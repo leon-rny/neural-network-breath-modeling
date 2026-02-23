@@ -1,16 +1,12 @@
 import argparse
-import math
+import csv
 import os
 
-import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
 
 from data import BreathDataset, load_dataset, split_dataset
 from models.vae import VAE, elbo_loss
-
-plt.rcParams.update({'legend.fontsize': 9,
-                     'axes.titlesize': 10})
 
 # cli arguments
 def parse_args() -> argparse.Namespace:
@@ -87,8 +83,11 @@ def main():
 
     # training loop
     os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('results/vae', exist_ok=True)
     ckpt_path = f'checkpoints/vae_{args.region}.pt'
-    best_val_loss = math.inf
+    history_path = f'results/vae/train_{args.region}.csv'
+    best_val_loss = torch.inf
+    history = []
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_recon, train_kl = train_one_epoch(
@@ -97,7 +96,8 @@ def main():
             model, val_loader, epoch, args.epochs, device)
         scheduler.step()
 
-        if val_loss < best_val_loss:
+        # save best model
+        if val_loss < best_val_loss and beta_schedule(epoch, args.epochs) >= 1.0:
             best_val_loss = val_loss
             torch.save({'epoch': epoch,
                         'model_state': model.state_dict(),
@@ -105,13 +105,24 @@ def main():
                         'latent_dim': args.latent_dim,
                         'region': args.region}, ckpt_path)
 
+        beta = beta_schedule(epoch, args.epochs)
+
+        # logging
+        history.append({'epoch': epoch, 'beta': beta,
+                        'train_loss': train_loss, 'train_recon': train_recon, 'train_kl': train_kl,
+                        'val_loss': val_loss,   'val_recon': val_recon,   'val_kl': val_kl})
         if epoch % args.log_every == 0 or epoch == 1:
-            beta = beta_schedule(epoch, args.epochs)
             print(f'Epoch {epoch:4d}/{args.epochs} | β={beta:.2f} | '
                   f'train loss={train_loss:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}) | '
                   f'val loss={val_loss:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})')
 
+    # results
+    with open(history_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=history[0].keys())
+        writer.writeheader()
+        writer.writerows(history)
     print(f'\nBest val loss: {best_val_loss:.4f} | Checkpoint: {ckpt_path}')
+    print(f'Training history saved to {history_path}')
 
 if __name__ == '__main__':
     main()
