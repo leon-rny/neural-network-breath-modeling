@@ -18,3 +18,7 @@ venv*/
 # tests
 test*/
 test.*
+
+# claude
+.claude/
+CLAUDE.md
