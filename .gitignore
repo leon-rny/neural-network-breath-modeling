@@ -22,3 +22,4 @@ test.*
 # claude
 .claude/
 CLAUDE.md
+tasks/
