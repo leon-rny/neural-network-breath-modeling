@@ -1,0 +1,52 @@
+{
+  "model": "trtr",
+  "region": "mouth",
+  "n_train_real": 215,
+  "n_synthetic": 215,
+  "top_20_features": [
+    "Temperature__partial_autocorrelation__lag_3",
+    "Temperature__ar_coefficient__coeff_2__k_10",
+    "Humidity__agg_linear_trend__attr__slope___chunk_len_5__f_agg__mean_",
+    "Temperature__change_quantiles__f_agg__var___isabs_False__qh_1_0__ql_0_4",
+    "Temperature__change_quantiles__f_agg__var___isabs_True__qh_1_0__ql_0_8",
+    "Temperature__change_quantiles__f_agg__var___isabs_False__qh_1_0__ql_0_6",
+    "Humidity__fft_coefficient__attr__angle___coeff_17",
+    "Temperature__permutation_entropy__dimension_5__tau_1",
+    "Humidity__partial_autocorrelation__lag_3",
+    "Temperature__fft_coefficient__attr__angle___coeff_13",
+    "Temperature__agg_linear_trend__attr__rvalue___chunk_len_5__f_agg__var_",
+    "Temperature__cid_ce__normalize_True",
+    "Temperature__change_quantiles__f_agg__var___isabs_False__qh_0_6__ql_0_4",
+    "Temperature__approximate_entropy__m_2__r_0_9",
+    "Temperature__spkt_welch_density__coeff_8",
+    "Humidity__energy_ratio_by_chunks__num_segments_10__segment_focus_4",
+    "Temperature__sample_entropy",
+    "Temperature__permutation_entropy__dimension_4__tau_1",
+    "Humidity__change_quantiles__f_agg__mean___isabs_True__qh_0_6__ql_0_0",
+    "Temperature__change_quantiles__f_agg__mean___isabs_True__qh_0_4__ql_0_2"
+  ],
+  "metrics": {
+    "accuracy": 0.8928571428571429,
+    "f1_weighted": 0.8943577430972388,
+    "roc_auc_ovr": 0.980896686159844,
+    "log_loss": 0.29320865274119373,
+    "per_class_f1": {
+      "bradypnea": 0.9411764705882353,
+      "eupnea": 0.8888888888888888,
+      "tachypnea": 0.8571428571428571
+    }
+  },
+  "feature_overlap": null,
+  "top_20_synth_features": null,
+  "trtr_metrics": {
+    "accuracy": 0.8928571428571429,
+    "f1_weighted": 0.8943577430972388,
+    "roc_auc_ovr": 0.980896686159844,
+    "log_loss": 0.29320865274119373,
+    "per_class_f1": {
+      "bradypnea": 0.9411764705882353,
+      "eupnea": 0.8888888888888888,
+      "tachypnea": 0.8571428571428571
+    }
+  }
+}

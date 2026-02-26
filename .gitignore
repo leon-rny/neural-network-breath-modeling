@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.pyo
+catboost_info/
 
 # Packaging
 *.egg-info/
@@ -18,6 +19,7 @@ venv*/
 # tests
 test*/
 test.*
+
 
 # claude
 .claude/
