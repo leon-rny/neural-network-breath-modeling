@@ -70,12 +70,12 @@ class BreathDataset(Dataset):
 
     def _compute_stats(self) -> dict:
         """
-        Compute per-channel mean and std from baseline-corrected signals.
-        
+        Compute per-channel mean and std from raw signals.
+
         :return: dictionary with 'mean' and 'std' keys, each containing a (2,) array for [humidity, temperature].
         """
-        h_all = np.concatenate([r['humidity'] - r['humidity'].min() for r in self.records])
-        t_all = np.concatenate([r['temperature'] - r['temperature'].min() for r in self.records])
+        h_all = np.concatenate([r['humidity'] for r in self.records])
+        t_all = np.concatenate([r['temperature'] for r in self.records])
         return {'mean': np.array([h_all.mean(), t_all.mean()], dtype=np.float32),
                 'std':  np.array([h_all.std(),  t_all.std()],  dtype=np.float32)}
 
@@ -94,19 +94,15 @@ class BreathDataset(Dataset):
         
         :param idx: Index of the sample to retrieve.
         :return: A tuple of (signal, time, label) where:
-            - signal is a (2, 36) float32 tensor of [humidity, temperature], baseline-corrected and z-score normalised
+            - signal is a (2, 36) float32 tensor of [humidity, temperature], z-score normalised on raw signals
             - time is a (36,) float32 tensor of seconds, aligned to 0
             - label is an int representing the class index
         """
         r = self.records[idx]
 
-        # baseline correction
-        h = r['humidity'] - r['humidity'].min()
-        t = r['temperature'] - r['temperature'].min()
-
         # z-score normalisation
-        h = (h - self.stats['mean'][0]) / (self.stats['std'][0] + 1e-8)
-        t = (t - self.stats['mean'][1]) / (self.stats['std'][1] + 1e-8)
+        h = (r['humidity']    - self.stats['mean'][0]) / (self.stats['std'][0] + 1e-8)
+        t = (r['temperature'] - self.stats['mean'][1]) / (self.stats['std'][1] + 1e-8)
 
         signal = torch.tensor(np.stack([h, t], axis=0), dtype=torch.float32)
         time = torch.tensor(r['time'] - r['time'][0],  dtype=torch.float32)

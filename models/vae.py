@@ -43,8 +43,7 @@ class Decoder(nn.Module):
         super().__init__()
         self.fc = nn.Sequential(nn.Linear(latent_dim, 128),
                                 nn.ReLU(),
-                                nn.Linear(128, 64 * 36),
-                                nn.ReLU())
+                                nn.Linear(128, 64 * 36))
         
         # use transposed convolutions to "deconvolve"
         self.conv = nn.Sequential(nn.ConvTranspose1d(64, 32, kernel_size=3, padding=1),
@@ -147,8 +146,7 @@ class ConditionalDecoder(nn.Module):
         self.label_embed = nn.Embedding(num_classes, embed_dim)
         self.fc = nn.Sequential(nn.Linear(latent_dim + embed_dim, 128),
                                 nn.ReLU(),
-                                nn.Linear(128, 64 * 36),
-                                nn.ReLU())
+                                nn.Linear(128, 64 * 36))
         self.conv = nn.Sequential(nn.ConvTranspose1d(64, 32, kernel_size=3, padding=1),
                                   nn.ReLU(),
                                   nn.ConvTranspose1d(32, 16, kernel_size=3, padding=1),

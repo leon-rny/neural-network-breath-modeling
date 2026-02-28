@@ -6,17 +6,18 @@ import torch
 from torch.utils.data import DataLoader
 
 from data import BreathDataset, load_dataset, split_dataset
-from models.vae import CVAE, elbo_loss
+from models.vae import VAE, CVAE, elbo_loss
 
 # cli arguments
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description='Train CVAE on breath signals')
+    p = argparse.ArgumentParser(description='Train VAE/CVAE on breath signals')
+    p.add_argument('--model', required=True, choices=['vae', 'cvae'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
-    p.add_argument('--epochs', type=int, default=300)
+    p.add_argument('--epochs', type=int, default=500)
     p.add_argument('--batch_size', type=int, default=32)
     p.add_argument('--lr', type=float, default=1e-3)
-    p.add_argument('--latent_dim', type=int, default=16)
-    p.add_argument('--embed_dim', type=int, default=8)
+    p.add_argument('--latent_dim', type=int, default=32)
+    p.add_argument('--embed_dim', type=int, default=16)
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--log_every', type=int, default=10)
     return p.parse_args()
@@ -26,14 +27,17 @@ def beta_schedule(epoch: int, total_epochs: int) -> float:
     """Linear beta anneal: 0 -> 1 over first half of training to avoid posterior collapse."""
     return min(1.0, epoch / (total_epochs * 0.5))
 
-def train_one_epoch(model, loader, optimizer, epoch, total_epochs, device):
+def train_one_epoch(model, loader, optimizer, epoch, total_epochs, device, conditional=False):
     model.train()
     beta = beta_schedule(epoch, total_epochs)
     total_loss = recon_sum = kl_sum = 0.0
     for signal, _time, label in loader:
         signal = signal.to(device)
-        label = label.long().to(device)
-        x_hat, mu, logvar = model(signal, label)
+        if conditional:
+            label = label.long().to(device)
+            x_hat, mu, logvar = model(signal, label)
+        else:
+            x_hat, mu, logvar = model(signal)
         loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta)
         optimizer.zero_grad()
         loss.backward()
@@ -45,14 +49,17 @@ def train_one_epoch(model, loader, optimizer, epoch, total_epochs, device):
     return total_loss / n, recon_sum / n, kl_sum / n
 
 @torch.no_grad()
-def evaluate(model, loader, epoch, total_epochs, device):
+def evaluate(model, loader, epoch, total_epochs, device, conditional=False):
     model.eval()
     beta = beta_schedule(epoch, total_epochs)
     total_loss = recon_sum = kl_sum = 0.0
     for signal, _time, label in loader:
         signal = signal.to(device)
-        label = label.long().to(device)
-        x_hat, mu, logvar = model(signal, label)
+        if conditional:
+            label = label.long().to(device)
+            x_hat, mu, logvar = model(signal, label)
+        else:
+            x_hat, mu, logvar = model(signal)
         loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta)
         total_loss += loss.item()
         recon_sum += recon.item()
@@ -65,7 +72,7 @@ def main():
     args = parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else
                           'mps' if torch.backends.mps.is_available() else 'cpu')
-    print(f'Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
+    print(f'Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
 
     # data
     df = load_dataset(args.dataset_dir)
@@ -80,34 +87,38 @@ def main():
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
 
     # model
-    model = CVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim).to(device)
+    conditional = args.model == 'cvae'
+    if conditional:
+        model = CVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim).to(device)
+    else:
+        model = VAE(latent_dim=args.latent_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # training loop
-    os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs('results/cvae', exist_ok=True)
-    ckpt_path = f'checkpoints/cvae_{args.region}.pt'
-    history_path = f'results/cvae/train_{args.region}.csv'
+    os.makedirs('models/checkpoints', exist_ok=True)
+    os.makedirs(f'results/{args.model}', exist_ok=True)
+    ckpt_path = f'models/checkpoints/{args.model}_{args.region}.pt'
+    history_path = f'results/{args.model}/train_{args.region}.csv'
     best_val_loss = torch.inf
     history = []
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_recon, train_kl = train_one_epoch(
-            model, train_loader, optimizer, epoch, args.epochs, device)
+            model, train_loader, optimizer, epoch, args.epochs, device, conditional)
         val_loss, val_recon, val_kl = evaluate(
-            model, val_loader, epoch, args.epochs, device)
+            model, val_loader, epoch, args.epochs, device, conditional)
         scheduler.step()
 
         # save best model
         if val_loss < best_val_loss and beta_schedule(epoch, args.epochs) >= 1.0:
             best_val_loss = val_loss
-            torch.save({'epoch': epoch,
-                        'model_state': model.state_dict(),
-                        'stats': train_ds.stats,
-                        'latent_dim': args.latent_dim,
-                        'embed_dim': args.embed_dim,
-                        'region': args.region}, ckpt_path)
+            ckpt = {'epoch': epoch, 'model_state': model.state_dict(),
+                    'stats': train_ds.stats, 'latent_dim': args.latent_dim,
+                    'region': args.region}
+            if conditional:
+                ckpt['embed_dim'] = args.embed_dim
+            torch.save(ckpt, ckpt_path)
 
         beta = beta_schedule(epoch, args.epochs)
 

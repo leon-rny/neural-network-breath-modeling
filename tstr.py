@@ -73,7 +73,7 @@ def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray) -> Stack
         X_res, y_res = smote.fit_resample(X_train, y_train)
     
     xgb_clf = XGBClassifier(eval_metric='mlogloss', random_state=42, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300,)
-    cat_clf = CatBoostClassifier(logging_level='Silent', random_state=42, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,)
+    cat_clf = CatBoostClassifier(logging_level='Silent', random_state=42, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,allow_writing_files=False)
     meta_clf = RandomForestClassifier(n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=42,)
     stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42), n_jobs=-1,)
     stacker.fit(X_res, y_res)
@@ -223,7 +223,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int) -> dict:
 
 # train synthetic test real
 def load_model(model_name: str, region: str, device: 'torch.device'):
-    ckpt_path = f'checkpoints/{model_name}_{region}.pt'
+    ckpt_path = f'models/checkpoints/{model_name}_{region}.pt'
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}\n'
                                 f'Run: python train_{model_name}.py --region {region}')
@@ -354,6 +354,7 @@ def main():
                   'trtr_metrics': cache['trtr_metrics']}
         save_result(result, args.model, args.region)
         save_summary(result)
+        print('[TRTR] Finished.')
         return
 
     # train-synthetic-test-real
@@ -363,6 +364,7 @@ def main():
     # save tstr results
     save_result(result, args.model, args.region)
     save_summary(result)
+    print('[TSTR] Finished.')
 
 if __name__ == '__main__':
     main()
