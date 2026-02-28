@@ -40,18 +40,14 @@ def df_to_df_long(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     hum_all  = np.stack(df['humidity'].values)
     temp_all = np.stack(df['temperature'].values)
 
-    # baseline correction
-    hum_bc  = hum_all  - hum_all.min(axis=1,  keepdims=True)
-    temp_bc = temp_all - temp_all.min(axis=1, keepdims=True)
-
-    n, T   = hum_bc.shape
-    ids    = np.repeat(np.arange(n), T)
-    times  = np.tile(np.arange(T), n)
+    n, T = hum_all.shape
+    ids = np.repeat(np.arange(n), T)
+    times = np.tile(np.arange(T), n)
 
     df_long = pd.DataFrame({'id': ids,
                             'time': times,
-                            'Humidity': hum_bc.ravel(),
-                            'Temperature': temp_bc.ravel()})
+                            'Humidity': hum_all.ravel(),
+                            'Temperature': temp_all.ravel()})
 
     labels = np.array([CLASS_TO_IDX[c] for c in df['class']])
     y = pd.Series(labels, index=np.arange(n), name='target')
@@ -76,7 +72,7 @@ def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray) -> Stack
         smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
         X_res, y_res = smote.fit_resample(X_train, y_train)
     
-    xgb_clf = XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300,)
+    xgb_clf = XGBClassifier(eval_metric='mlogloss', random_state=42, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300,)
     cat_clf = CatBoostClassifier(logging_level='Silent', random_state=42, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,)
     meta_clf = RandomForestClassifier(n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=42,)
     stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42), n_jobs=-1,)
@@ -177,9 +173,9 @@ def trtr(dataset_dir: str, region: str, n_jobs: int) -> dict:
 
     # lgbm and shap feature importance
     X_tr, X_val, y_tr, y_val = train_test_split(X_full_san, y_train, test_size=0.2, stratify=y_train, random_state=42)
-    param_grid = {'max_depth':       [4, 6],
-                  'reg_alpha':       [0.1, 1.0],
-                  'reg_lambda':      [0.5, 1.0],
+    param_grid = {'max_depth': [4, 6],
+                  'reg_alpha': [0.1, 1.0],
+                  'reg_lambda': [0.5, 1.0],
                   'colsample_bytree': [0.8, 1.0]}
     base_lgbm = LGBMClassifier(n_estimators=1000, learning_rate=0.05, random_state=42, verbose=-1)
     gs = GridSearchCV(base_lgbm, param_grid, cv=StratifiedKFold(3), scoring='accuracy', n_jobs=-1, verbose=0)
@@ -188,7 +184,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int) -> dict:
     best_lgbm = LGBMClassifier(**gs.best_params_, n_estimators=1000, learning_rate=0.05, random_state=42, verbose=-1)
     best_lgbm.fit(X_tr.values, y_tr.values, eval_set=[(X_val.values, y_val.values)], eval_metric='multi_logloss', callbacks=[early_stopping(50, verbose=False), log_evaluation(0)])
 
-    explainer   = shap.TreeExplainer(best_lgbm)
+    explainer = shap.TreeExplainer(best_lgbm)
     shap_values = explainer.shap_values(X_full_san.values)
 
     mean_abs = np.abs(shap_values).mean(axis=0).mean(axis=1)
@@ -229,9 +225,8 @@ def trtr(dataset_dir: str, region: str, n_jobs: int) -> dict:
 def load_model(model_name: str, region: str, device: 'torch.device'):
     ckpt_path = f'checkpoints/{model_name}_{region}.pt'
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f'Checkpoint not found: {ckpt_path}\n'
-            f'Run:  python train_{model_name}.py --region {region}')
+        raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}\n'
+                                f'Run: python train_{model_name}.py --region {region}')
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
@@ -328,7 +323,7 @@ def main():
     os.makedirs(CACHE_DIR, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else
                           'mps'  if torch.backends.mps.is_available() else 'cpu')
-    print(f'Region: {args.region} | Model: {args.model}')
+    print(f'[TRTR] Region: {args.region}' if args.model == 'trtr' else f'[TSTR] Region: {args.region}')
 
     # train-real-test-real 
     # build cache
@@ -357,7 +352,7 @@ def main():
                   'feature_overlap': None,
                   'top_20_synth_features': None,
                   'trtr_metrics': cache['trtr_metrics']}
-        save_result(result, 'trtr', args.region)
+        save_result(result, args.model, args.region)
         save_summary(result)
         return
 
