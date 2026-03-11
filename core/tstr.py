@@ -19,20 +19,21 @@ from sklearn.ensemble import RandomForestClassifier, StackingClassifier
 from sklearn.metrics import accuracy_score, classification_report, f1_score, log_loss, roc_auc_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 
-from data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, split_dataset
+from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, split_dataset
 from models.vae import CVAE, VAE
+from models.gan import CGAN
 
 CACHE_DIR = 'results/tstr'
 
 # cli
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='TSTR evaluation for breath signal generative models')
-    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae'])
+    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'gan'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
-    p.add_argument('--n_synthetic', type=int, default=None, help='Number of synthetic samples (default: match real train size)')
+    p.add_argument('--n_synthetic', type=int, default=None)
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--n_jobs', type=int, default=4)
-    p.add_argument('--force_rebuild', action='store_true', help='Delete existing Phase 1 cache and rebuild from scratch')
+    p.add_argument('--force_rebuild', action='store_true')
     return p.parse_args()
 
 # utils
@@ -234,6 +235,8 @@ def load_model(model_name: str, region: str, device: 'torch.device'):
         model = VAE(latent_dim=ckpt['latent_dim'])
     elif model_name == 'cvae':
         model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
+    elif model_name == 'gan':
+        model = CGAN(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
     else:
         raise ValueError(f'Unknown model: {model_name}')
 
@@ -256,7 +259,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
         signals_phys = (z * std_t + mean_t).cpu().numpy()
         labels = np.concatenate([np.full(c, i) for i, c in enumerate(counts)])
 
-    elif model_name == 'cvae':
+    elif model_name in ('cvae', 'gan'):
         all_signals, all_labels = [], []
         for cls_idx, count in enumerate(counts):
             y_cls = torch.tensor(cls_idx, dtype=torch.long)
