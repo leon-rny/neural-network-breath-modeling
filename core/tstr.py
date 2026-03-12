@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--n_jobs', type=int, default=4)
     p.add_argument('--force_rebuild', action='store_true')
+    p.add_argument('--seed', type=int, default=42)
     return p.parse_args()
 
 # utils
@@ -64,19 +65,19 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
             X[c] = 0.0
     return X[top_features_raw]
 
-def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray) -> StackingClassifier:
+def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, seed: int) -> StackingClassifier:
     min_class = int(np.bincount(y_train).min())
     k_neighbors = min(5, min_class - 1)
     if k_neighbors < 1:
         X_res, y_res = X_train, y_train
     else:
-        smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+        smote = SMOTE(random_state=seed, k_neighbors=k_neighbors)
         X_res, y_res = smote.fit_resample(X_train, y_train)
-    
-    xgb_clf = XGBClassifier(eval_metric='mlogloss', random_state=42, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300,)
-    cat_clf = CatBoostClassifier(logging_level='Silent', random_state=42, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,allow_writing_files=False)
-    meta_clf = RandomForestClassifier(n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=42,)
-    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42), n_jobs=-1,)
+
+    xgb_clf = XGBClassifier(eval_metric='mlogloss', random_state=seed, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300,)
+    cat_clf = CatBoostClassifier(logging_level='Silent', random_state=seed, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,allow_writing_files=False)
+    meta_clf = RandomForestClassifier(n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=seed,)
+    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=seed), n_jobs=-1,)
     stacker.fit(X_res, y_res)
     
     return stacker
@@ -99,8 +100,8 @@ def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.
             'log_loss':    float(log_loss(y_test, y_prob)),
             'per_class_f1': {cls: float(report.get(str(i), {}).get('f1-score', float('nan'))) for i, cls in enumerate(CLASSES)}}
 
-def save_result(result: dict, model: str, region: str) -> None:
-    path = os.path.join(CACHE_DIR, f'{model}_{region}.json')
+def save_result(result: dict, model: str, region: str, seed: int) -> None:
+    path = os.path.join(CACHE_DIR, f'{model}_{region}_s{seed}.json')
 
     def _json_safe(obj):
         if isinstance(obj, float) and np.isnan(obj):
@@ -124,6 +125,7 @@ def save_summary(result: dict) -> None:
     m = result['metrics']
     new_row = {'model': result['model'],
                'region': result['region'],
+               'seed': result.get('seed'),
                'accuracy': m['accuracy'],
                'f1_weighted': m['f1_weighted'],
                'roc_auc_ovr': m['roc_auc_ovr'],
@@ -133,30 +135,31 @@ def save_summary(result: dict) -> None:
                'f1_tachypnea': m['per_class_f1']['tachypnea'],
                'feature_overlap': result.get('feature_overlap'),
                'n_synthetic': result.get('n_synthetic', result['n_train_real'])}
+    df_row = pd.DataFrame([new_row])
     if os.path.exists(csv_path):
         df_old = pd.read_csv(csv_path)
-        df_new = pd.concat([df_old, pd.DataFrame([new_row])], ignore_index=True)
-        df_new = df_new.drop_duplicates(subset=['model', 'region'], keep='last')
+        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(
+            subset=['model', 'region', 'seed'], keep='last')
     else:
-        df_new = pd.DataFrame([new_row])
+        df_new = df_row
     df_new.to_csv(csv_path, index=False)
 
 # train real test real
-def _cache_path(region: str) -> str:
-    return os.path.join(CACHE_DIR, f'{region}_cache.pkl')
+def _cache_path(region: str, seed: int) -> str:
+    return os.path.join(CACHE_DIR, f'{region}_cache_s{seed}.pkl')
 
-def load_cache(region: str) -> dict | None:
-    path = _cache_path(region)
+def load_cache(region: str, seed: int) -> dict | None:
+    path = _cache_path(region, seed)
     if os.path.exists(path):
         with open(path, 'rb') as f:
             return pickle.load(f)
     return None
 
-def trtr(dataset_dir: str, region: str, n_jobs: int) -> dict:
+def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int) -> dict:
     # load dataset
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
-    df_train, df_val, df_test = split_dataset(df, random_state=42)
+    df_train, df_val, df_test = split_dataset(df, random_state=seed)
     stats = BreathDataset(df_train).stats
 
     ## train real
@@ -173,16 +176,16 @@ def trtr(dataset_dir: str, region: str, n_jobs: int) -> dict:
     X_full_san.columns = [raw_to_san[c] for c in X_full_san.columns]
 
     # lgbm and shap feature importance
-    X_tr, X_val, y_tr, y_val = train_test_split(X_full_san, y_train, test_size=0.2, stratify=y_train, random_state=42)
+    X_tr, X_val, y_tr, y_val = train_test_split(X_full_san, y_train, test_size=0.2, stratify=y_train, random_state=seed)
     param_grid = {'max_depth': [4, 6],
                   'reg_alpha': [0.1, 1.0],
                   'reg_lambda': [0.5, 1.0],
                   'colsample_bytree': [0.8, 1.0]}
-    base_lgbm = LGBMClassifier(n_estimators=1000, learning_rate=0.05, random_state=42, verbose=-1)
+    base_lgbm = LGBMClassifier(n_estimators=1000, learning_rate=0.05, random_state=seed, verbose=-1)
     gs = GridSearchCV(base_lgbm, param_grid, cv=StratifiedKFold(3), scoring='accuracy', n_jobs=-1, verbose=0)
     gs.fit(X_tr, y_tr)
 
-    best_lgbm = LGBMClassifier(**gs.best_params_, n_estimators=1000, learning_rate=0.05, random_state=42, verbose=-1)
+    best_lgbm = LGBMClassifier(**gs.best_params_, n_estimators=1000, learning_rate=0.05, random_state=seed, verbose=-1)
     best_lgbm.fit(X_tr.values, y_tr.values, eval_set=[(X_val.values, y_val.values)], eval_metric='multi_logloss', callbacks=[early_stopping(50, verbose=False), log_evaluation(0)])
 
     explainer = shap.TreeExplainer(best_lgbm)
@@ -202,7 +205,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int) -> dict:
     X_test_top = X_test_san[top_20_san].values
 
     # train stack classifier
-    clf = train_stacking_classifier(X_train_top, y_train.values)
+    clf = train_stacking_classifier(X_train_top, y_train.values, seed)
 
     # evaluate classifier
     trtr_metrics = evaluate_classifier(clf, X_test_top, y_test.values)
@@ -216,15 +219,16 @@ def trtr(dataset_dir: str, region: str, n_jobs: int) -> dict:
              'y_test': y_test.values,
              'stats': stats,
              'n_train': len(df_train),
-             'trtr_metrics': trtr_metrics}
-    with open(_cache_path(region), 'wb') as f:
+             'trtr_metrics': trtr_metrics,
+             'seed': seed}
+    with open(_cache_path(region, seed), 'wb') as f:
         pickle.dump(cache, f)
 
     return cache
 
 # train synthetic test real
-def load_model(model_name: str, region: str, device: 'torch.device'):
-    ckpt_path = f'models/checkpoints/{model_name}_{region}.pt'
+def load_model(model_name: str, region: str, device: 'torch.device', seed: int) -> tuple[torch.nn.Module, dict]:
+    ckpt_path = f'models/checkpoints/{model_name}_{region}_s{seed}.pt'
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}\n'
                                 f'Run: python train_{model_name}.py --region {region}')
@@ -272,8 +276,8 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
 
     return signals_phys, labels
 
-def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device) -> dict:
-    model, ckpt_stats = load_model(model_name, region, device)
+def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int) -> dict:
+    model, ckpt_stats = load_model(model_name, region, device, seed)
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
     synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device)
@@ -291,11 +295,10 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     X_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_san.columns]
     X_synth_top = X_san[cache['top_20_features_sanitized']].values
 
-    stacker_tstr = train_stacking_classifier(X_synth_top, synth_labels)
+    stacker_tstr = train_stacking_classifier(X_synth_top, synth_labels, seed)
     tstr_metrics = evaluate_classifier(stacker_tstr, cache['X_test_top'], cache['y_test'])
 
-    # feature overlap: top-10 of synth SHAP vs real top-10
-    # cache['top_20_features_sanitized'] is already ranked by real SHAP importance
+    # feature overlap
     xgb_clf = stacker_tstr.estimators_[0]
     explainer = shap.TreeExplainer(xgb_clf)
     shap_values = explainer.shap_values(X_synth_top)
@@ -310,19 +313,22 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     top_k_real  = cache['top_20_features_sanitized'][:k]
     overlap = len(set(top_k_real) & set(top_k_synth)) / k
 
-    return {'model':                 model_name,
-            'region':                region,
-            'n_train_real':          cache['n_train'],
-            'n_synthetic':           n_synthetic,
-            'top_20_features':       cache['top_20_features_sanitized'],
-            'metrics':               tstr_metrics,
-            'feature_overlap':       overlap,
+    return {'model': model_name,
+            'region': region,
+            'seed': seed,
+            'n_train_real': cache['n_train'],
+            'n_synthetic': n_synthetic,
+            'top_20_features': cache['top_20_features_sanitized'],
+            'metrics': tstr_metrics,
+            'feature_overlap': overlap,
             'top_20_synth_features': top_k_synth,
-            'trtr_metrics':          cache['trtr_metrics']}
+            'trtr_metrics': cache['trtr_metrics']}
 
 # main
 def main():
     args = parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     os.makedirs(CACHE_DIR, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else
                           'mps'  if torch.backends.mps.is_available() else 'cpu')
@@ -331,23 +337,24 @@ def main():
     # train-real-test-real 
     # build cache
     if args.force_rebuild:
-        path = _cache_path(args.region)
+        path = _cache_path(args.region, args.seed)
         if os.path.exists(path):
             os.remove(path)
-            print(f'[TRTR] Removed cache for region={args.region}')
+            print(f'[TRTR] Removed cache for region={args.region}, seed={args.seed}')
     
     # load cache
-    cache = load_cache(args.region)
+    cache = load_cache(args.region, args.seed)
     if cache is None:
-        cache = trtr(args.dataset_dir, args.region, args.n_jobs)
-        print(f'[TRTR] Built cache for region={args.region}')
+        cache = trtr(args.dataset_dir, args.region, args.n_jobs, args.seed)
+        print(f'[TRTR] Built cache for region={args.region}, seed={args.seed}')
     else:
-        print(f'[TRTR] Loaded cache for region={args.region}')
+        print(f'[TRTR] Loaded cache for region={args.region}, seed={args.seed}')
 
     # save trtr results
     if args.model == 'trtr':
         result = {'model': 'trtr',
                   'region': args.region,
+                  'seed': args.seed,
                   'n_train_real': cache['n_train'],
                   'n_synthetic': cache['n_train'],
                   'top_20_features': cache['top_20_features_sanitized'],
@@ -355,17 +362,17 @@ def main():
                   'feature_overlap': None,
                   'top_20_synth_features': None,
                   'trtr_metrics': cache['trtr_metrics']}
-        save_result(result, args.model, args.region)
+        save_result(result, args.model, args.region, args.seed)
         save_summary(result)
         print('[TRTR] Finished.')
         return
 
     # train-synthetic-test-real
     n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
-    result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device)
+    result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed)
     
     # save tstr results
-    save_result(result, args.model, args.region)
+    save_result(result, args.model, args.region, args.seed)
     save_summary(result)
     print('[TSTR] Finished.')
 

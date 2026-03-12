@@ -33,9 +33,11 @@ class Generator(nn.Module):
 
 class Discriminator(nn.Module):
     """
-    Conditional discriminator: classifies signals as real or fake, conditioned on class label.
+    AC-GAN discriminator: jointly outputs a Wasserstein critic score and class logits.
     The class label is embedded and projected to signal length 36, then concatenated as an extra channel.
-    Uses LeakyReLU (standard for discriminators) and outputs a raw logit (no sigmoid).
+    The shared convolutional features feed into two heads:
+      - critic_head: raw score for WGAN-GP (positive = real)
+      - cls_head: class logits for auxiliary classification loss
     """
     def __init__(self, num_classes: int = 3, embed_dim: int = 8) -> None:
         super().__init__()
@@ -48,21 +50,22 @@ class Discriminator(nn.Module):
                                   nn.LeakyReLU(0.2),
                                   nn.Conv1d(32, 64, kernel_size=3, padding=1),
                                   nn.LeakyReLU(0.2))
-        self.fc = nn.Sequential(nn.Linear(64 * 36, 128),
-                                nn.LeakyReLU(0.2),
-                                nn.Linear(128, 1))
+        self.feature_fc = nn.Sequential(nn.Linear(64 * 36, 128),
+                                        nn.LeakyReLU(0.2))
+        self.critic_head = nn.Linear(128, 1)
+        self.cls_head    = nn.Linear(128, num_classes)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         :param x: (B, 2, 36) signals (real or fake)
         :param y: (B,) integer class labels
-        :return: (B, 1) raw logits (positive = real)
+        :return: (B, 1) critic scores, (B, num_classes) class logits
         """
-        e         = self.label_embed(y) # (B, embed_dim)
-        label_map = self.label_proj(e).unsqueeze(1) # (B, 1, 36)
-        xc        = torch.cat([x, label_map], dim=1)# (B, 3, 36)
-        h         = self.conv(xc).flatten(1) # (B, 64*36)
-        return self.fc(h) # (B, 1)
+        e         = self.label_embed(y)              # (B, embed_dim)
+        label_map = self.label_proj(e).unsqueeze(1)  # (B, 1, 36)
+        xc        = torch.cat([x, label_map], dim=1) # (B, 3, 36)
+        feat      = self.feature_fc(self.conv(xc).flatten(1)) # (B, 128)
+        return self.critic_head(feat), self.cls_head(feat)    # (B, 1), (B, num_classes)
 
 class CGAN(nn.Module):
     """Wraps Generator and Discriminator into a Conditional GAN."""
@@ -94,13 +97,14 @@ def gradient_penalty(discriminator: nn.Module, real: torch.Tensor, fake: torch.T
     """
     WGAN-GP gradient penalty: enforces 1-Lipschitz constraint on the critic by penalising
     gradients that deviate from norm 1 on interpolated samples.
+    Uses only the critic score (first output of discriminator).
     """
     B = real.size(0)
     alpha = torch.rand(B, 1, 1, device=device) # (B, 1, 1) broadcast over (B, 2, 36)
     interp = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
-    d_interp = discriminator(interp, y)
-    grads = torch.autograd.grad(outputs=d_interp, inputs=interp,
-                                grad_outputs=torch.ones_like(d_interp),
+    critic_score, _ = discriminator(interp, y)  # only need critic score for GP
+    grads = torch.autograd.grad(outputs=critic_score, inputs=interp,
+                                grad_outputs=torch.ones_like(critic_score),
                                 create_graph=True, retain_graph=True)[0]
     grads = grads.reshape(B, -1)
     return ((grads.norm(2, dim=1) - 1) ** 2).mean()

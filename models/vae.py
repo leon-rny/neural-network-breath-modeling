@@ -134,8 +134,8 @@ class ConditionalEncoder(nn.Module):
         :param y: (B,) integer class labels
         :return: (B, latent_dim) mean and log-variance
         """
-        h = self.conv(x).flatten(1)          # (B, 64*36)
-        e = self.label_embed(y)               # (B, embed_dim)
+        h = self.conv(x).flatten(1) # (B, 64*36)
+        e = self.label_embed(y) # (B, embed_dim)
         h = self.fc(torch.cat([h, e], dim=1)) # (B, 128)
         return self.mu_head(h), self.logvar_head(h)
 
