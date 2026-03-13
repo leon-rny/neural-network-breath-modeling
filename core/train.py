@@ -33,7 +33,7 @@ def beta_schedule(epoch: int, total_epochs: int) -> float:
     """Linear beta anneal: 0 -> 1 over first half of training to avoid posterior collapse."""
     return min(1.0, epoch / (total_epochs * 0.5))
 
-def train_one_epoch(model, loader, optimizer, epoch, total_epochs, device, conditional=False):
+def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, conditional=False):
     model.train()
     beta = beta_schedule(epoch, total_epochs)
     total_loss = recon_sum = kl_sum = 0.0
@@ -158,10 +158,9 @@ def main():
         history = []
 
         for epoch in range(1, args.epochs + 1):
-            train_loss, train_recon, train_kl = train_one_epoch(
+            train_loss, train_recon, train_kl = train_vae_one_epoch(
                 model, train_loader, optimizer, epoch, args.epochs, device, conditional)
-            val_loss, val_recon, val_kl = evaluate(
-                model, val_loader, epoch, args.epochs, device, conditional)
+            val_loss, val_recon, val_kl = evaluate(model, val_loader, epoch, args.epochs, device, conditional)
             scheduler.step()
 
             if val_loss < best_val_loss and beta_schedule(epoch, args.epochs) >= 1.0:
