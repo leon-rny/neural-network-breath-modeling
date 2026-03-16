@@ -207,7 +207,7 @@ class CVAE(nn.Module):
         with torch.no_grad():
             return self.decoder(z, y.to(device))
 
-def elbo_loss(x: torch.Tensor, x_hat: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, beta: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def elbo_loss(x: torch.Tensor, x_hat: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, beta: float = 1.0, free_bits: float = 0.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     ELBO loss = MSE reconstruction + beta * KL divergence.
 
@@ -216,8 +216,12 @@ def elbo_loss(x: torch.Tensor, x_hat: torch.Tensor, mu: torch.Tensor, logvar: to
     :param mu: (B, latent_dim) mean of latent distribution
     :param logvar: (B, latent_dim) log-variance of latent distribution
     :param beta: weight for KL divergence (for annealing)
+    :param free_bits: minimum KL per dimension to prevent posterior collapse
     :return: total loss, reconstruction loss, KL divergence
     """
     recon = nn.functional.mse_loss(x_hat, x, reduction='mean')
-    kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
+    # per-dimension KL, then apply free bits floor
+    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()) # (B, latent_dim)
+    kl_per_dim = kl_per_dim.mean(dim=0) # (latent_dim,)
+    kl = torch.clamp(kl_per_dim, min=free_bits).sum()
     return recon + beta * kl, recon, kl

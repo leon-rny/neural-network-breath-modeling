@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--n_critic', type=int, default=5)
     p.add_argument('--latent_dim', type=int, default=32)
     p.add_argument('--embed_dim', type=int, default=16)
+    p.add_argument('--free_bits', type=float, default=0.0)
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--log_every', type=int, default=25)
     p.add_argument('--seed', type=int, default=42)
@@ -33,7 +34,7 @@ def beta_schedule(epoch: int, total_epochs: int) -> float:
     """Linear beta anneal: 0 -> 1 over first half of training to avoid posterior collapse."""
     return min(1.0, epoch / (total_epochs * 0.5))
 
-def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, conditional=False):
+def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, free_bits, conditional=False):
     model.train()
     beta = beta_schedule(epoch, total_epochs)
     total_loss = recon_sum = kl_sum = 0.0
@@ -44,7 +45,7 @@ def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, c
             x_hat, mu, logvar = model(signal, label)
         else:
             x_hat, mu, logvar = model(signal)
-        loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta)
+        loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -55,7 +56,7 @@ def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, c
     return total_loss / n, recon_sum / n, kl_sum / n
 
 @torch.no_grad()
-def evaluate(model, loader, epoch, total_epochs, device, conditional=False):
+def evaluate(model, loader, epoch, total_epochs, device, free_bits, conditional=False):
     model.eval()
     beta = beta_schedule(epoch, total_epochs)
     total_loss = recon_sum = kl_sum = 0.0
@@ -66,7 +67,7 @@ def evaluate(model, loader, epoch, total_epochs, device, conditional=False):
             x_hat, mu, logvar = model(signal, label)
         else:
             x_hat, mu, logvar = model(signal)
-        loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta)
+        loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
         total_loss += loss.item()
         recon_sum  += recon.item()
         kl_sum     += kl.item()
@@ -124,13 +125,11 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.use_deterministic_algorithms(True, warn_only=True)
-
-    # warn_only=True: ops without a deterministic impl emit a warning instead of raising
     device = torch.device('cuda' if torch.cuda.is_available() else
                           'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f'Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
 
-    # data
+    # data set
     df = load_dataset(args.dataset_dir)
     df = df[df['region'] == args.region].reset_index(drop=True)
     print(f'Trials for {args.region}: {len(df)}')
@@ -138,14 +137,15 @@ def main():
     df_train, df_val, df_test = split_dataset(df, random_state=args.seed)
     train_ds = BreathDataset(df_train)
     val_ds = BreathDataset(df_val, stats=train_ds.stats)
-
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  drop_last=False)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
 
-    os.makedirs('models/checkpoints', exist_ok=True)
-    os.makedirs(f'results/{args.model}', exist_ok=True)
-    ckpt_path = f'models/checkpoints/{args.model}_{args.region}_s{args.seed}.pt'
-    history_path = f'results/{args.model}/train_{args.region}_s{args.seed}.csv'
+    # paths
+    os.makedirs(f'results/experiments/{args.model}', exist_ok=True)
+    run_id = (f'{args.region}_s{args.seed}_ld{args.latent_dim}_fb{args.free_bits}' if args.model in ('vae', 'cvae')
+              else f'{args.region}_s{args.seed}')
+    ckpt_path = f'results/experiments/{args.model}/{run_id}_checkpoint.pt'
+    history_path = f'results/experiments/{args.model}/{run_id}_train_history.csv'
 
     # vae and cvae branch
     if args.model in ('vae', 'cvae'):
@@ -158,9 +158,8 @@ def main():
         history = []
 
         for epoch in range(1, args.epochs + 1):
-            train_loss, train_recon, train_kl = train_vae_one_epoch(
-                model, train_loader, optimizer, epoch, args.epochs, device, conditional)
-            val_loss, val_recon, val_kl = evaluate(model, val_loader, epoch, args.epochs, device, conditional)
+            train_loss, train_recon, train_kl = train_vae_one_epoch(model, train_loader, optimizer, epoch, args.epochs, device, args.free_bits, conditional)
+            val_loss, val_recon, val_kl = evaluate(model, val_loader, epoch, args.epochs, device, args.free_bits, conditional)
             scheduler.step()
 
             if val_loss < best_val_loss and beta_schedule(epoch, args.epochs) >= 1.0:
@@ -195,8 +194,7 @@ def main():
         history = []
 
         for epoch in range(1, args.epochs + 1):
-            d_loss, g_loss = train_gan_one_epoch(
-                model, train_loader, opt_g, opt_d, device, args.n_critic)
+            d_loss, g_loss = train_gan_one_epoch(model, train_loader, opt_g, opt_d, device, args.n_critic)
             # save checkpoint when loss improves
             if g_loss < best_g_loss:
                 best_g_loss = g_loss
