@@ -1,29 +1,14 @@
-# Python
+# python
 __pycache__/
 *.pyc
 *.pyo
-catboost_info/
-
-# Packaging
-*.egg-info/
-dist/
-build/
 
 # environment
-.venv/
-venv*/
 .python-version
 .vscode/
 .DS_Store
-
-# tests
-test*/
-test.*
+.claude/
+CLAUDE.md
 
 # results
 results/
-checkpoints/
-
-# claude
-.claude/
-CLAUDE.md
