@@ -36,7 +36,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--force_rebuild', action='store_true')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--free_bits', type=float, default=0.0)
-    p.add_argument('--latent_dim', type=int, default=32)
     return p.parse_args()
 
 # utils
@@ -102,9 +101,9 @@ def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.
             'log_loss':    float(log_loss(y_test, y_prob)),
             'per_class_f1': {cls: float(report.get(str(i), {}).get('f1-score', float('nan'))) for i, cls in enumerate(CLASSES)}}
 
-def save_result(result: dict, model: str, region: str, seed: int, latent_dim: int, free_bits: float = 0.0) -> None:
+def save_result(result: dict, model: str, region: str, seed: int, free_bits: float = 0.0) -> None:
     os.makedirs(f'results/experiments/{model}', exist_ok=True)
-    run_id = (f'{region}_s{seed}_ld{latent_dim}_fb{free_bits}' if model in ('vae', 'cvae') else f'{region}_s{seed}_ld{latent_dim}')
+    run_id = (f'{region}_s{seed}_fb{free_bits}' if model in ('vae', 'cvae') else f'{region}_s{seed}')
     path = f'results/experiments/{model}/{run_id}_tstr.json'
 
     def _json_safe(obj):
@@ -232,8 +231,8 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int) -> dict:
     return cache
 
 # train synthetic test real
-def load_model(model_name: str, region: str, device: 'torch.device', seed: int, latent_dim: int, free_bits: float = 0.0) -> tuple[torch.nn.Module, dict]:
-    run_id = (f'{region}_s{seed}_ld{latent_dim}_fb{free_bits}' if model_name in ('vae', 'cvae') else f'{region}_s{seed}_ld{latent_dim}')
+def load_model(model_name: str, region: str, device: 'torch.device', seed: int, free_bits: float = 0.0) -> tuple[torch.nn.Module, dict]:
+    run_id = (f'{region}_s{seed}_fb{free_bits}' if model_name in ('vae', 'cvae') else f'{region}_s{seed}')
     ckpt_path = f'results/experiments/{model_name}/{run_id}_checkpoint.pt'
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}\n'
@@ -282,8 +281,8 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
 
     return signals_phys, labels
 
-def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int, latent_dim: int = 32, free_bits: float = 0.0) -> dict:
-    model, ckpt_stats = load_model(model_name, region, device, seed, latent_dim, free_bits)
+def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int, free_bits: float = 0.0) -> dict:
+    model, ckpt_stats = load_model(model_name, region, device, seed, free_bits)
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
     synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device)
@@ -369,17 +368,17 @@ def main():
                   'feature_overlap': None,
                   'top_20_synth_features': None,
                   'trtr_metrics': cache['trtr_metrics']}
-        save_result(result, args.model, args.region, args.seed, args.latent_dim)
+        save_result(result, args.model, args.region, args.seed)
         save_summary(result)
         print('[TRTR] Finished.')
         return
 
     # train-synthetic-test-real
     n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
-    result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, args.latent_dim, args.free_bits)
+    result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, args.free_bits)
 
     # save tstr results
-    save_result(result, args.model, args.region, args.seed, args.latent_dim, args.free_bits)
+    save_result(result, args.model, args.region, args.seed, args.free_bits)
     save_summary(result)
     print('[TSTR] Finished.')
 
