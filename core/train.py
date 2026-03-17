@@ -74,6 +74,23 @@ def evaluate(model, loader, epoch, total_epochs, device, free_bits, conditional=
     n = len(loader)
     return total_loss / n, recon_sum / n, kl_sum / n
 
+@torch.no_grad()
+def active_dims(model, dataset, device, threshold=0.1, conditional=False):
+    mus, logvars = [], []
+    for i in range(len(dataset)):
+        signal, _, label = dataset[i]
+        signal = signal.unsqueeze(0).to(device)
+        if conditional:
+            mu, logvar = model.encoder(signal, torch.tensor([label]).long().to(device))
+        else:
+            mu, logvar = model.encoder(signal)
+        mus.append(mu.squeeze(0).cpu())
+        logvars.append(logvar.squeeze(0).cpu())
+    mus     = torch.stack(mus)
+    logvars = torch.stack(logvars)
+    kl_per_dim = -0.5 * (1 + logvars - mus.pow(2) - logvars.exp()).mean(dim=0)
+    return int((kl_per_dim > threshold).sum().item())
+
 # gan training
 GP_LAMBDA  = 10 # gradient penalty coefficient
 CLS_LAMBDA = 1.0 # auxiliary classifier loss weight
@@ -142,7 +159,7 @@ def main():
 
     # paths
     os.makedirs(f'results/experiments/{args.model}', exist_ok=True)
-    run_id = (f'{args.region}_s{args.seed}_ld{args.latent_dim}_fb{args.free_bits}' if args.model in ('vae', 'cvae')
+    run_id = (f'{args.region}_s{args.seed}_fb{args.free_bits}' if args.model in ('vae', 'cvae')
               else f'{args.region}_s{args.seed}')
     ckpt_path = f'results/experiments/{args.model}/{run_id}_checkpoint.pt'
     history_path = f'results/experiments/{args.model}/{run_id}_train_history.csv'
@@ -172,13 +189,16 @@ def main():
                 torch.save(ckpt, ckpt_path)
 
             beta = beta_schedule(epoch, args.epochs)
+            n_active = active_dims(model, train_ds, device, conditional=conditional)
             history.append({'epoch': epoch, 'beta': beta,
                             'train_loss': train_loss, 'train_recon': train_recon, 'train_kl': train_kl,
-                            'val_loss':   val_loss,   'val_recon':   val_recon,   'val_kl':   val_kl})
+                            'val_loss': val_loss, 'val_recon': val_recon, 'val_kl': val_kl,
+                            'active_dims': n_active})
             if epoch % args.log_every == 0 or epoch == 1:
                 print(f'Epoch {epoch:4d}/{args.epochs} | beta={beta:.2f} | '
                       f'train loss={train_loss:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}) | '
-                      f'val loss={val_loss:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})')
+                      f'val loss={val_loss:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f}) | '
+                      f'active_dims={n_active}')
 
         print(f'Best val loss: {best_val_loss} | Checkpoint: {ckpt_path}')
 
