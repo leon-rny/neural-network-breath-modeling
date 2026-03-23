@@ -193,7 +193,7 @@ def main():
     args = parse_args()
 
     # paths
-    os.makedirs(f'results/experiments/{args.model}', exist_ok=True)
+    os.makedirs(f'results/{args.model}', exist_ok=True)
     if args.model == 'vae':
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_fb{args.free_bits}'
     elif args.model == 'cvae':
@@ -204,8 +204,8 @@ def main():
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_lp{args.lambda_physics}_fb{args.free_bits}'
     else:
         run_id = f'{args.region}_s{args.seed}'
-    ckpt_path = f'results/experiments/{args.model}/{run_id}_checkpoint.pt'
-    history_path = f'results/experiments/{args.model}/{run_id}_train_history.csv'
+    ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
+    history_path = f'results/{args.model}/{run_id}_train_history.csv'
 
     # reproducibility
     torch.manual_seed(args.seed)

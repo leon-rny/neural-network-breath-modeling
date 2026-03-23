@@ -24,7 +24,6 @@ from models.vae import CVAE, CVAEPart, VAE
 from models.gan import CGAN
 from models.pinn import PINNCVAE
 
-CACHE_DIR = 'results/cache'
 
 # cli
 def parse_args() -> argparse.Namespace:
@@ -112,8 +111,8 @@ def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.
 
 def save_result(result: dict, model: str, run_id: str) -> None:
     # paths
-    os.makedirs(f'results/experiments/{model}', exist_ok=True)
-    path = f'results/experiments/{model}/{run_id}_tstr.json'
+    os.makedirs(f'results/{model}', exist_ok=True)
+    path = f'results/{model}/{run_id}_tstr.json'
 
     def _json_safe(obj):
         if isinstance(obj, float) and np.isnan(obj):
@@ -173,7 +172,7 @@ def save_summary(result: dict) -> None:
 
 # train real test real
 def _cache_path(region: str, seed: int) -> str:
-    return os.path.join(CACHE_DIR, f'{region}_cache_s{seed}.pkl')
+    return f'results/trtr/{region}_s{seed}_checkpoint.pkl'
 
 def load_cache(region: str, seed: int) -> dict | None:
     path = _cache_path(region, seed)
@@ -248,6 +247,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int) -> dict:
              'n_train': len(df_train),
              'trtr_metrics': trtr_metrics,
              'seed': seed}
+    os.makedirs('results/trtr', exist_ok=True)
     with open(_cache_path(region, seed), 'wb') as f:
         pickle.dump(cache, f)
 
@@ -256,7 +256,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int) -> dict:
 # train synthetic test real
 def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[torch.nn.Module, dict]:
     # load model
-    ckpt_path = f'results/experiments/{model_name}/{run_id}_checkpoint.pt'
+    ckpt_path = f'results/{model_name}/{run_id}_checkpoint.pt'
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -423,7 +423,6 @@ def main():
     # reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    os.makedirs(CACHE_DIR, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else
                           'mps'  if torch.backends.mps.is_available() else 'cpu')
     print(f'[TRTR] Region: {args.region}' if args.model == 'trtr' else f'[TSTR] Region: {args.region}')
