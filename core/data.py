@@ -89,16 +89,17 @@ class BreathDataset(Dataset):
         """
         return len(self.records)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         """
         Gets the sample at the specified index, applies baseline correction and z-score normalisation
         so the network treats them equally and makes gradient-based optimisation more stable.
         
         :param idx: Index of the sample to retrieve.
-        :return: A tuple of (signal, time, label) where:
+        :return: A tuple of (signal, time, label, participant) where:
             - signal is a (2, 36) float32 tensor of [humidity, temperature], z-score normalised on raw signals
             - time is a (36,) float32 tensor of seconds, aligned to 0
             - label is an int representing the class index
+            - participant is an int representing the participant index
         """
         r = self.records[idx]
 
