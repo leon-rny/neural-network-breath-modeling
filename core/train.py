@@ -159,8 +159,12 @@ def main():
 
     # paths
     os.makedirs(f'results/experiments/{args.model}', exist_ok=True)
-    run_id = (f'{args.region}_s{args.seed}_fb{args.free_bits}' if args.model in ('vae', 'cvae')
-              else f'{args.region}_s{args.seed}')
+    if args.model == 'cvae':
+        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
+    elif args.model == 'vae':
+        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_fb{args.free_bits}'
+    else:
+        run_id = f'{args.region}_s{args.seed}'
     ckpt_path = f'results/experiments/{args.model}/{run_id}_checkpoint.pt'
     history_path = f'results/experiments/{args.model}/{run_id}_train_history.csv'
 
@@ -189,7 +193,7 @@ def main():
                 torch.save(ckpt, ckpt_path)
 
             beta = beta_schedule(epoch, args.epochs)
-            n_active = active_dims(model, train_ds, device, conditional=conditional)
+            n_active = active_dims(model, train_ds, device, conditional=conditional) if epoch % args.log_every == 0 or epoch == 1 else history[-1]['active_dims'] if history else 0
             history.append({'epoch': epoch, 'beta': beta,
                             'train_loss': train_loss, 'train_recon': train_recon, 'train_kl': train_kl,
                             'val_loss': val_loss, 'val_recon': val_recon, 'val_kl': val_kl,
