@@ -9,6 +9,8 @@ from torch.utils.data import Dataset
 
 CLASSES = ['bradypnea', 'eupnea', 'tachypnea']
 CLASS_TO_IDX = {cls: i for i, cls in enumerate(CLASSES)}
+PARTICIPANTS = ['a', 'p', 's']
+PARTICIPANT_TO_IDX = {p: i for i, p in enumerate(PARTICIPANTS)}
 
 def load_dataset(dataset_dir: str = 'dataset') -> pd.DataFrame:
     """
@@ -106,6 +108,7 @@ class BreathDataset(Dataset):
 
         signal = torch.tensor(np.stack([h, t], axis=0), dtype=torch.float32)
         time = torch.tensor(r['time'] - r['time'][0],  dtype=torch.float32)
-        label  = CLASS_TO_IDX[r['class']]
+        label = CLASS_TO_IDX[r['class']]
+        participant = PARTICIPANT_TO_IDX[r['participant']]
 
-        return signal, time, label
+        return signal, time, label, participant
