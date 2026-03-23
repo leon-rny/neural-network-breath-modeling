@@ -30,12 +30,16 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='TSTR evaluation for breath signal generative models')
     p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'gan'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
+    p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
     p.add_argument('--n_synthetic', type=int, default=None)
+    p.add_argument('--augmentation_ratio', type=float, default=1.0)
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--n_jobs', type=int, default=4)
     p.add_argument('--force_rebuild', action='store_true')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--free_bits', type=float, default=0.0)
+    p.add_argument('--latent_dim', type=int, default=32)
+    p.add_argument('--embed_dim', type=int, default=16)
     return p.parse_args()
 
 # utils
@@ -101,9 +105,15 @@ def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.
             'log_loss':    float(log_loss(y_test, y_prob)),
             'per_class_f1': {cls: float(report.get(str(i), {}).get('f1-score', float('nan'))) for i, cls in enumerate(CLASSES)}}
 
-def save_result(result: dict, model: str, region: str, seed: int, free_bits: float = 0.0) -> None:
+def save_result(result: dict, model: str, region: str, seed: int, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16) -> None:
     os.makedirs(f'results/experiments/{model}', exist_ok=True)
-    run_id = (f'{region}_s{seed}_fb{free_bits}' if model in ('vae', 'cvae') else f'{region}_s{seed}')
+    base_model = model.removesuffix('_plus')
+    if base_model == 'cvae':
+        run_id = f'{region}_s{seed}_ld{latent_dim}_ed{embed_dim}_fb{free_bits}'
+    elif base_model == 'vae':
+        run_id = f'{region}_s{seed}_ld{latent_dim}_fb{free_bits}'
+    else:
+        run_id = f'{region}_s{seed}'
     path = f'results/experiments/{model}/{run_id}_tstr.json'
 
     def _json_safe(obj):
@@ -129,6 +139,8 @@ def save_summary(result: dict) -> None:
     new_row = {'model': result['model'],
                'region': result['region'],
                'seed': result.get('seed'),
+               'latent_dim': result.get('latent_dim'),
+               'embed_dim': result.get('embed_dim'),
                'free_bits': result.get('free_bits'),
                'accuracy': m['accuracy'],
                'f1_weighted': m['f1_weighted'],
@@ -138,12 +150,23 @@ def save_summary(result: dict) -> None:
                'f1_eupnea': m['per_class_f1']['eupnea'],
                'f1_tachypnea': m['per_class_f1']['tachypnea'],
                'feature_overlap': result.get('feature_overlap'),
-               'n_synthetic': result.get('n_synthetic', result['n_train_real'])}
+               'n_synthetic': result.get('n_synthetic', result['n_train_real']),
+               'n_train_real': result.get('n_train_real'),
+               'augmentation_ratio': result.get('augmentation_ratio')}
     df_row = pd.DataFrame([new_row])
     if os.path.exists(csv_path):
         df_old = pd.read_csv(csv_path)
-        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(
-            subset=['model', 'region', 'seed', 'free_bits'], keep='last')
+        for col in df_row.columns:
+            if col not in df_old.columns:
+                df_old[col] = pd.NA
+        for col in df_old.columns:
+            if col not in df_row.columns:
+                df_row[col] = pd.NA
+            try:
+                df_row[col] = df_row[col].astype(df_old[col].dtype)
+            except (ValueError, TypeError):
+                pass
+        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(subset=['model', 'region', 'seed', 'latent_dim', 'embed_dim', 'free_bits', 'augmentation_ratio'], keep='last')
     else:
         df_new = df_row
     df_new.to_csv(csv_path, index=False)
@@ -231,8 +254,13 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int) -> dict:
     return cache
 
 # train synthetic test real
-def load_model(model_name: str, region: str, device: 'torch.device', seed: int, free_bits: float = 0.0) -> tuple[torch.nn.Module, dict]:
-    run_id = (f'{region}_s{seed}_fb{free_bits}' if model_name in ('vae', 'cvae') else f'{region}_s{seed}')
+def load_model(model_name: str, region: str, device: 'torch.device', seed: int, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16) -> tuple[torch.nn.Module, dict]:
+    if model_name == 'cvae':
+        run_id = f'{region}_s{seed}_ld{latent_dim}_ed{embed_dim}_fb{free_bits}'
+    elif model_name == 'vae':
+        run_id = f'{region}_s{seed}_ld{latent_dim}_fb{free_bits}'
+    else:
+        run_id = f'{region}_s{seed}'
     ckpt_path = f'results/experiments/{model_name}/{run_id}_checkpoint.pt'
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}\n'
@@ -281,8 +309,8 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
 
     return signals_phys, labels
 
-def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int, free_bits: float = 0.0) -> dict:
-    model, ckpt_stats = load_model(model_name, region, device, seed, free_bits)
+def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16) -> dict:
+    model, ckpt_stats = load_model(model_name, region, device, seed, free_bits, latent_dim, embed_dim)
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
     synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device)
@@ -321,6 +349,8 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     return {'model': model_name,
             'region': region,
             'seed': seed,
+            'latent_dim': latent_dim,
+            'embed_dim': embed_dim,
             'free_bits': free_bits,
             'n_train_real': cache['n_train'],
             'n_synthetic': n_synthetic,
@@ -328,6 +358,47 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
             'metrics': tstr_metrics,
             'feature_overlap': overlap,
             'top_20_synth_features': top_k_synth,
+            'trtr_metrics': cache['trtr_metrics']}
+
+def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, seed: int, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16) -> dict:
+    n_synthetic = int(cache['n_train'] * augmentation_ratio)
+    model, ckpt_stats = load_model(model_name, region, device, seed, free_bits, latent_dim, embed_dim)
+    print(f'[TSTR+] model={model_name}, n_synthetic={n_synthetic}, n_train_real={cache["n_train"]}')
+
+    synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device)
+    print(f'[TSTR+] Generated {n_synthetic} synthetic signals')
+
+    n, _C, T = synth_signals.shape
+    ids = np.repeat(np.arange(n), T)
+    times = np.tile(np.arange(T), n)
+    df_long_synth = pd.DataFrame({'id': ids, 'time': times,
+                                  'Humidity': synth_signals[:, 0, :].ravel(),
+                                  'Temperature': synth_signals[:, 1, :].ravel()})
+
+    X_synth_raw = extract_fixed_features(df_long_synth, cache['top_20_features_raw'], n_jobs)
+    X_san = X_synth_raw.copy()
+    X_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_san.columns]
+    X_synth_top = X_san[cache['top_20_features_sanitized']].values
+
+    X_combined = np.concatenate([cache['X_train_top'], X_synth_top])
+    y_combined = np.concatenate([cache['y_train'], synth_labels])
+
+    stacker = train_stacking_classifier(X_combined, y_combined, seed)
+    metrics = evaluate_classifier(stacker, cache['X_test_top'], cache['y_test'])
+
+    return {'model': f'{model_name}_plus',
+            'region': region,
+            'seed': seed,
+            'latent_dim': latent_dim,
+            'embed_dim': embed_dim,
+            'free_bits': free_bits,
+            'n_train_real': cache['n_train'],
+            'n_synthetic': n_synthetic,
+            'augmentation_ratio': augmentation_ratio,
+            'top_20_features': cache['top_20_features_sanitized'],
+            'metrics': metrics,
+            'feature_overlap': None,
+            'top_20_synth_features': None,
             'trtr_metrics': cache['trtr_metrics']}
 
 # main
@@ -374,13 +445,17 @@ def main():
         return
 
     # train-synthetic-test-real
-    n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
-    result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, args.free_bits)
-
-    # save tstr results
-    save_result(result, args.model, args.region, args.seed, args.free_bits)
-    save_summary(result)
-    print('[TSTR] Finished.')
+    if args.mode == 'tstr_plus':
+        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.seed, args.free_bits, args.latent_dim, args.embed_dim)
+        save_result(result, result['model'], args.region, args.seed, args.free_bits, args.latent_dim, args.embed_dim)
+        save_summary(result)
+        print('[TSTR+] Finished.')
+    else:
+        n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
+        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, args.free_bits, args.latent_dim, args.embed_dim)
+        save_result(result, args.model, args.region, args.seed, args.free_bits, args.latent_dim, args.embed_dim)
+        save_summary(result)
+        print('[TSTR] Finished.')
 
 if __name__ == '__main__':
     main()
