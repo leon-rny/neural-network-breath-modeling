@@ -20,10 +20,9 @@ from sklearn.metrics import accuracy_score, classification_report, f1_score, log
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 
 from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, split_dataset
-from models.vae import CVAE, CVAEPart, VAE
+from models.vae import CVAE, VAE
 from models.gan import CGAN
 from models.pinn import PINNCVAE
-
 
 # cli
 def parse_args() -> argparse.Namespace:
@@ -267,7 +266,7 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
     elif model_name == 'cvae':
         model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
     elif model_name == 'cvae_part':
-        model = CVAEPart(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'], part_embed_dim=ckpt['part_embed_dim'])
+        model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'], condition_on_participant=True, part_embed_dim=ckpt['part_embed_dim'])
     elif model_name == 'gan':
         model = CGAN(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
     elif model_name == 'pinn':

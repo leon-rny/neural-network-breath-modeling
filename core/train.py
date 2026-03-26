@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from core.data import BreathDataset, load_dataset, split_dataset
-from models.vae import VAE, CVAE, CVAEPart, elbo_loss
+from models.vae import VAE, CVAE, elbo_loss
 from models.gan import CGAN, discriminator_loss, generator_loss, gradient_penalty
 from models.pinn import PINNCVAE
 
@@ -230,7 +230,7 @@ def main():
         use_participant = args.model == 'cvae_part'
         conditional = args.model in ('cvae', 'cvae_part')
         if args.model == 'cvae_part':
-            model = CVAEPart(latent_dim=args.latent_dim, embed_dim=args.embed_dim, part_embed_dim=args.part_embed_dim).to(device)
+            model = CVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim, condition_on_participant=True, part_embed_dim=args.part_embed_dim).to(device)
         elif args.model == 'cvae':
             model = CVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim).to(device)
         else:
