@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from core.data import CLASSES, BreathDataset, load_dataset, split_dataset
 from core.train import active_dims, beta_schedule
 from core.tstr import evaluate_classifier, extract_fixed_features, load_cache, train_stacking_classifier, trtr
-from models.cvae_ablation import VARIANT_MAP
+from ablations.models.cvae_ablation import VARIANT_MAP
 from models.vae import elbo_loss
 
 # fix variables expect architecture

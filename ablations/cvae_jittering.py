@@ -305,7 +305,7 @@ def eval_config(config: str, region: str, seed: int, cache: dict,
         'f1_tachy':    metrics['per_class_f1']['tachypnea'],
     }
 
-# results 
+# results
 def save_results(rows: list[dict]) -> None:
     os.makedirs(RESULTS_DIR, exist_ok=True)
     csv_path = f'{RESULTS_DIR}/summary.csv'
