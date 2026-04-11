@@ -40,14 +40,13 @@ def parse_args() -> argparse.Namespace:
 
 # paths
 def ckpt_path(variant: str, region: str, seed: int) -> str:
-    return f'results/ablation/{variant}_{region}_s{seed}.pt'
+    return f'results/ablation_cvae_architecture/{variant}_{region}_s{seed}.pt'
 
 def hist_path(variant: str, region: str, seed: int) -> str:
-    return f'results/ablation/{variant}_{region}_s{seed}_history.csv'
+    return f'results/ablation_cvae_architecture/{variant}_{region}_s{seed}_history.csv'
 
 # training
-def train_variant(variant: str, region: str, seed: int,
-                  dataset_dir: str, device: torch.device) -> None:
+def train_variant(variant: str, region: str, seed: int, dataset_dir: str, device: torch.device) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
     torch.use_deterministic_algorithms(True, warn_only=True)
@@ -57,15 +56,13 @@ def train_variant(variant: str, region: str, seed: int,
     df = df[df['region'] == region].reset_index(drop=True)
     df_train, df_val, _ = split_dataset(df, random_state=seed)
     train_ds = BreathDataset(df_train)
-    val_ds   = BreathDataset(df_val, stats=train_ds.stats)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  drop_last=False)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False)
+    val_ds = BreathDataset(df_val, stats=train_ds.stats)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     # model + optimiser
     ModelClass = VARIANT_MAP[variant]
-    model = ModelClass(latent_dim=LATENT_DIM, embed_dim=EMBED_DIM,
-                       condition_on_participant=True,
-                       part_embed_dim=PART_EMBED_DIM).to(device)
+    model = ModelClass(latent_dim=LATENT_DIM, embed_dim=EMBED_DIM, condition_on_participant=True, part_embed_dim=PART_EMBED_DIM).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
@@ -79,17 +76,17 @@ def train_variant(variant: str, region: str, seed: int,
         model.train()
         t_loss = t_recon = t_kl = 0.0
         for signal, _time, label, participant in train_loader:
-            signal      = signal.to(device)
-            label       = label.long().to(device)
+            signal = signal.to(device)
+            label = label.long().to(device)
             participant = participant.long().to(device)
             x_hat, mu, logvar = model(signal, label, participant)
-            loss, recon, kl   = elbo_loss(signal, x_hat, mu, logvar, beta)
+            loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            t_loss  += loss.item()
+            t_loss += loss.item()
             t_recon += recon.item()
-            t_kl    += kl.item()
+            t_kl += kl.item()
         n_tr = len(train_loader)
         t_loss /= n_tr
         t_recon /= n_tr
@@ -100,14 +97,14 @@ def train_variant(variant: str, region: str, seed: int,
         v_loss = v_recon = v_kl = 0.0
         with torch.no_grad():
             for signal, _time, label, participant in val_loader:
-                signal      = signal.to(device)
-                label       = label.long().to(device)
+                signal = signal.to(device)
+                label = label.long().to(device)
                 participant = participant.long().to(device)
                 x_hat, mu, logvar = model(signal, label, participant)
-                loss, recon, kl   = elbo_loss(signal, x_hat, mu, logvar, beta)
-                v_loss  += loss.item()
+                loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta)
+                v_loss += loss.item()
                 v_recon += recon.item()
-                v_kl    += kl.item()
+                v_kl += kl.item()
         n_val = len(val_loader)
         v_loss /= n_val
         v_recon /= n_val
@@ -115,42 +112,34 @@ def train_variant(variant: str, region: str, seed: int,
 
         scheduler.step()
 
-        # checkpoint (only once beta has fully warmed up)
+        # checkpoint only once beta has fully warmed up
         if v_loss < best_val_loss and beta >= 1.0:
             best_val_loss = v_loss
             os.makedirs('results/ablation', exist_ok=True)
-            torch.save({
-                'variant':    variant,
-                'region':     region,
-                'seed':       seed,
-                'epoch':      epoch,
-                'model_state': model.state_dict(),
-                'stats':      train_ds.stats,
-                'latent_dim': LATENT_DIM,
-                'embed_dim':  EMBED_DIM,
-                'part_embed_dim': PART_EMBED_DIM,
-            }, ckpt_path(variant, region, seed))
+            torch.save({'variant':    variant,
+                        'region': region,
+                        'seed': seed,
+                        'epoch': epoch,
+                        'model_state': model.state_dict(),
+                        'stats': train_ds.stats,
+                        'latent_dim': LATENT_DIM,
+                        'embed_dim': EMBED_DIM,
+                        'part_embed_dim': PART_EMBED_DIM}, ckpt_path(variant, region, seed))
 
-        # active dims (expensive — compute only every LOG_EVERY epochs)
+        # active dims
         if epoch % LOG_EVERY == 0 or epoch == 1:
             n_active = active_dims(model, train_ds, device,
                                    conditional=True, use_participant=True)
         else:
             n_active = history[-1]['active_dims'] if history else 0
 
-        history.append({
-            'epoch': epoch, 'beta': beta,
-            'train_loss': t_loss, 'train_recon': t_recon, 'train_kl': t_kl,
-            'val_loss':   v_loss, 'val_recon':   v_recon, 'val_kl':   v_kl,
-            'active_dims': n_active,
-        })
+        history.append({'epoch': epoch, 'beta': beta,
+                        'train_loss': t_loss, 'train_recon': t_recon, 'train_kl': t_kl,
+                        'val_loss': v_loss, 'val_recon': v_recon, 'val_kl': v_kl,
+                        'active_dims': n_active})
 
         if epoch % LOG_EVERY == 0 or epoch == 1:
-            print(f'  [{variant}|{region}|s{seed}] '
-                  f'epoch {epoch:4d}/{EPOCHS} | beta={beta:.2f} | '
-                  f'train {t_loss:.4f} (r={t_recon:.4f}, kl={t_kl:.4f}) | '
-                  f'val {v_loss:.4f} (r={v_recon:.4f}, kl={v_kl:.4f}) | '
-                  f'active_dims={n_active}')
+            print(f'  [{variant}|{region}|s{seed}] epoch {epoch:4d}/{EPOCHS} | beta={beta:.2f} | train {t_loss:.4f} (r={t_recon:.4f}, kl={t_kl:.4f}) | val {v_loss:.4f} (r={v_recon:.4f}, kl={v_kl:.4f}) | active_dims={n_active}')
 
     # persist history
     os.makedirs('results/ablation', exist_ok=True)
@@ -159,8 +148,7 @@ def train_variant(variant: str, region: str, seed: int,
         writer.writeheader()
         writer.writerows(history)
 
-    print(f'  [{variant}|{region}|s{seed}] done. '
-          f'best_val={best_val_loss:.4f} | ckpt: {ckpt_path(variant, region, seed)}')
+    print(f'  [{variant}|{region}|s{seed}] done. best_val={best_val_loss:.4f} | ckpt: {ckpt_path(variant, region, seed)}')
 
 # tstr evaluation
 def eval_variant(variant: str, region: str, seed: int,
@@ -186,12 +174,12 @@ def eval_variant(variant: str, region: str, seed: int,
     counts = [n_per_class + (1 if i < remainder else 0) for i in range(len(CLASSES))]
 
     mean_t = torch.tensor(stats['mean'], dtype=torch.float32).view(1, 2, 1).to(device)
-    std_t  = torch.tensor(stats['std'],  dtype=torch.float32).view(1, 2, 1).to(device)
+    std_t  = torch.tensor(stats['std'], dtype=torch.float32).view(1, 2, 1).to(device)
 
     all_signals, all_labels = [], []
     for cls_idx, count in enumerate(counts):
         y_cls = torch.tensor(cls_idx, dtype=torch.long)
-        sigs  = model.sample(count, y_cls, device)  # (count, 2, 36) — normalised
+        sigs  = model.sample(count, y_cls, device)
         all_signals.append((sigs * std_t + mean_t).cpu().numpy())
         all_labels.append(np.full(count, cls_idx))
     synth_signals = np.concatenate(all_signals, axis=0)
@@ -200,12 +188,10 @@ def eval_variant(variant: str, region: str, seed: int,
 
     # tsfresh feature extraction on synthetic data
     n, _C, T = synth_signals.shape
-    df_long = pd.DataFrame({
-        'id':          np.repeat(np.arange(n), T),
-        'time':        np.tile(np.arange(T), n),
-        'Humidity':    synth_signals[:, 0, :].ravel(),
-        'Temperature': synth_signals[:, 1, :].ravel(),
-    })
+    df_long = pd.DataFrame({'id': np.repeat(np.arange(n), T),
+                            'time': np.tile(np.arange(T), n),
+                            'Humidity': synth_signals[:, 0, :].ravel(),
+                            'Temperature': synth_signals[:, 1, :].ravel()})
     X_raw = extract_fixed_features(df_long, cache['top_20_features_raw'], n_jobs)
     X_san = X_raw.copy()
     X_san.columns = [re.sub(r'[^\w]', '_', c) for c in X_san.columns]
@@ -224,24 +210,22 @@ def eval_variant(variant: str, region: str, seed: int,
         kl_final          = float(hist_df['train_kl'].iloc[-1])
         active_dims_final = int(hist_df['active_dims'].iloc[-1])
 
-    return {
-        'variant':     variant,
-        'region':      region,
-        'seed':        seed,
-        'accuracy':    metrics['accuracy'],
-        'f1_weighted': metrics['f1_weighted'],
-        'roc_auc':     metrics['roc_auc_ovr'],
-        'kl_final':    kl_final,
-        'active_dims': active_dims_final,
-        'f1_brady':    metrics['per_class_f1']['bradypnea'],
-        'f1_eupnea':   metrics['per_class_f1']['eupnea'],
-        'f1_tachy':    metrics['per_class_f1']['tachypnea'],
-    }
+    return {'variant': variant,
+            'region': region,
+            'seed': seed,
+            'accuracy': metrics['accuracy'],
+            'f1_weighted': metrics['f1_weighted'],
+            'roc_auc': metrics['roc_auc_ovr'],
+            'kl_final': kl_final,
+            'active_dims': active_dims_final,
+            'f1_brady': metrics['per_class_f1']['bradypnea'],
+            'f1_eupnea': metrics['per_class_f1']['eupnea'],
+            'f1_tachy': metrics['per_class_f1']['tachypnea']}
 
 # results
 def save_results(rows: list[dict]) -> None:
-    os.makedirs('results/ablation', exist_ok=True)
-    csv_path = 'results/ablation/summary.csv'
+    os.makedirs('results/ablation_cvae_architecture', exist_ok=True)
+    csv_path = 'results/ablation_cvae_architecture/summary.csv'
     df_new = pd.DataFrame(rows)
     if os.path.exists(csv_path):
         df_old = pd.read_csv(csv_path)
@@ -252,9 +236,6 @@ def save_results(rows: list[dict]) -> None:
 
 def print_summary(rows: list[dict]) -> None:
     df = pd.DataFrame(rows)
-    print('\n' + '=' * 82)
-    print('ABLATION SUMMARY')
-    print('=' * 82)
     for region in df['region'].unique():
         rdf = df[df['region'] == region]
         best_variant = rdf.groupby('variant')['accuracy'].mean().idxmax()
@@ -274,9 +255,7 @@ def print_summary(rows: list[dict]) -> None:
             kl  = vdf['kl_final'].mean()
             ad  = vdf['active_dims'].mean()
             flag = ' *' if variant == best_variant else ''
-            print(f"  {variant:<16} {acc:.3f}±{acc_s:.3f}  {f1:.3f}±{f1_s:.3f}  "
-                  f"{roc:.3f}±{roc_s:.3f}  {kl:>8.3f}  {ad:>8.1f}{flag}")
-    print('=' * 82)
+            print(f"  {variant:<16} {acc:.3f}±{acc_s:.3f}  {f1:.3f}±{f1_s:.3f}  {roc:.3f}±{roc_s:.3f}  {kl:>8.3f}  {ad:>8.1f}{flag}")
     print('  * = best accuracy for that region')
 
 # main
@@ -310,12 +289,11 @@ def main() -> None:
                 print(f'[ABLATION] Building TRTR cache region={region}, seed={seed} ...')
                 cache = trtr(args.dataset_dir, region, args.n_jobs, seed)
             caches[seed] = cache
-            print(f'[ABLATION] TRTR cache ready: region={region}, seed={seed}, '
-                  f'n_train={cache["n_train"]}, top_20 features selected')
+            print(f'[ABLATION] TRTR cache ready: region={region}, seed={seed}, n_train={cache["n_train"]}, top_20 features selected')
 
         for variant in variants:
             for seed in seeds:
-                print(f'\n[ABLATION] === {variant} | {region} | seed={seed} ===')
+                print(f'\n[ABLATION] {variant} | {region} | seed={seed}')
 
                 # train
                 path = ckpt_path(variant, region, seed)
@@ -327,9 +305,7 @@ def main() -> None:
                 # evaluate
                 row = eval_variant(variant, region, seed, caches[seed], device, args.n_jobs)
                 all_results.append(row)
-                print(f'  TSTR → acc={row["accuracy"]:.3f}, '
-                      f'f1={row["f1_weighted"]:.3f}, roc={row["roc_auc"]:.3f}, '
-                      f'kl={row["kl_final"]:.3f}, active_dims={row["active_dims"]}')
+                print(f'  TSTR: acc={row["accuracy"]:.3f}, f1={row["f1_weighted"]:.3f}, roc={row["roc_auc"]:.3f}, kl={row["kl_final"]:.3f}, active_dims={row["active_dims"]}')
 
     if all_results:
         save_results(all_results)

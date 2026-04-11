@@ -50,8 +50,7 @@ def df_to_df_long(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
 
 def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n_jobs: int = 4) -> pd.DataFrame:
     kind_to_fc = from_columns(top_features_raw)
-    X = extract_features(df_long, column_id='id', column_sort='time',
-                         kind_to_fc_parameters=kind_to_fc, n_jobs=n_jobs)
+    X = extract_features(df_long, column_id='id', column_sort='time', kind_to_fc_parameters=kind_to_fc, n_jobs=n_jobs)
     impute(X)
     missing = [c for c in top_features_raw if c not in X.columns]
     for c in missing:
@@ -91,16 +90,15 @@ def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.
         print(f'ROC-AUC failed: {e}')
         roc_auc = float('nan')
     report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
-    return {'accuracy':    float(accuracy_score(y_test, y_pred)),
+    return {'accuracy': float(accuracy_score(y_test, y_pred)),
             'f1_weighted': float(f1_score(y_test, y_pred, average='weighted', zero_division=0)),
             'roc_auc_ovr': roc_auc,
-            'log_loss':    float(log_loss(y_test, y_prob)),
-            'per_class_f1': {cls: float(report.get(str(i), {}).get('f1-score', float('nan')))
-                             for i, cls in enumerate(CLASSES)}}
+            'log_loss': float(log_loss(y_test, y_prob)),
+            'per_class_f1': {cls: float(report.get(str(i), {}).get('f1-score', float('nan'))) for i, cls in enumerate(CLASSES)}}
 
 def save_result(result: dict, run_id: str) -> None:
-    os.makedirs('results/trtr_ablation', exist_ok=True)
-    path = f'results/trtr_ablation/{run_id}_trtr.json'
+    os.makedirs('results/ablation_trtr', exist_ok=True)
+    path = f'results/ablation_trtr/{run_id}_trtr.json'
     def _json_safe(obj):
         if isinstance(obj, float) and np.isnan(obj): return None
         if isinstance(obj, np.floating): return float(obj)
@@ -113,7 +111,7 @@ def save_result(result: dict, run_id: str) -> None:
         json.dump(_json_safe(result), f, indent=2)
 
 def save_summary(result: dict) -> None:
-    csv_path = 'results/trtr_ablation_summary.csv'
+    csv_path = 'results/ablation_trtr/summary.csv'
     m = result['metrics']
     new_row = {'pipeline': result['pipeline'],
                'region': result['region'],
@@ -137,7 +135,7 @@ def save_summary(result: dict) -> None:
 
 # cache
 def _cache_path(region: str, seed: int, pipeline: str) -> str:
-    return f'results/trtr_ablation/{region}_s{seed}_{pipeline}_checkpoint.pkl'
+    return f'results/ablation_trtr/{region}_s{seed}_{pipeline}_checkpoint.pkl'
 
 def load_cache(region: str, seed: int, pipeline: str) -> dict | None:
     path = _cache_path(region, seed, pipeline)
@@ -194,8 +192,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int, pipeline: str) -
         gs = GridSearchCV(base_lgbm, param_grid, cv=StratifiedKFold(3),
                           scoring='accuracy', n_jobs=-1, verbose=0)
         gs.fit(X_tr, y_tr)
-        best_lgbm = LGBMClassifier(**gs.best_params_, n_estimators=1000,
-                                    learning_rate=0.05, random_state=seed, verbose=-1)
+        best_lgbm = LGBMClassifier(**gs.best_params_, n_estimators=1000, learning_rate=0.05, random_state=seed, verbose=-1)
         best_lgbm.fit(X_tr.values, y_tr.values,
                       eval_set=[(X_val_lgbm.values, y_val_lgbm.values)],
                       eval_metric='multi_logloss',
@@ -244,7 +241,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int, pipeline: str) -
              'metrics': metrics,
              'seed': seed,
              'pipeline': pipeline}
-    os.makedirs('results/trtr_ablation', exist_ok=True)
+    os.makedirs('results/ablation_trtr', exist_ok=True)
     with open(_cache_path(region, seed, pipeline), 'wb') as f:
         pickle.dump(cache, f)
     return cache
