@@ -22,13 +22,12 @@ from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_sp
 from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, split_dataset
 from models.vae import CVAE, VAE
 from models.gan import CGAN
-from models.pinn import PINNCVAE
 
 # cli
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'gan', 'pinn'])
+    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'gan'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
     p.add_argument('--n_synthetic', type=int, default=None)
@@ -42,7 +41,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--latent_dim', type=int, default=32)
     p.add_argument('--embed_dim', type=int, default=16)
     p.add_argument('--part_embed_dim', type=int, default=8)
-    p.add_argument('--lambda_physics', type=float, default=0.1)
     return p.parse_args()
 
 # utils
@@ -269,8 +267,6 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
         model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'], condition_on_participant=True, part_embed_dim=ckpt['part_embed_dim'])
     elif model_name == 'gan':
         model = CGAN(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
-    elif model_name == 'pinn':
-        model = PINNCVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
     else:
         raise ValueError(f'Unknown model: {model_name}')
     model.load_state_dict(ckpt['model_state'])
@@ -293,7 +289,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
             z = model.sample(n_synthetic, device)
         signals_phys = (z * std_t + mean_t).cpu().numpy()
         labels = np.concatenate([np.full(c, i) for i, c in enumerate(counts)])
-    elif model_name in ('cvae', 'cvae_part', 'gan', 'pinn'):
+    elif model_name in ('cvae', 'cvae_part', 'gan'):
         all_signals, all_labels = [], []
         for cls_idx, count in enumerate(counts):
             y_cls = torch.tensor(cls_idx, dtype=torch.long)
@@ -306,7 +302,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
 
     return signals_phys, labels
 
-def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_physics: float = 0.1) -> dict:
+def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8) -> dict:
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
@@ -350,7 +346,6 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
             'embed_dim': embed_dim,
             'part_embed_dim': part_embed_dim if model_name == 'cvae_part' else None,
             'free_bits': free_bits,
-            'lambda_physics': lambda_physics if model_name == 'pinn' else None,
             'n_train_real': cache['n_train'],
             'n_synthetic': n_synthetic,
             'top_20_features': cache['top_20_features_sanitized'],
@@ -360,7 +355,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
             'trtr_metrics': cache['trtr_metrics']}
 
 # train synthetic/real test real
-def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_physics: float = 0.1) -> dict:
+def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8) -> dict:
     n_synthetic = int(cache['n_train'] * augmentation_ratio)
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR+] model={model_name}, n_synthetic={n_synthetic}, n_train_real={cache["n_train"]}')
@@ -414,8 +409,6 @@ def main():
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
     elif base_model == 'cvae_part':
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
-    elif base_model == 'pinn':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_lp{args.lambda_physics}_fb{args.free_bits}'
     else:
         run_id = f'{args.region}_s{args.seed}'
 
@@ -461,13 +454,13 @@ def main():
 
     # train-synthetic-test-real
     if args.mode == 'tstr_plus':
-        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_physics)
+        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim)
         save_result(result, result['model'], run_id)
         save_summary(result)
         print('[TSTR+] Finished.')
     else:
         n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
-        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_physics)
+        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim)
         save_result(result, args.model, run_id)
         save_summary(result)
         print('[TSTR] Finished.')

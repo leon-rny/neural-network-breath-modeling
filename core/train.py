@@ -9,13 +9,12 @@ from torch.utils.data import DataLoader
 from core.data import BreathDataset, load_dataset, split_dataset
 from models.vae import VAE, CVAE, elbo_loss
 from models.gan import CGAN, discriminator_loss, generator_loss, gradient_penalty
-from models.pinn import PINNCVAE
 
 # cli arguments
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part', 'gan', 'pinn'])
+    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part', 'gan'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--log_every', type=int, default=25)
@@ -27,8 +26,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--embed_dim', type=int, default=16)
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--free_bits', type=float, default=0.0)
-    p.add_argument('--lambda_physics', type=float, default=0.1)
-    p.add_argument('--n_col', type=int, default=100)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--lr_g', type=float, default=None)
     p.add_argument('--lr_d', type=float, default=None)
@@ -107,45 +104,6 @@ def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_pa
     kl_per_dim = -0.5 * (1 + logvars - mus.pow(2) - logvars.exp()).mean(dim=0)
     return int((kl_per_dim > threshold).sum().item())
 
-# pinn training
-def train_pinn_one_epoch(model, loader, optimizer, epoch, total_epochs, device, free_bits, lambda_physics, n_col):
-    model.train()
-    beta = beta_schedule(epoch, total_epochs)
-    total_loss = recon_sum = kl_sum = phys_sum = 0.0
-    for signal, time, label, _participant in loader:
-        signal = signal.to(device)
-        time   = time.to(device)
-        label  = label.long().to(device)
-        x_hat, mu, logvar, physics_res = model(signal, time, label, n_col)
-        loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
-        total = loss + lambda_physics * physics_res
-        optimizer.zero_grad()
-        total.backward()
-        optimizer.step()
-        total_loss += total.item()
-        recon_sum += recon.item()
-        kl_sum += kl.item()
-        phys_sum += physics_res.item()
-    n = len(loader)
-    return total_loss / n, recon_sum / n, kl_sum / n, phys_sum / n
-
-@torch.no_grad()
-def evaluate_pinn(model, loader, epoch, total_epochs, device, free_bits):
-    model.eval()
-    beta = beta_schedule(epoch, total_epochs)
-    total_loss = recon_sum = kl_sum = 0.0
-    for signal, time, label, _participant in loader:
-        signal = signal.to(device)
-        time   = time.to(device)
-        label  = label.long().to(device)
-        x_hat, mu, logvar, _phys = model(signal, time, label)
-        loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
-        total_loss += loss.item()
-        recon_sum += recon.item()
-        kl_sum += kl.item()
-    n = len(loader)
-    return total_loss / n, recon_sum / n, kl_sum / n
-
 # gan training
 GP_LAMBDA  = 10 # gradient penalty coefficient
 CLS_LAMBDA = 1.0 # auxiliary classifier loss weight
@@ -200,8 +158,6 @@ def main():
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
     elif args.model == 'cvae_part':
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
-    elif args.model == 'pinn':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_lp{args.lambda_physics}_fb{args.free_bits}'
     else:
         run_id = f'{args.region}_s{args.seed}'
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
@@ -296,45 +252,6 @@ def main():
                 print(f'[TRAIN] Epoch {epoch:4d}/{args.epochs} | D loss={d_loss:.4f} | G loss={g_loss:.4f}')
 
         print(f'[TRAIN] Best G loss: {best_g_loss} | Checkpoint: {ckpt_path}')
-
-    # pinn branch
-    elif args.model == 'pinn':
-        model = PINNCVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-        best_val_loss = torch.inf
-        history = []
-
-        for epoch in range(1, args.epochs + 1):
-            train_loss, train_recon, train_kl, train_phys = train_pinn_one_epoch(
-                model, train_loader, optimizer, epoch, args.epochs, device,
-                args.free_bits, args.lambda_physics, args.n_col)
-            val_loss, val_recon, val_kl = evaluate_pinn(
-                model, val_loader, epoch, args.epochs, device, args.free_bits)
-            scheduler.step()
-
-            if val_loss < best_val_loss and beta_schedule(epoch, args.epochs) >= 1.0:
-                best_val_loss = val_loss
-                torch.save({'epoch': epoch, 'model_state': model.state_dict(),
-                            'stats': train_ds.stats, 'latent_dim': args.latent_dim,
-                            'embed_dim': args.embed_dim, 'region': args.region,
-                            'lambda_physics': args.lambda_physics, 'n_col': args.n_col}, ckpt_path)
-
-            beta = beta_schedule(epoch, args.epochs)
-            n_active = active_dims(model, train_ds, device, conditional=True) if epoch % args.log_every == 0 or epoch == 1 else history[-1]['active_dims'] if history else 0
-            history.append({'epoch': epoch, 'beta': beta,
-                            'train_loss': train_loss, 'train_recon': train_recon,
-                            'train_kl': train_kl, 'train_phys': train_phys,
-                            'val_loss': val_loss, 'val_recon': val_recon, 'val_kl': val_kl,
-                            'active_dims': n_active})
-            if epoch % args.log_every == 0 or epoch == 1:
-                print(f'[TRAIN] Epoch {epoch:4d}/{args.epochs} | beta={beta:.2f} | '
-                      f'train loss={train_loss:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}, phys={train_phys:.4f}) | '
-                      f'val loss={val_loss:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f}) | '
-                      f'active_dims={n_active}')
-
-        print(f'[TRAIN] Best val loss: {best_val_loss} | Checkpoint: {ckpt_path}')
 
     # save training complete history
     with open(history_path, 'w', newline='') as f:
