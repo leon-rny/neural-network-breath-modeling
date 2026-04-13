@@ -4,17 +4,20 @@ import os
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from core.data import BreathDataset, load_dataset, split_dataset
 from models.vae import VAE, CVAE, elbo_loss
 from models.gan import CGAN, discriminator_loss, generator_loss, gradient_penalty
+from models.pinn import BreathMLP
 
 # cli arguments
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part', 'gan'])
+    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part', 'gan', 'mlp'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--log_every', type=int, default=25)
@@ -105,7 +108,7 @@ def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_pa
     return int((kl_per_dim > threshold).sum().item())
 
 # gan training
-GP_LAMBDA  = 10 # gradient penalty coefficient
+GP_LAMBDA = 10 # gradient penalty coefficient
 CLS_LAMBDA = 1.0 # auxiliary classifier loss weight
 
 def train_gan_one_epoch(model, loader, opt_g, opt_d, device, n_critic):
@@ -126,7 +129,7 @@ def train_gan_one_epoch(model, loader, opt_g, opt_d, device, n_critic):
             fake_scores, fake_cls = model.discriminator(fake,   label)
             gp = gradient_penalty(model.discriminator, signal, fake, label, device)
             # WGAN-GP loss + auxiliary classification on real samples
-            d_loss = discriminator_loss(real_scores, fake_scores) + GP_LAMBDA * gp + CLS_LAMBDA * torch.nn.CrossEntropyLoss(real_cls, label)
+            d_loss = discriminator_loss(real_scores, fake_scores) + GP_LAMBDA * gp + CLS_LAMBDA * nn.CrossEntropyLoss()(real_cls, label)
             opt_d.zero_grad()
             d_loss.backward()
             opt_d.step()
@@ -135,7 +138,7 @@ def train_gan_one_epoch(model, loader, opt_g, opt_d, device, n_critic):
         z = torch.randn(B, model.latent_dim, device=device)
         fake = model.generator(z, label)
         fake_scores, fake_cls = model.discriminator(fake, label)
-        g_loss = generator_loss(fake_scores) + CLS_LAMBDA * torch.nn.CrossEntropyLoss(fake_cls, label)
+        g_loss = generator_loss(fake_scores) + CLS_LAMBDA * nn.CrossEntropyLoss()(fake_cls, label)
         opt_g.zero_grad()
         g_loss.backward()
         opt_g.step()
@@ -145,6 +148,27 @@ def train_gan_one_epoch(model, loader, opt_g, opt_d, device, n_critic):
         n += 1
 
     return d_loss_sum / n, g_loss_sum / n
+
+# mlp training
+T_MAX = 70.0
+N_TIMESTEPS = 36
+def fit_sample_mlp(signal: torch.Tensor, label: int, epochs: int = 2000, lr: float = 1e-3, device: torch.device = torch.device('cpu')) -> tuple[BreathMLP, float]:
+    model = BreathMLP().to(device)
+    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
+
+    t_data = torch.linspace(0, T_MAX, N_TIMESTEPS, device=device) / T_MAX
+    y_obs  = signal.to(device).T
+
+    for _ in range(epochs):
+        optimiser.zero_grad()
+        loss = nn.functional.mse_loss(model(t_data, label), y_obs)
+        loss.backward()
+        optimiser.step()
+
+    with torch.no_grad():
+        mse = nn.functional.mse_loss(model(t_data, label), y_obs).item()
+
+    return model.cpu(), mse
 
 # main loop
 def main():
@@ -158,6 +182,8 @@ def main():
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
     elif args.model == 'cvae_part':
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
+    elif args.model == 'mlp':
+        run_id = f'{args.region}_s{args.seed}'
     else:
         run_id = f'{args.region}_s{args.seed}'
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
@@ -253,7 +279,20 @@ def main():
 
         print(f'[TRAIN] Best G loss: {best_g_loss} | Checkpoint: {ckpt_path}')
 
-    # save training complete history
+    # mlp branch
+    elif args.model == 'mlp':
+        out_dir = f'results/mlp/{run_id}'
+        os.makedirs(out_dir, exist_ok=True)
+        fitted: list[tuple[BreathMLP, int, int]] = []
+        print(f'[TRAIN] Fitting {len(train_ds)} samples, {args.epochs} epochs each:')
+        for i in tqdm(range(len(train_ds)), total=len(train_ds), desc='fitting'):
+            signal, _, label, _ = train_ds[i]
+            model, _ = fit_sample_mlp(signal, label, epochs=args.epochs, device=device)
+            fitted.append((model, label, i))
+            torch.save(model.state_dict(), os.path.join(out_dir, f'sample_{i}.pt'))
+        return
+
+    # save training history (vae/cvae/gan)
     with open(history_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=history[0].keys())
         writer.writeheader()
