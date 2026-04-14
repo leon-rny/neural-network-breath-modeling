@@ -20,14 +20,14 @@ from sklearn.metrics import accuracy_score, classification_report, f1_score, log
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 
 from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, split_dataset
-from models.vae import CVAE, VAE
+from models.vae import CVAE, PICVAE, VAE
 from models.gan import CGAN
 
 # cli
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'gan'])
+    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'gan', 'picvae'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
     p.add_argument('--n_synthetic', type=int, default=None)
@@ -41,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--latent_dim', type=int, default=32)
     p.add_argument('--embed_dim', type=int, default=16)
     p.add_argument('--part_embed_dim', type=int, default=8)
+    p.add_argument('--lambda_physics', type=float, default=0.1)
+    p.add_argument('--ode_params_path', default='results/ode_fit/ode_params_all.csv')
     return p.parse_args()
 
 # utils
@@ -267,6 +269,9 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
         model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'], condition_on_participant=True, part_embed_dim=ckpt['part_embed_dim'])
     elif model_name == 'gan':
         model = CGAN(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
+    elif model_name == 'picvae':
+        model = PICVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'],
+                       region=ckpt['region'], ode_params_path='results/ode_fit/ode_params_all.csv')
     else:
         raise ValueError(f'Unknown model: {model_name}')
     model.load_state_dict(ckpt['model_state'])
@@ -289,7 +294,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
             z = model.sample(n_synthetic, device)
         signals_phys = (z * std_t + mean_t).cpu().numpy()
         labels = np.concatenate([np.full(c, i) for i, c in enumerate(counts)])
-    elif model_name in ('cvae', 'cvae_part', 'gan'):
+    elif model_name in ('cvae', 'cvae_part', 'gan', 'picvae'):
         all_signals, all_labels = [], []
         for cls_idx, count in enumerate(counts):
             y_cls = torch.tensor(cls_idx, dtype=torch.long)
@@ -409,6 +414,8 @@ def main():
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
     elif base_model == 'cvae_part':
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
+    elif base_model == 'picvae':
+        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}_lp{args.lambda_physics}'
     else:
         run_id = f'{args.region}_s{args.seed}'
 
