@@ -1,3 +1,4 @@
+import pandas as pd
 import torch
 import torch.nn as nn
 
@@ -256,4 +257,87 @@ class CVAE(nn.Module):
         self.eval()
         with torch.no_grad():
             return self.decoder(z, y.to(device), p)
+
+
+# Physics-Informed CVAE
+_CLASSES = ['bradypnea', 'eupnea', 'tachypnea']
+
+class PICVAE(nn.Module):
+    def __init__(self, latent_dim: int = 16, num_classes: int = 3, embed_dim: int = 8, region: str = 'mouth', ode_params_path: str = 'results/ode_fit/ode_params_all.csv') -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_classes = num_classes
+        self.encoder = ConditionalEncoder(latent_dim, num_classes, embed_dim)
+        self.decoder = ConditionalDecoder(latent_dim, num_classes, embed_dim)
+
+        # Learnable physics parameters: (num_classes, 4) -> [alpha_H, c_H, alpha_T, c_T]
+        self.physics_params = nn.Embedding(num_classes, 4)
+        self._init_physics_params(region, ode_params_path)
+
+    def _init_physics_params(self, region: str, ode_params_path: str) -> None:
+        """Load per-class, per-region means from ODE fit CSV and set embedding weights."""
+        df = pd.read_csv(ode_params_path)
+        df = df[df['region'] == region]
+        weights = torch.zeros(self.num_classes, 4)
+        for i, cls in enumerate(_CLASSES):
+            means = df[df['label'] == cls][['alpha_H', 'c_H', 'alpha_T', 'c_T']].mean()
+            weights[i] = torch.tensor(means.values, dtype=torch.float32)
+        with torch.no_grad():
+            self.physics_params.weight.copy_(weights)
+
+    def physics_loss(self, y_hat: torch.Tensor, labels: torch.Tensor, dt: float = 2.0) -> torch.Tensor:
+        """
+        Compute ODE residual loss on decoder output.
+
+        :param y_hat:  (B, 2, 36) decoder output (normalised signal space)
+        :param labels: (B,) integer class labels
+        :param dt:     timestep in seconds (default 2.0)
+        :return: scalar physics residual loss
+        """
+        params = self.physics_params(labels)          # (B, 4)
+        alpha_H = params[:, 0].unsqueeze(1)           # (B, 1)
+        c_H     = params[:, 1].unsqueeze(1)           # (B, 1)
+        alpha_T = params[:, 2].unsqueeze(1)           # (B, 1)
+        c_T     = params[:, 3].unsqueeze(1)           # (B, 1)
+
+        dy = (y_hat[:, :, 1:] - y_hat[:, :, :-1]) / dt  # (B, 2, 35)
+
+        R_H = dy[:, 0, :] + alpha_H * y_hat[:, 0, :-1] - c_H  # (B, 35)
+        R_T = dy[:, 1, :] + alpha_T * y_hat[:, 1, :-1] - c_T  # (B, 35)
+
+        return (R_H.pow(2) + R_T.pow(2)).mean()
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            std = (0.5 * logvar).exp()
+            return mu + std * torch.randn_like(std)
+        return mu
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        :param x: (B, 2, 36) input signals
+        :param y: (B,) integer class labels
+        :return: (B, 2, 36) reconstructed signals, (B, latent_dim) mu, (B, latent_dim) logvar
+        """
+        mu, logvar = self.encoder(x, y)
+        z = self.reparameterize(mu, logvar)
+        x_hat = self.decoder(z, y)
+        return x_hat, mu, logvar
+
+    def sample(self, n: int, y: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """
+        Sample n signals conditioned on class labels y.
+        Output format is identical to CVAE.sample() for tstr.py compatibility.
+
+        :param n: number of samples to generate
+        :param y: (n,) integer class labels (or scalar broadcast to all n samples)
+        :param device: device to perform sampling on
+        :return: (n, 2, 36) generated signals
+        """
+        z = torch.randn(n, self.latent_dim, device=device)
+        if y.dim() == 0:
+            y = y.expand(n)
+        self.eval()
+        with torch.no_grad():
+            return self.decoder(z, y.to(device))
 
