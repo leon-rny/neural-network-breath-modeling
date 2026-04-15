@@ -9,6 +9,7 @@ start_time=$(date +%s)
 for region in "${REGIONS[@]}"; do
   for augmentation_ratio in "${AUGMENTATION_RATIOS[@]}"; do
     for seed in "${SEEDS[@]}"; do
+      export PYTHONHASHSEED=$seed
       python -m core.tstr --model cvae --region "$region" --seed "$seed" --mode tstr_plus --augmentation_ratio "$augmentation_ratio"
     done
   done

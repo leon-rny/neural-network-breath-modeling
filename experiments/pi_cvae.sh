@@ -1,15 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-REGIONS=(mouth)
+REGIONS=(mouth nose)
 SEEDS=(0 1 7 42 123)
 
 start_time=$(date +%s)
 for region in "${REGIONS[@]}"; do
   for seed in "${SEEDS[@]}"; do
     export PYTHONHASHSEED=$seed
-    python train_picvae.py --region "$region" --seed "$seed" --lambda_physics 0.001
-    python -m core.tstr  --model picvae --region "$region" --seed "$seed" --lambda_physics 0.001
+    python train_pi_cvae.py --region "$region" --seed "$seed"
   done
 done
 end_time=$(date +%s)

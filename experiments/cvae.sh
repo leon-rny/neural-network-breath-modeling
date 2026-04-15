@@ -7,6 +7,7 @@ SEEDS=(0 1 7 42 123)
 start_time=$(date +%s)
 for region in "${REGIONS[@]}"; do
   for seed in "${SEEDS[@]}"; do
+    export PYTHONHASHSEED=$seed
     python -m core.train --model cvae --region "$region" --seed "$seed"
     python -m core.tstr  --model cvae --region "$region" --seed "$seed"
   done

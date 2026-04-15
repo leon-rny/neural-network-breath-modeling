@@ -1,6 +1,10 @@
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+# per-sample MLP
 class BreathMLP(nn.Module):
     def __init__(self, hidden: int = 128, n_layers: int = 4) -> None:
         super().__init__()
@@ -16,3 +20,5 @@ class BreathMLP(nn.Module):
         oh[:, class_idx] = 1.0
         x = torch.cat([t, oh], dim=1)
         return self.net(x)
+    
+

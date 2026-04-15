@@ -28,6 +28,7 @@ export PYTHONUNBUFFERED=1
 
 REGION="mouth"
 SEED=42
+export PYTHONHASHSEED=$SEED
 
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib_${SLURM_JOB_ID}"
 mkdir -p "$MPLCONFIGDIR"

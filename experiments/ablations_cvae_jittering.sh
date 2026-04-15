@@ -19,6 +19,7 @@ CONFIGS=(
 start_time=$(date +%s)
 for region in "${REGIONS[@]}"; do
   for seed in "${SEEDS[@]}"; do
+    export PYTHONHASHSEED=$seed
     for config in "${CONFIGS[@]}"; do
       python -m ablations.cvae_jittering --config "$config" --region "$region" --seed "$seed"
     done

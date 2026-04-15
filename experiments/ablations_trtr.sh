@@ -9,6 +9,7 @@ start_time=$(date +%s)
 for pipeline in "${PIPELINES[@]}"; do
   for region in "${REGIONS[@]}"; do
     for seed in "${SEEDS[@]}"; do
+      export PYTHONHASHSEED=$seed
       python -m ablations.trtr \
         --region "$region" \
         --pipeline "$pipeline" \

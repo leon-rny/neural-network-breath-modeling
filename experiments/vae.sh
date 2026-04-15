@@ -9,6 +9,7 @@ start_time=$(date +%s)
 for region in "${REGIONS[@]}"; do
   for fb in "${FREE_BITS[@]}"; do
     for seed in "${SEEDS[@]}"; do
+      export PYTHONHASHSEED=$seed
       python -m core.train --model vae --region "$region" --seed "$seed" --free_bits "$fb"
       python -m core.tstr  --model vae --region "$region" --seed "$seed" --free_bits "$fb"
     done

@@ -14,3 +14,6 @@ CLAUDE.md
 results/
 test.*
 *.pdf
+
+# others
+OSL-SingleSource/
