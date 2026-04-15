@@ -2,13 +2,13 @@ import argparse
 import csv
 import os
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from core.data import BreathDataset, load_dataset, split_dataset
+from core.utils import seed_everything, seed_worker, make_generator
 from models.vae import VAE, CVAE, elbo_loss
 from models.gan import CGAN, discriminator_loss, generator_loss, gradient_penalty
 from models.pinn import BreathMLP
@@ -33,16 +33,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--lr_g', type=float, default=None)
     p.add_argument('--lr_d', type=float, default=None)
     p.add_argument('--n_critic', type=int, default=5)
+    p.add_argument('--beta_max', type=float, default=0.1)
     return p.parse_args()
 
 # vae and cvae training
-def beta_schedule(epoch: int, total_epochs: int) -> float:
-    """Linear beta anneal: 0 -> 1 over first half of training to avoid posterior collapse."""
-    return min(1.0, epoch / (total_epochs * 0.5))
+def beta_capped(epoch: int, total_epochs: int, beta_max: float = 0.1) -> float:
+    """Linear warmup from 0 → beta_max over first half of training, then hold."""
+    warmup_epochs = total_epochs * 0.5
+    return min(beta_max, (epoch / warmup_epochs) * beta_max)
 
-def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, free_bits, conditional=False, use_participant=False):
+def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1):
     model.train()
-    beta = beta_schedule(epoch, total_epochs)
+    beta = beta_capped(epoch, total_epochs, beta_max=beta_max)
     total_loss = recon_sum = kl_sum = 0.0
     for signal, _time, label, participant in loader:
         signal = signal.to(device)
@@ -66,9 +68,9 @@ def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, f
     return total_loss / n, recon_sum / n, kl_sum / n
 
 @torch.no_grad()
-def evaluate(model, loader, epoch, total_epochs, device, free_bits, conditional=False, use_participant=False):
+def evaluate(model, loader, epoch, total_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1):
     model.eval()
-    beta = beta_schedule(epoch, total_epochs)
+    beta = beta_capped(epoch, total_epochs, beta_max=beta_max)
     total_loss = recon_sum = kl_sum = 0.0
     for signal, _time, label, participant in loader:
         signal = signal.to(device)
@@ -83,8 +85,8 @@ def evaluate(model, loader, epoch, total_epochs, device, free_bits, conditional=
             x_hat, mu, logvar = model(signal)
         loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
         total_loss += loss.item()
-        recon_sum  += recon.item()
-        kl_sum     += kl.item()
+        recon_sum += recon.item()
+        kl_sum += kl.item()
     n = len(loader)
     return total_loss / n, recon_sum / n, kl_sum / n
 
@@ -173,6 +175,8 @@ def fit_sample_mlp(signal: torch.Tensor, label: int, epochs: int = 2000, lr: flo
 # main loop
 def main():
     args = parse_args()
+    device = torch.device('cpu')
+    print(f'[TRAIN] Seed: {args.seed} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
 
     # paths
     os.makedirs(f'results/{args.model}', exist_ok=True)
@@ -190,22 +194,17 @@ def main():
     history_path = f'results/{args.model}/{run_id}_train_history.csv'
 
     # reproducibility
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else
-                          'mps' if torch.backends.mps.is_available() else 'cpu')
-    print(f'Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
+    seed_everything(args.seed)
+    g = make_generator(args.seed)
 
-    # data set
+    # dataset
     df = load_dataset(args.dataset_dir)
     df = df[df['region'] == args.region].reset_index(drop=True)
     df_train, df_val, _ = split_dataset(df, random_state=args.seed)
     train_ds = BreathDataset(df_train)
     val_ds = BreathDataset(df_val, stats=train_ds.stats)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  drop_last=False)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-    print(f'[TRAIN] Trials for {args.region}: {len(df)}')
 
     # vae, cvae, and cvae_part branch
     if args.model in ('vae', 'cvae', 'cvae_part'):
@@ -223,12 +222,13 @@ def main():
         best_val_loss = torch.inf
         history = []
 
-        for epoch in range(1, args.epochs + 1):
-            train_loss, train_recon, train_kl = train_vae_one_epoch(model, train_loader, optimizer, epoch, args.epochs, device, args.free_bits, conditional, use_participant)
-            val_loss, val_recon, val_kl = evaluate(model, val_loader, epoch, args.epochs, device, args.free_bits, conditional, use_participant)
+        epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
+        for epoch in epoch_bar:
+            train_loss, train_recon, train_kl = train_vae_one_epoch(model, train_loader, optimizer, epoch, args.epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max)
+            val_loss, val_recon, val_kl = evaluate(model, val_loader, epoch, args.epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max)
             scheduler.step()
 
-            if val_loss < best_val_loss and beta_schedule(epoch, args.epochs) >= 1.0:
+            if val_loss < best_val_loss and beta_capped(epoch, args.epochs, beta_max=args.beta_max) >= args.beta_max:
                 best_val_loss = val_loss
                 ckpt = {'epoch': epoch, 'model_state': model.state_dict(),
                         'stats': train_ds.stats, 'latent_dim': args.latent_dim,
@@ -239,19 +239,16 @@ def main():
                     ckpt['part_embed_dim'] = args.part_embed_dim
                 torch.save(ckpt, ckpt_path)
 
-            beta = beta_schedule(epoch, args.epochs)
+            beta = beta_capped(epoch, args.epochs, beta_max=args.beta_max)
             n_active = active_dims(model, train_ds, device, conditional=conditional, use_participant=use_participant) if epoch % args.log_every == 0 or epoch == 1 else history[-1]['active_dims'] if history else 0
             history.append({'epoch': epoch, 'beta': beta,
                             'train_loss': train_loss, 'train_recon': train_recon, 'train_kl': train_kl,
                             'val_loss': val_loss, 'val_recon': val_recon, 'val_kl': val_kl,
                             'active_dims': n_active})
-            if epoch % args.log_every == 0 or epoch == 1:
-                print(f'[TRAIN] Epoch {epoch:4d}/{args.epochs} | beta={beta:.2f} | '
-                      f'train loss={train_loss:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}) | '
-                      f'val loss={val_loss:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f}) | '
-                      f'active_dims={n_active}')
-
-        print(f'[TRAIN] Best val loss: {best_val_loss} | Checkpoint: {ckpt_path}')
+            epoch_bar.set_postfix({'beta': f'{beta:.2f}',
+                                   'train': f'{train_loss:.4f}',
+                                   'val': f'{val_loss:.4f}',
+                                   'active': n_active})
 
     # gan branch
     elif args.model == 'gan':
@@ -264,7 +261,8 @@ def main():
         best_g_loss = torch.inf
         history = []
 
-        for epoch in range(1, args.epochs + 1):
+        epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
+        for epoch in epoch_bar:
             d_loss, g_loss = train_gan_one_epoch(model, train_loader, opt_g, opt_d, device, args.n_critic)
             # save checkpoint when loss improves
             if g_loss < best_g_loss:
@@ -274,10 +272,7 @@ def main():
                             'embed_dim': args.embed_dim, 'region': args.region}, ckpt_path)
 
             history.append({'epoch': epoch, 'd_loss': d_loss, 'g_loss': g_loss})
-            if epoch % args.log_every == 0 or epoch == 1:
-                print(f'[TRAIN] Epoch {epoch:4d}/{args.epochs} | D loss={d_loss:.4f} | G loss={g_loss:.4f}')
-
-        print(f'[TRAIN] Best G loss: {best_g_loss} | Checkpoint: {ckpt_path}')
+            epoch_bar.set_postfix({'d_loss': f'{d_loss:.4f}', 'g_loss': f'{g_loss:.4f}'})
 
     # mlp branch
     elif args.model == 'mlp':
@@ -297,7 +292,7 @@ def main():
         writer = csv.DictWriter(f, fieldnames=history[0].keys())
         writer.writeheader()
         writer.writerows(history)
-    print(f'[TRAIN] History saved to {history_path}')
+    print(f'[TRAIN] History saved to {history_path}\n[TRAIN] Checkpoint saved to {ckpt_path}')
 
 if __name__ == '__main__':
     main()

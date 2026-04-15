@@ -20,6 +20,7 @@ from sklearn.metrics import accuracy_score, classification_report, f1_score, log
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 
 from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, split_dataset
+from core.utils import seed_everything
 from models.vae import CVAE, PICVAE, VAE
 from models.gan import CGAN
 
@@ -405,6 +406,8 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
 # main
 def main():
     args = parse_args()
+    device = torch.device('cuda' if torch.cuda.is_available() else
+                          'mps'  if torch.backends.mps.is_available() else 'cpu')
 
     # run_id for paths
     base_model = args.model.removesuffix('_plus')
@@ -420,11 +423,9 @@ def main():
         run_id = f'{args.region}_s{args.seed}'
 
     # reproducibility
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else
-                          'mps'  if torch.backends.mps.is_available() else 'cpu')
-    print(f'[TRTR] Region: {args.region}' if args.model == 'trtr' else f'[TSTR] Region: {args.region}')
+    seed_everything(args.seed)
+    print(f'[TRTR] Seed: {args.seed} | Model: {args.model} | Region: {args.region} | Device: {device}' if args.model == 'trtr'
+          else f'[TSTR] Seed: {args.seed} | Model: {args.model} | Region: {args.region} | Device: {device}')
 
     # train-real-test-real 
     # build cache
@@ -432,15 +433,15 @@ def main():
         path = _cache_path(args.region, args.seed)
         if os.path.exists(path):
             os.remove(path)
-            print(f'[TRTR] Removed cache for region={args.region}, seed={args.seed}')
+            print('[TRTR] Removed cache.')
     
     # load cache
     cache = load_cache(args.region, args.seed)
     if cache is None:
         cache = trtr(args.dataset_dir, args.region, args.n_jobs, args.seed)
-        print(f'[TRTR] Built cache for region={args.region}, seed={args.seed}')
+        print('[TRTR] Built cache.')
     else:
-        print(f'[TRTR] Loaded cache for region={args.region}, seed={args.seed}')
+        print('[TRTR] Loaded cache.')
 
     # save trtr results
     if args.model == 'trtr':
@@ -456,7 +457,6 @@ def main():
                   'trtr_metrics': cache['trtr_metrics']}
         save_result(result, args.model, run_id)
         save_summary(result)
-        print('[TRTR] Finished.')
         return
 
     # train-synthetic-test-real
@@ -464,13 +464,11 @@ def main():
         result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim)
         save_result(result, result['model'], run_id)
         save_summary(result)
-        print('[TSTR+] Finished.')
     else:
         n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
         result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim)
         save_result(result, args.model, run_id)
         save_summary(result)
-        print('[TSTR] Finished.')
 
 if __name__ == '__main__':
     main()

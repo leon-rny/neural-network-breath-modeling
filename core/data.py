@@ -58,55 +58,29 @@ def split_dataset(df: pd.DataFrame, val_size: float = 0.1, test_size: float = 0.
     return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test.reset_index(drop=True)
 
 class BreathDataset(Dataset):
-    """
-    PyTorch Dataset class for breath pattern signals.
-    To avoid data leakage, always compute stats on the training set and pass
-    them explicitly to the validation and test datasets:
-        train_ds = BreathDataset(df_train)
-        val_ds   = BreathDataset(df_val,  stats=train_ds.stats)
-        test_ds  = BreathDataset(df_test, stats=train_ds.stats)
-    """
     def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None) -> None:
         self.records = dataframe.to_dict('records')
         self.stats = stats if stats is not None else self._compute_stats()
 
     def _compute_stats(self) -> dict:
-        """
-        Compute per-channel mean and std from raw signals.
-
-        :return: dictionary with 'mean' and 'std' keys, each containing a (2,) array for [humidity, temperature].
-        """
         h_all = np.concatenate([r['humidity'] for r in self.records])
         t_all = np.concatenate([r['temperature'] for r in self.records])
-        return {'mean': np.array([h_all.mean(), t_all.mean()], dtype=np.float32),
-                'std':  np.array([h_all.std(),  t_all.std()],  dtype=np.float32)}
+        return {'max':  np.array([h_all.max(), t_all.max()], dtype=np.float32),
+                'min':  np.array([h_all.min(), t_all.min()], dtype=np.float32),
+                'mean': np.array([h_all.mean(), t_all.mean()], dtype=np.float32),
+                'std':  np.array([h_all.std(), t_all.std()], dtype=np.float32)}
 
     def __len__(self) -> int:
-        """
-        Required by PyTorch's DataLoader so it knows the dataset size.
-        
-        :return: The number of samples in the dataset.
-        """
         return len(self.records)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-        """
-        Gets the sample at the specified index, applies baseline correction and z-score normalisation
-        so the network treats them equally and makes gradient-based optimisation more stable.
-        
-        :param idx: Index of the sample to retrieve.
-        :return: A tuple of (signal, time, label, participant) where:
-            - signal is a (2, 36) float32 tensor of [humidity, temperature], z-score normalised on raw signals
-            - time is a (36,) float32 tensor of seconds, aligned to 0
-            - label is an int representing the class index
-            - participant is an int representing the participant index
-        """
         r = self.records[idx]
 
         # z-score normalisation
-        h = (r['humidity']    - self.stats['mean'][0]) / (self.stats['std'][0] + 1e-8)
+        h = (r['humidity'] - self.stats['mean'][0]) / (self.stats['std'][0] + 1e-8)
         t = (r['temperature'] - self.stats['mean'][1]) / (self.stats['std'][1] + 1e-8)
-
+        
+        # get all infos
         signal = torch.tensor(np.stack([h, t], axis=0), dtype=torch.float32)
         time = torch.tensor(r['time'] - r['time'][0],  dtype=torch.float32)
         label = CLASS_TO_IDX[r['class']]
