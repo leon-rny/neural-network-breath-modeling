@@ -1,38 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name=pinn
-#SBATCH --partition=gpu
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
-#SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
-#SBATCH --mail-type=FAIL
-#SBATCH --account=sc-users
-#SBATCH --output=/home/rane10/logs/pinn.o%j
-#SBATCH --error=/home/rane10/logs/pinn.e%j
-
 set -euo pipefail
 
-echo "Start time: $(date)"
+REGIONS=(mouth nose)
+SEEDS=(0 1 7 42 123)
 
-cd ~/nnbm
-source /opt/miniforge/etc/profile.d/conda.sh
-conda activate toyenv
-
-# Keep PyTorch/CUDA deterministic runs compatible with CuBLAS on GPU.
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
-
-# Stream Python logs immediately even when piped through tee.
-export PYTHONUNBUFFERED=1
-
-REGION="mouth"
-SEED=42
-export PYTHONHASHSEED=$SEED
-
-export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib_${SLURM_JOB_ID}"
-mkdir -p "$MPLCONFIGDIR"
-
-python -u train_pinn_stage2.py --train-only --region "$REGION" --seed "$SEED" 2>&1 | tee output.out
-
-echo "End time: $(date)"
+start_time=$(date +%s)
+for region in "${REGIONS[@]}"; do
+  for seed in "${SEEDS[@]}"; do
+    export PYTHONHASHSEED=$seed
+    python physics_cvae.py --region "$region" --seed "$seed"
+  done
+done
+end_time=$(date +%s)
+elapsed=$((end_time - start_time))
+echo "Total elapsed time: $elapsed seconds"
