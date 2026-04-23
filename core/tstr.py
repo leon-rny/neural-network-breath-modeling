@@ -21,14 +21,15 @@ from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_sp
 
 from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, split_dataset
 from core.utils import seed_everything
-from models.vae import CVAE, PICVAE, VAE
+from models.vae import CVAE, VAE
 from models.gan import CGAN
+from models.pinn import PhysicsInformedCVAE
 
 # cli
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'gan', 'picvae'])
+    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'gan', 'picvae', 'pinn'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
     p.add_argument('--n_synthetic', type=int, default=None)
@@ -270,9 +271,18 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
         model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'], condition_on_participant=True, part_embed_dim=ckpt['part_embed_dim'])
     elif model_name == 'gan':
         model = CGAN(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
-    elif model_name == 'picvae':
-        model = PICVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'],
-                       region=ckpt['region'], ode_params_path='results/ode_fit/ode_params_all.csv')
+    elif model_name == 'pinn':
+        model = PhysicsInformedCVAE(
+            cir_params=ckpt['cir_params'],
+            t_grid=ckpt['t_grid'],
+            tau_s=ckpt.get('tau_s', 15.0),
+            latent_dim=ckpt['latent_dim'],
+            num_classes=3,
+            embed_dim=ckpt['embed_dim'],
+            condition_on_participant=ckpt.get('condition_on_participant', True),
+            num_participants=ckpt.get('num_participants', 3),
+            part_embed_dim=ckpt.get('part_embed_dim', 8),
+        )
     else:
         raise ValueError(f'Unknown model: {model_name}')
     model.load_state_dict(ckpt['model_state'])
@@ -305,6 +315,23 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
             all_labels.append(np.full(count, cls_idx))
         signals_phys = np.concatenate(all_signals, axis=0)
         labels = np.concatenate(all_labels,  axis=0)
+    elif model_name == 'pinn':
+        # PhysicsInformedDataset normalises humidity by h_scale (not z-score)
+        # and temperature by z-score; undo each channel separately
+        h_scale = float(stats['h_scale'])
+        t_mean  = float(stats['mean'][1])
+        t_std   = float(stats['std'][1])
+        all_signals, all_labels = [], []
+        for cls_idx, count in enumerate(counts):
+            y_cls = torch.tensor(cls_idx, dtype=torch.long)
+            with torch.no_grad():
+                z_cls = model.sample(count, y_cls, device).cpu()
+            h = z_cls[:, 0:1, :] * h_scale
+            t = z_cls[:, 1:2, :] * t_std + t_mean
+            all_signals.append(torch.cat([h, t], dim=1).numpy())
+            all_labels.append(np.full(count, cls_idx))
+        signals_phys = np.concatenate(all_signals, axis=0)
+        labels = np.concatenate(all_labels, axis=0)
 
     return signals_phys, labels
 
@@ -419,6 +446,8 @@ def main():
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
     elif base_model == 'picvae':
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}_lp{args.lambda_physics}'
+    elif base_model == 'pinn':
+        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}'
     else:
         run_id = f'{args.region}_s{args.seed}'
 
