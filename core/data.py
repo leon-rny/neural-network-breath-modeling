@@ -87,3 +87,52 @@ class BreathDataset(Dataset):
         participant = PARTICIPANT_TO_IDX[r['participant']]
 
         return signal, time, label, participant
+    
+class PhysicsInformedDataset(Dataset):
+    def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None) -> None:
+        self.records = dataframe.to_dict('records')
+        self.stats = stats if stats is not None else self._compute_stats()
+
+    def _compute_stats(self) -> dict:
+        peak_devs = []
+        for r in self.records:
+            baseline = np.mean(r['humidity'][:5])
+            peak_devs.append((r['humidity'] - baseline).max())
+        h_scale = float(np.max(peak_devs) * 1.2)
+
+        h_all = np.concatenate([r['humidity'] for r in self.records])
+        t_all = np.concatenate([r['temperature'] for r in self.records])
+        return {'mean': np.array([h_all.mean(), t_all.mean()], dtype=np.float32),
+                'std': np.array([h_all.std(), t_all.std()], dtype=np.float32),
+                'h_scale': h_scale}
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
+        r = self.records[idx]
+
+        # baseline correct
+        baseline_h = np.mean(r['humidity'][:5])
+        h = r['humidity'] - baseline_h
+
+        # onset detection
+        baseline_std = np.std(r['humidity'][:5])
+        threshold = baseline_h + 3.0 * baseline_std
+        onset_idx = 5
+        for i in range(len(r['humidity'])):
+            if r['humidity'][i] > threshold:
+                onset_idx = i
+                break
+        
+        # normalize
+        h = h / self.stats['h_scale']
+        t = (r['temperature'] - self.stats['mean'][1]) / self.stats['std'][1]
+        
+        # get all infos
+        signal = torch.tensor(np.stack([h, t], axis=0), dtype=torch.float32)
+        time = torch.tensor(r['time'] - r['time'][0],  dtype=torch.float32)
+        label = CLASS_TO_IDX[r['class']]
+        participant = PARTICIPANT_TO_IDX[r['participant']]
+
+        return signal, time, label, participant, onset_idx
