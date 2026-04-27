@@ -43,8 +43,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--latent_dim', type=int, default=32)
     p.add_argument('--embed_dim', type=int, default=16)
     p.add_argument('--part_embed_dim', type=int, default=8)
-    p.add_argument('--lambda_physics', type=float, default=0.1)
-    p.add_argument('--ode_params_path', default='results/ode_fit/ode_params_all.csv')
     return p.parse_args()
 
 # utils
@@ -273,7 +271,7 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
         model = CGAN(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
     elif model_name == 'pinn':
         model = PhysicsInformedCVAE(
-            cir_params=ckpt['cir_params'],
+            cir_params_init=ckpt['cir_params'],
             t_grid=ckpt['t_grid'],
             tau_s=ckpt.get('tau_s', 15.0),
             latent_dim=ckpt['latent_dim'],
@@ -297,7 +295,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
     remainder = n_synthetic % n_classes
     counts = [n_per_class + (1 if i < remainder else 0) for i in range(n_classes)]
     mean_t = torch.tensor(stats['mean'], dtype=torch.float32).view(1, 2, 1).to(device)
-    std_t  = torch.tensor(stats['std'], dtype=torch.float32).view(1, 2, 1).to(device)
+    std_t = torch.tensor(stats['std'], dtype=torch.float32).view(1, 2, 1).to(device)
 
     # generate synthetic signals
     if model_name == 'vae':
@@ -433,8 +431,9 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
 # main
 def main():
     args = parse_args()
-    device = torch.device('cuda' if torch.cuda.is_available() else
-                          'mps'  if torch.backends.mps.is_available() else 'cpu')
+    # device = torch.device('cuda' if torch.cuda.is_available() else
+    #                       'mps'  if torch.backends.mps.is_available() else 'cpu')
+    device = torch.device('cpu')
 
     # run_id for paths
     base_model = args.model.removesuffix('_plus')
