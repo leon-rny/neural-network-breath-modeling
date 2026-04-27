@@ -33,17 +33,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--lr_d', type=float, default=None)
     p.add_argument('--n_critic', type=int, default=5)
     p.add_argument('--beta_max', type=float, default=0.1)
+    p.add_argument('--beta_warmup_epochs', type=int, default=250)
     return p.parse_args()
 
 # vae and cvae training
-def beta_capped(epoch: int, total_epochs: int, beta_max: float = 0.1) -> float:
+def beta_capped(epoch: int, warmup_epochs: int, beta_max: float = 0.1) -> float:
     """Linear warmup from 0 → beta_max over first half of training, then hold."""
-    warmup_epochs = total_epochs * 0.5
     return min(beta_max, (epoch / warmup_epochs) * beta_max)
 
-def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1):
+def train_vae_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1):
     model.train()
-    beta = beta_capped(epoch, total_epochs, beta_max=beta_max)
+    beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
     total_loss = recon_sum = kl_sum = 0.0
     for signal, _time, label, participant in loader:
         signal = signal.to(device)
@@ -67,9 +67,9 @@ def train_vae_one_epoch(model, loader, optimizer, epoch, total_epochs, device, f
     return total_loss / n, recon_sum / n, kl_sum / n
 
 @torch.no_grad()
-def evaluate(model, loader, epoch, total_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1):
+def evaluate(model, loader, epoch, warmup_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1):
     model.eval()
-    beta = beta_capped(epoch, total_epochs, beta_max=beta_max)
+    beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
     total_loss = recon_sum = kl_sum = 0.0
     for signal, _time, label, participant in loader:
         signal = signal.to(device)
@@ -202,11 +202,11 @@ def main():
 
         epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
         for epoch in epoch_bar:
-            train_loss, train_recon, train_kl = train_vae_one_epoch(model, train_loader, optimizer, epoch, args.epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max)
-            val_loss, val_recon, val_kl = evaluate(model, val_loader, epoch, args.epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max)
+            train_loss, train_recon, train_kl = train_vae_one_epoch(model, train_loader, optimizer, epoch, args.beta_warmup_epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max)
+            val_loss, val_recon, val_kl = evaluate(model, val_loader, epoch, args.beta_warmup_epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max)
             scheduler.step()
 
-            if val_loss < best_val_loss and beta_capped(epoch, args.epochs, beta_max=args.beta_max) >= args.beta_max:
+            if val_loss < best_val_loss and beta_capped(epoch, args.beta_warmup_epochs, beta_max=args.beta_max) >= args.beta_max:
                 best_val_loss = val_loss
                 ckpt = {'epoch': epoch, 'model_state': model.state_dict(),
                         'stats': train_ds.stats, 'latent_dim': args.latent_dim,
@@ -217,7 +217,7 @@ def main():
                     ckpt['part_embed_dim'] = args.part_embed_dim
                 torch.save(ckpt, ckpt_path)
 
-            beta = beta_capped(epoch, args.epochs, beta_max=args.beta_max)
+            beta = beta_capped(epoch, args.beta_warmup_epochs, beta_max=args.beta_max)
             n_active = active_dims(model, train_ds, device, conditional=conditional, use_participant=use_participant) if epoch % args.log_every == 0 or epoch == 1 else history[-1]['active_dims'] if history else 0
             history.append({'epoch': epoch, 'beta': beta,
                             'train_loss': train_loss, 'train_recon': train_recon, 'train_kl': train_kl,
