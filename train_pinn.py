@@ -15,9 +15,9 @@ from models.pinn import PhysicsInformedCVAE
 
 # train pinn
 @torch.no_grad()
-def evaluate(model, loader, cir_params_init, beta, lambda_sparsity, lambda_baseline, lambda_prior, device):
+def evaluate(model, loader, cir_params_init, beta, lambda_baseline, lambda_prior, device):
     model.eval()
-    totals = {"total": 0.0, "recon": 0.0, "kl": 0.0, "sparsity": 0.0, "baseline": 0.0, "prior": 0.0}
+    totals = {"total": 0.0, "recon": 0.0, "kl": 0.0, "baseline": 0.0, "prior": 0.0}
     n_batches = 0
 
     for batch in loader:
@@ -29,7 +29,7 @@ def evaluate(model, loader, cir_params_init, beta, lambda_sparsity, lambda_basel
 
         x_hat, mu, logvar, u_post_softplus, cir_params = model(x, y, p)
 
-        losses = compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx, cir_params_init=cir_params_init, beta=beta, lambda_sparsity=lambda_sparsity, lambda_baseline=lambda_baseline, lambda_prior=lambda_prior)
+        losses = compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx, cir_params_init=cir_params_init, beta=beta, lambda_baseline=lambda_baseline, lambda_prior=lambda_prior)
 
         for k in totals:
             totals[k] += losses[k].item()
@@ -37,10 +37,9 @@ def evaluate(model, loader, cir_params_init, beta, lambda_sparsity, lambda_basel
 
     return {k: v / n_batches for k, v in totals.items()}
 
-def compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx, cir_params_init, beta, lambda_sparsity, lambda_baseline, lambda_prior):
+def compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx, cir_params_init, beta, lambda_baseline, lambda_prior):
     recon = F.mse_loss(x_hat, x)
     kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    sparsity = u_post_softplus.abs().mean()
 
     # per-sample baseline mask: 1 where we want u to be zero
     B, T = u_post_softplus.shape
@@ -58,11 +57,11 @@ def compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx,
 
     total = recon + beta * kl + lambda_baseline * baseline_penalty + lambda_prior * prior
 
-    return {"total": total, "recon": recon, "kl": kl, "sparsity": sparsity, "baseline": baseline_penalty, "prior": prior}
+    return {"total": total, "recon": recon, "kl": kl, "baseline": baseline_penalty, "prior": prior}
 
-def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_sparsity, lambda_baseline, lambda_prior, device):
+def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_baseline, lambda_prior, device):
     model.train()
-    totals = {"total": 0.0, "recon": 0.0, "kl": 0.0, "sparsity": 0.0, "baseline": 0.0, "prior": 0.0}
+    totals = {"total": 0.0, "recon": 0.0, "kl": 0.0, "baseline": 0.0, "prior": 0.0}
     n_batches = 0
 
     for batch in loader:
@@ -74,7 +73,7 @@ def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_spar
 
         x_hat, mu, logvar, u_post_softplus, cir_params = model(x, y, p)
 
-        losses = compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx, cir_params_init=cir_params_init, beta=beta, lambda_sparsity=lambda_sparsity, lambda_baseline=lambda_baseline, lambda_prior=lambda_prior)
+        losses = compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx, cir_params_init=cir_params_init, beta=beta, lambda_baseline=lambda_baseline, lambda_prior=lambda_prior)
 
         optimizer.zero_grad()
         losses["total"].backward()
@@ -89,15 +88,14 @@ def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_spar
 # params
 device = torch.device('cuda' if torch.cuda.is_available() else
                       'mps'  if torch.backends.mps.is_available() else 'cpu')
-REGION = ['nose'] # 'mouth', 
-SEED = [0, 1, 7, 42, 123]
+REGION = ['mouth', 'nose']
+SEED = [0, 1] # , 7, 42, 123
 NUM_EPOCHS = 500
 BATCH_SIZE = 16
 LR = 1e-3
 BETA_MAX = 0.1
-LAMBDA_SPARSITY = 0.001
 LAMBDA_BASELINE = 1.0
-LAMBDA_PRIOR = 0.1
+LAMBDA_PRIOR = 0.001
 TAU_S = 15.0
 os.makedirs('results/pinn', exist_ok=True)
 
@@ -135,9 +133,9 @@ for seed in SEED:
 
         history = {
             "train_total": [], "train_recon": [], "train_kl": [],
-            "train_sparsity": [], "train_baseline": [], "train_prior": [],
+            "train_baseline": [], "train_prior": [],
             "val_total": [], "val_recon": [], "val_kl": [],
-            "val_sparsity": [], "val_baseline": [], "val_prior": [],
+            "val_baseline": [], "val_prior": [],
             "beta": [],
         }
 
@@ -146,12 +144,12 @@ for seed in SEED:
 
         pbar = tqdm(range(NUM_EPOCHS), desc=f"Training {region} s{seed}")
         for epoch in pbar:
-            beta = beta_capped(epoch, NUM_EPOCHS, BETA_MAX)
+            beta = beta_capped(epoch, NUM_EPOCHS // 2, BETA_MAX)
 
-            train_metrics = train_one_epoch(model, train_loader, optimizer, cir_params_init=params_cir, beta=beta, lambda_sparsity=LAMBDA_SPARSITY, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, device=device)
-            val_metrics = evaluate(model, val_loader, cir_params_init=params_cir, beta=beta, lambda_sparsity=LAMBDA_SPARSITY, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, device=device)
+            train_metrics = train_one_epoch(model, train_loader, optimizer, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, device=device)
+            val_metrics = evaluate(model, val_loader, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, device=device)
 
-            for k in ("total", "recon", "kl", "sparsity", "baseline", "prior"):
+            for k in ("total", "recon", "kl", "baseline", "prior"):
                 history[f"train_{k}"].append(train_metrics[k])
                 history[f"val_{k}"].append(val_metrics[k])
             history["beta"].append(beta)
