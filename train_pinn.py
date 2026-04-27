@@ -89,7 +89,7 @@ def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_base
 device = torch.device('cuda' if torch.cuda.is_available() else
                       'mps'  if torch.backends.mps.is_available() else 'cpu')
 REGION = ['mouth', 'nose']
-SEED = [0, 1] # , 7, 42, 123
+SEED = [7, 42, 123] # 0, 1
 NUM_EPOCHS = 500
 BATCH_SIZE = 16
 LR = 1e-3

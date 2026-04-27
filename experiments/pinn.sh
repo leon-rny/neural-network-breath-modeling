@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/bin/bash 
 set -euo pipefail
 
-SEEDS=(0 1 7 42 123)
-REGION=('nose')
+SEEDS=(7 42 123)
+REGION=('mouth' 'nose')
 
 start_time=$(date +%s)
 for region in "${REGION[@]}"; do
