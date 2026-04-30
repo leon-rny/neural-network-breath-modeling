@@ -7,31 +7,13 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 from core.data import CLASSES, BreathDataset, load_dataset, split_dataset
 from core.train import active_dims
 from core.tstr import (evaluate_classifier, extract_fixed_features,
                        load_cache, train_stacking_classifier, trtr)
 from models.vae import CVAE, elbo_loss
-
-# jittering augmentation wrapper
-class JitteredDataset(Dataset):
-    def __init__(self, base: BreathDataset, n_copies: int, alpha: float) -> None:
-        self.base = base
-        self.n_copies = n_copies
-        self.alpha = alpha
-        signals = torch.stack([base[i][0] for i in range(len(base))])
-        self.std_per_ch = signals.std(dim=(0, 2)).unsqueeze(1)
-
-    def __len__(self) -> int:
-        return len(self.base) * self.n_copies
-
-    def __getitem__(self, idx: int):
-        base_idx = idx % len(self.base)
-        signal, time, label, participant = self.base[base_idx]
-        noise = self.alpha * self.std_per_ch * torch.randn_like(signal)
-        return signal + noise, time, label, participant
 
 # configs
 CONFIGS: dict[str, dict] = {'baseline': {'alpha': 0.0, 'n_copies': 0},
@@ -101,19 +83,15 @@ def train_config(config: str, region: str, seed: int, dataset_dir: str, device: 
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
     df_train, df_val, _ = split_dataset(df, random_state=seed)
-    train_ds = BreathDataset(df_train)
+    train_ds = BreathDataset(df_train, alpha=alpha, n_copies=n_copies)
+    train_ds_clean = BreathDataset(df_train, stats=train_ds.stats)
     val_ds = BreathDataset(df_val, stats=train_ds.stats)
 
-    # augmentation (training only)
-    if alpha > 0 and n_copies > 0:
-        aug_ds = JitteredDataset(train_ds, n_copies, alpha)
-        train_loader = DataLoader(aug_ds, batch_size=BATCH_SIZE,
-                                  shuffle=True, drop_last=False)
-        print(f'[Jitter] {len(train_ds)}: {len(aug_ds)} samples (alpha={alpha}, n_copies={n_copies})')
-    else:
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                                  shuffle=True, drop_last=False)
+    if alpha > 0 and n_copies > 1:
+        print(f'[Jitter] {len(train_ds_clean)}: {len(train_ds)} samples (alpha={alpha}, n_copies={n_copies})')
 
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
+                              shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     # model (conv_baseline with participant conditioning)
@@ -191,7 +169,7 @@ def train_config(config: str, region: str, seed: int, dataset_dir: str, device: 
 
         # active dims
         if epoch % LOG_EVERY == 0 or epoch == 1:
-            n_active = active_dims(model, train_ds, device,
+            n_active = active_dims(model, train_ds_clean, device,
                                    conditional=True, use_participant=True)
         else:
             n_active = history[-1]['active_dims'] if history else 0

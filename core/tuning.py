@@ -34,17 +34,21 @@ def _train_model(model_name: str, params: dict, region: str, dataset_dir: str, e
     train_loader = DataLoader(train_ds, batch_size=params['batch_size'], shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=params['batch_size'], shuffle=False)
 
-    if model_name == 'cvae':
+    if model_name == 'cvae_part':
+        model = CVAE(latent_dim=params['latent_dim'], embed_dim=params['embed_dim'],
+                     condition_on_participant=True, part_embed_dim=params['part_embed_dim']).to(device)
+    elif model_name == 'cvae':
         model = CVAE(latent_dim=params['latent_dim'], embed_dim=params['embed_dim']).to(device)
     else:
         model = VAE(latent_dim=params['latent_dim']).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    conditional = model_name == 'cvae'
+    conditional = model_name in ('cvae', 'cvae_part')
+    use_participant = model_name == 'cvae_part'
     for epoch in range(1, epochs + 1):
-        train_vae_one_epoch(model, train_loader, optimizer, epoch, epochs, device, params['free_bits'], conditional=conditional, use_participant=False, beta_max=params['beta_max'])
-        evaluate(model, val_loader, epoch, epochs, device, params['free_bits'], conditional=conditional, use_participant=False, beta_max=params['beta_max'])
+        train_vae_one_epoch(model, train_loader, optimizer, epoch, epochs, device, params['free_bits'], conditional=conditional, use_participant=use_participant, beta_max=params['beta_max'])
+        evaluate(model, val_loader, epoch, epochs, device, params['free_bits'], conditional=conditional, use_participant=use_participant, beta_max=params['beta_max'])
         scheduler.step()
 
     return model, train_ds.stats
@@ -83,8 +87,10 @@ def make_objective(model_name: str, region: str, dataset_dir: str = 'dataset', e
                   'lr': trial.suggest_float('lr', 1e-4, 1e-2, log=True),
                   'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64]),
                   'beta_warmup_epochs': trial.suggest_int('beta_warmup_epochs', 50, 300)}
-        if model_name == 'cvae':
+        if model_name in ('cvae', 'cvae_part'):
             params['embed_dim'] = trial.suggest_categorical('embed_dim', [4, 8, 16, 32])
+        if model_name == 'cvae_part':
+            params['part_embed_dim'] = trial.suggest_categorical('part_embed_dim', [4, 8, 16, 32])
 
         accs = []
         model = None
@@ -130,7 +136,7 @@ def _log_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
 
 def run_search(model_name: str, region: str, n_trials: int = 50, epochs: int = 500, seeds: tuple[int, ...] = (42,), n_synthetic: int | None = None, dataset_dir: str = 'dataset', n_jobs: int = 4, sampler_seed: int = 42, device: torch.device | None = None) -> optuna.Study:
     os.makedirs('results/tuning', exist_ok=True)
-    storage = optuna.storages.JournalStorage(optuna.storages.journal.JournalFileBackend(f'results/tuning/{model_name}_{region}_v2.log'))
+    storage = optuna.storages.JournalStorage(optuna.storages.journal.JournalFileBackend(f'results/tuning/{model_name}_{region}_v3.log'))
     sampler = optuna.samplers.TPESampler(seed=sampler_seed)
     pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=2)
     study = optuna.create_study(direction='maximize', sampler=sampler, pruner=pruner,
@@ -152,7 +158,7 @@ def run_search(model_name: str, region: str, n_trials: int = 50, epochs: int = 5
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument('--model', required=True, choices=['vae', 'cvae'])
+    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--n_trials', type=int, default=50)
     p.add_argument('--epochs', type=int, default=500)
