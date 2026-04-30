@@ -58,9 +58,12 @@ def split_dataset(df: pd.DataFrame, val_size: float = 0.1, test_size: float = 0.
     return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test.reset_index(drop=True)
 
 class BreathDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None) -> None:
+    def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None,
+                 alpha: float = 0.0, n_copies: int = 1) -> None:
         self.records = dataframe.to_dict('records')
         self.stats = stats if stats is not None else self._compute_stats()
+        self.alpha = alpha
+        self.n_copies = max(n_copies, 1)
 
     def _compute_stats(self) -> dict:
         h_all = np.concatenate([r['humidity'] for r in self.records])
@@ -71,17 +74,19 @@ class BreathDataset(Dataset):
                 'std':  np.array([h_all.std(), t_all.std()], dtype=np.float32)}
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.records) * self.n_copies
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-        r = self.records[idx]
+        r = self.records[idx % len(self.records)]
 
         # z-score normalisation
         h = (r['humidity'] - self.stats['mean'][0]) / (self.stats['std'][0] + 1e-8)
         t = (r['temperature'] - self.stats['mean'][1]) / (self.stats['std'][1] + 1e-8)
-        
+
         # get all infos
         signal = torch.tensor(np.stack([h, t], axis=0), dtype=torch.float32)
+        if self.alpha > 0:
+            signal = signal + self.alpha * torch.randn_like(signal)
         time = torch.tensor(r['time'] - r['time'][0],  dtype=torch.float32)
         label = CLASS_TO_IDX[r['class']]
         participant = PARTICIPANT_TO_IDX[r['participant']]

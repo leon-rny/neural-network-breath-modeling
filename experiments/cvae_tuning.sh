@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tune_cvae
+#SBATCH --job-name=tune_cvae_part
 #SBATCH --partition=compute
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -29,7 +29,7 @@ SEEDS=(0 1 7 42 123)
 
 for region in "${REGIONS[@]}"; do
   python -m core.tuning \
-    --model cvae \
+    --model cvae_part \
     --region "$region" \
     --n_trials 50 \
     --epochs 500 \

@@ -34,6 +34,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--n_critic', type=int, default=5)
     p.add_argument('--beta_max', type=float, default=0.1)
     p.add_argument('--beta_warmup_epochs', type=int, default=250)
+    # jittering augmentation (training only; defaults = off)
+    p.add_argument('--alpha', type=float, default=0.0)
+    p.add_argument('--n_copies', type=int, default=1)
     return p.parse_args()
 
 # vae and cvae training
@@ -168,6 +171,8 @@ def main():
         run_id = f'{args.region}_s{args.seed}'
     else:
         run_id = f'{args.region}_s{args.seed}'
+    if args.alpha > 0 and args.n_copies > 1:
+        run_id += f'_a{args.alpha}_n{args.n_copies}'
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
     history_path = f'results/{args.model}/{run_id}_train_history.csv'
 
@@ -179,10 +184,13 @@ def main():
     df = load_dataset(args.dataset_dir)
     df = df[df['region'] == args.region].reset_index(drop=True)
     df_train, df_val, _ = split_dataset(df, random_state=args.seed)
-    train_ds = BreathDataset(df_train)
+    train_ds = BreathDataset(df_train, alpha=args.alpha, n_copies=args.n_copies)
+    train_ds_clean = BreathDataset(df_train, stats=train_ds.stats) if args.alpha > 0 else train_ds
     val_ds = BreathDataset(df_val, stats=train_ds.stats)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    if args.alpha > 0 and args.n_copies > 1:
+        print(f'[TRAIN] Jitter: alpha={args.alpha}, n_copies={args.n_copies} ({len(train_ds_clean)} → {len(train_ds)} samples)')
 
     # vae, cvae, and cvae_part branch
     if args.model in ('vae', 'cvae', 'cvae_part'):
@@ -218,7 +226,7 @@ def main():
                 torch.save(ckpt, ckpt_path)
 
             beta = beta_capped(epoch, args.beta_warmup_epochs, beta_max=args.beta_max)
-            n_active = active_dims(model, train_ds, device, conditional=conditional, use_participant=use_participant) if epoch % args.log_every == 0 or epoch == 1 else history[-1]['active_dims'] if history else 0
+            n_active = active_dims(model, train_ds_clean, device, conditional=conditional, use_participant=use_participant) if epoch % args.log_every == 0 or epoch == 1 else history[-1]['active_dims'] if history else 0
             history.append({'epoch': epoch, 'beta': beta,
                             'train_loss': train_loss, 'train_recon': train_recon, 'train_kl': train_kl,
                             'val_loss': val_loss, 'val_recon': val_recon, 'val_kl': val_kl,
