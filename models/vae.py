@@ -13,7 +13,7 @@ def elbo_loss(x: torch.Tensor, x_hat: torch.Tensor, mu: torch.Tensor, logvar: to
     :param free_bits: minimum KL per dimension to prevent posterior collapse
     :return: total loss, reconstruction loss, KL divergence
     """
-    recon = nn.functional.mse_loss(x_hat, x, reduction='mean')
+    recon = nn.functional.mse_loss(x_hat, x, reduction="mean")
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, latent_dim)
     kl_per_dim = kl_per_dim.mean(dim=0) # (latent_dim,)
     kl = torch.clamp(kl_per_dim, min=free_bits).mean()

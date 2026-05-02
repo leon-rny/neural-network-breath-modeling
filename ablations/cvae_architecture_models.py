@@ -250,8 +250,8 @@ class ConvAsym(AblationCVAE):
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvAsym(**kw)
 
-VARIANT_MAP: dict[str, type] = {'conv_baseline': ConvBaseline,
-                                'conv_slim': ConvSlim,
-                                'mlp': MLP,
-                                'mlp_small': MLPSmall,
-                                'conv_asym': ConvAsym,}
+VARIANT_MAP: dict[str, type] = {"conv_baseline": ConvBaseline,
+                                "conv_slim": ConvSlim,
+                                "mlp": MLP,
+                                "mlp_small": MLPSmall,
+                                "conv_asym": ConvAsym,}
