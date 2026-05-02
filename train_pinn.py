@@ -15,9 +15,9 @@ from models.pinn import PhysicsInformedCVAE
 
 # train pinn
 @torch.no_grad()
-def evaluate(model, loader, cir_params_init, beta, lambda_baseline, lambda_prior, device):
+def evaluate(model, loader, cir_params_init, beta, lambda_baseline, lambda_prior, lambda_residual, device):
     model.eval()
-    totals = {"total": 0.0, "recon": 0.0, "kl": 0.0, "baseline": 0.0, "prior": 0.0}
+    totals = {"total": 0.0, "recon": 0.0, "kl": 0.0, "baseline": 0.0, "prior": 0.0, "residual": 0.0}
     n_batches = 0
 
     for batch in loader:
@@ -27,9 +27,9 @@ def evaluate(model, loader, cir_params_init, beta, lambda_baseline, lambda_prior
         p = p.to(device)
         onset_idx = onset_idx.to(device)
 
-        x_hat, mu, logvar, u_post_softplus, cir_params = model(x, y, p)
+        x_hat, mu, logvar, u_post_softplus, cir_params, residual = model(x, y, p)
 
-        losses = compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx, cir_params_init=cir_params_init, beta=beta, lambda_baseline=lambda_baseline, lambda_prior=lambda_prior)
+        losses = compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, residual, onset_idx, cir_params_init=cir_params_init, beta=beta, lambda_baseline=lambda_baseline, lambda_prior=lambda_prior, lambda_residual=lambda_residual)
 
         for k in totals:
             totals[k] += losses[k].item()
@@ -37,7 +37,7 @@ def evaluate(model, loader, cir_params_init, beta, lambda_baseline, lambda_prior
 
     return {k: v / n_batches for k, v in totals.items()}
 
-def compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx, cir_params_init, beta, lambda_baseline, lambda_prior):
+def compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, residual, onset_idx, cir_params_init, beta, lambda_baseline, lambda_prior, lambda_residual):
     recon = F.mse_loss(x_hat, x)
     kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
@@ -55,13 +55,16 @@ def compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx,
     log_v_ref = np.log(v_ref)
     prior = ((log_A - log_A_ref) ** 2 + (log_D - log_D_ref) ** 2 + (log_v - log_v_ref) ** 2).mean()
 
-    total = recon + beta * kl + lambda_baseline * baseline_penalty + lambda_prior * prior
+    # residual
+    residual_penalty = residual.abs().mean()
 
-    return {"total": total, "recon": recon, "kl": kl, "baseline": baseline_penalty, "prior": prior}
+    total = recon + beta * kl + lambda_baseline * baseline_penalty + lambda_prior * prior + lambda_residual * residual_penalty
 
-def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_baseline, lambda_prior, device):
+    return {"total": total, "recon": recon, "kl": kl, "baseline": baseline_penalty, "prior": prior, "residual": residual_penalty}
+
+def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_baseline, lambda_prior, lambda_residual, device):
     model.train()
-    totals = {"total": 0.0, "recon": 0.0, "kl": 0.0, "baseline": 0.0, "prior": 0.0}
+    totals = {"total": 0.0, "recon": 0.0, "kl": 0.0, "baseline": 0.0, "prior": 0.0, "residual": 0.0}
     n_batches = 0
 
     for batch in loader:
@@ -71,9 +74,9 @@ def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_base
         p = p.to(device)
         onset_idx = onset_idx.to(device)
 
-        x_hat, mu, logvar, u_post_softplus, cir_params = model(x, y, p)
+        x_hat, mu, logvar, u_post_softplus, cir_params, residual = model(x, y, p)
 
-        losses = compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, onset_idx, cir_params_init=cir_params_init, beta=beta, lambda_baseline=lambda_baseline, lambda_prior=lambda_prior)
+        losses = compute_losses(x, x_hat, mu, logvar, u_post_softplus, cir_params, residual, onset_idx, cir_params_init=cir_params_init, beta=beta, lambda_baseline=lambda_baseline, lambda_prior=lambda_prior, lambda_residual=lambda_residual)
 
         optimizer.zero_grad()
         losses["total"].backward()
@@ -86,31 +89,32 @@ def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_base
     return {k: v / n_batches for k, v in totals.items()}
 
 # params
-device = torch.device('cuda' if torch.cuda.is_available() else
-                      'mps'  if torch.backends.mps.is_available() else 'cpu')
-REGION = ['mouth', 'nose']
-SEED = [7, 42, 123] # 0, 1
+device = torch.device("cuda" if torch.cuda.is_available() else
+                      "mps"  if torch.backends.mps.is_available() else "cpu")
+REGION = ["mouth", "nose"]
+SEED = [0, 1] # 0, 1
 NUM_EPOCHS = 500
 BATCH_SIZE = 16
 LR = 1e-3
 BETA_MAX = 0.1
 LAMBDA_BASELINE = 1.0
 LAMBDA_PRIOR = 0.001
+LAMBDA_RESIDUAL = 1.0
 TAU_S = 15.0
-os.makedirs('results/pinn', exist_ok=True)
+os.makedirs("results/pinn", exist_ok=True)
 
 for seed in SEED:
     for region in REGION:
-        run_id = f'{region}_s{seed}_ld16_ed8'
-        ckpt_path = f'results/pinn/{run_id}_checkpoint.pt'
+        run_id = f"{region}_s{seed}_ld16_ed8"
+        ckpt_path = f"results/pinn/{run_id}_checkpoint.pt"
 
         # reproducibility
         seed_everything(seed)
         g = make_generator(seed)
 
         # dataset
-        df = load_dataset('./dataset')
-        df = df[df['region'] == region].reset_index(drop=True)
+        df = load_dataset("./dataset")
+        df = df[df["region"] == region].reset_index(drop=True)
         df_train, df_val, _ = split_dataset(df, random_state=seed)
         train_ds = PhysicsInformedDataset(df_train)
         val_ds = PhysicsInformedDataset(df_val, stats=train_ds.stats)
@@ -118,7 +122,7 @@ for seed in SEED:
         val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
         # CIR parameters
-        params_cir = np.load(f'results/pinn/params_{region}.npy')
+        params_cir = np.load(f"results/pinn/params_{region}.npy")
         t_grid = np.arange(36) * 2.0
 
         model = PhysicsInformedCVAE(cir_params_init=params_cir,
@@ -133,9 +137,9 @@ for seed in SEED:
 
         history = {
             "train_total": [], "train_recon": [], "train_kl": [],
-            "train_baseline": [], "train_prior": [],
+            "train_baseline": [], "train_prior": [], "train_residual": [],
             "val_total": [], "val_recon": [], "val_kl": [],
-            "val_baseline": [], "val_prior": [],
+            "val_baseline": [], "val_prior": [], "val_residual": [],
             "beta": [],
         }
 
@@ -146,10 +150,10 @@ for seed in SEED:
         for epoch in pbar:
             beta = beta_capped(epoch, NUM_EPOCHS // 2, BETA_MAX)
 
-            train_metrics = train_one_epoch(model, train_loader, optimizer, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, device=device)
-            val_metrics = evaluate(model, val_loader, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, device=device)
+            train_metrics = train_one_epoch(model, train_loader, optimizer, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, lambda_residual=LAMBDA_RESIDUAL, device=device)
+            val_metrics = evaluate(model, val_loader, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, lambda_residual=LAMBDA_RESIDUAL, device=device)
 
-            for k in ("total", "recon", "kl", "baseline", "prior"):
+            for k in ("total", "recon", "kl", "baseline", "prior", "residual"):
                 history[f"train_{k}"].append(train_metrics[k])
                 history[f"val_{k}"].append(val_metrics[k])
             history["beta"].append(beta)
@@ -157,23 +161,24 @@ for seed in SEED:
             if val_metrics["recon"] < best_val_recon and beta >= BETA_MAX:
                 best_val_recon = val_metrics["recon"]
                 best_epoch = epoch
-                torch.save({'model_state': model.state_dict(),
-                            'stats': train_ds.stats,
-                            'latent_dim': 16,
-                            'embed_dim': 8,
-                            'part_embed_dim': 8,
-                            'region': region,
-                            'cir_params': params_cir,
-                            't_grid': t_grid,
-                            'tau_s': TAU_S,
-                            'condition_on_participant': True,
-                            'num_participants': 3}, ckpt_path)
+                torch.save({"model_state": model.state_dict(),
+                            "stats": train_ds.stats,
+                            "latent_dim": 16,
+                            "embed_dim": 8,
+                            "part_embed_dim": 8,
+                            "region": region,
+                            "cir_params": params_cir,
+                            "t_grid": t_grid,
+                            "tau_s": TAU_S,
+                            "condition_on_participant": True,
+                            "num_participants": 3}, ckpt_path)
 
             pbar.set_postfix(b=f"{beta:.3f}",
-                             tr=f"{train_metrics['recon']:.4f}",
-                             vr=f"{val_metrics['recon']:.4f}",
-                             kl=f"{val_metrics['kl']:.4f}",
-                             bl=f"{val_metrics['baseline']:.4f}",
-                             pr=f"{val_metrics['prior']:.4f}")
+                             tr=f"{train_metrics["recon"]:.4f}",
+                             vr=f"{val_metrics["recon"]:.4f}",
+                             kl=f"{val_metrics["kl"]:.4f}",
+                             bl=f"{val_metrics["baseline"]:.4f}",
+                             pr=f"{val_metrics["prior"]:.4f}",
+                             rs=f"{val_metrics["residual"]:.4f}")
 
         print(f"\nBest validation recon: {best_val_recon:.4f} at epoch {best_epoch}")

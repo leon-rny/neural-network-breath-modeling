@@ -85,6 +85,16 @@ class PhysicsInformedCVAE(CVAE):
         with torch.no_grad():
             self.cir_param_head[-1].bias.copy_(torch.tensor([np.log(A_init), np.log(D_init), np.log(v_init)], dtype=torch.float32))
             self.cir_param_head[-1].weight.data *= 0.01
+
+        # residual head
+        T = len(t_grid)
+        self.residual_head = nn.Sequential(nn.Linear(self.latent_dim, 64),
+                                           nn.ReLU(),
+                                           nn.Linear(64, T))
+        
+        with torch.no_grad():
+            self.residual_head[-1].weight.data *= 0.01
+            self.residual_head[-1].bias.zero_()
     
     def forward(self, x, y, p=None):
         mu, logvar = self.encoder(x, y, p)
@@ -99,11 +109,18 @@ class PhysicsInformedCVAE(CVAE):
         log_A, log_D, log_v = cir_params.unbind(dim=1)
         
         # physics-informed humidity
-        humidity, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
+        humidity_physics, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
+
+        # residual path
+        residual = self.residual_head(z)
+
+        # combine
+        humidity = humidity_physics + residual
+
 
         x_hat = torch.stack([humidity, temperature], dim=1)
 
-        return x_hat, mu, logvar, u_post_softplus, (log_A, log_D, log_v)
+        return x_hat, mu, logvar, u_post_softplus, (log_A, log_D, log_v), residual
     
     def sample(self, n, y, device):
         z = torch.randn(n, self.latent_dim, device=device)
@@ -120,5 +137,7 @@ class PhysicsInformedCVAE(CVAE):
             cir_params = self.cir_param_head(z)
             log_A, log_D, log_v = cir_params.unbind(dim=1)
             
-            humidity, _ = self.cir_conv(u_raw, log_A, log_D, log_v)
+            humidity_physics, _ = self.cir_conv(u_raw, log_A, log_D, log_v)
+            residual = self.residual_head(z)
+            humidity = humidity_physics + residual
             return torch.stack([humidity, temperature], dim=1)

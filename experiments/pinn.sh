@@ -1,7 +1,7 @@
 #!/bin/bash 
 set -euo pipefail
 
-SEEDS=(7 42 123)
+SEEDS=(0 1 7 42 123)
 REGION=('mouth' 'nose')
 
 start_time=$(date +%s)
