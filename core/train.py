@@ -3,20 +3,18 @@ import csv
 import os
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from core.data import BreathDataset, load_dataset, split_dataset
 from core.utils import seed_everything, seed_worker, make_generator
 from models.vae import VAE, CVAE, elbo_loss
-from models.gan import CGAN, discriminator_loss, generator_loss, gradient_penalty
 
 # cli arguments
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part', 'gan'])
+    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--log_every', type=int, default=25)
@@ -29,9 +27,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--free_bits', type=float, default=0.0)
     p.add_argument('--lr', type=float, default=1e-3)
-    p.add_argument('--lr_g', type=float, default=None)
-    p.add_argument('--lr_d', type=float, default=None)
-    p.add_argument('--n_critic', type=int, default=5)
     p.add_argument('--beta_max', type=float, default=0.1)
     p.add_argument('--beta_warmup_epochs', type=int, default=250)
     # jittering augmentation (training only; defaults = off)
@@ -111,48 +106,6 @@ def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_pa
     kl_per_dim = -0.5 * (1 + logvars - mus.pow(2) - logvars.exp()).mean(dim=0)
     return int((kl_per_dim > threshold).sum().item())
 
-# gan training
-GP_LAMBDA = 10 # gradient penalty coefficient
-CLS_LAMBDA = 1.0 # auxiliary classifier loss weight
-
-def train_gan_one_epoch(model, loader, opt_g, opt_d, device, n_critic):
-    model.train()
-    d_loss_sum = g_loss_sum = 0.0
-    n = 0
-    for signal, _time, label, _participant in loader:
-        signal = signal.to(device)
-        label = label.long().to(device)
-        B = signal.size(0)
-
-        # train critic n_critic times per generator update
-        for _ in range(n_critic):
-            z = torch.randn(B, model.latent_dim, device=device)
-            with torch.no_grad():
-                fake = model.generator(z, label)
-            real_scores, real_cls = model.discriminator(signal, label)
-            fake_scores, fake_cls = model.discriminator(fake,   label)
-            gp = gradient_penalty(model.discriminator, signal, fake, label, device)
-            # WGAN-GP loss + auxiliary classification on real samples
-            d_loss = discriminator_loss(real_scores, fake_scores) + GP_LAMBDA * gp + CLS_LAMBDA * nn.CrossEntropyLoss()(real_cls, label)
-            opt_d.zero_grad()
-            d_loss.backward()
-            opt_d.step()
-
-        # train generator: WGAN loss + auxiliary classification
-        z = torch.randn(B, model.latent_dim, device=device)
-        fake = model.generator(z, label)
-        fake_scores, fake_cls = model.discriminator(fake, label)
-        g_loss = generator_loss(fake_scores) + CLS_LAMBDA * nn.CrossEntropyLoss()(fake_cls, label)
-        opt_g.zero_grad()
-        g_loss.backward()
-        opt_g.step()
-
-        d_loss_sum += d_loss.item()
-        g_loss_sum += g_loss.item()
-        n += 1
-
-    return d_loss_sum / n, g_loss_sum / n
-
 # main loop
 def main():
     args = parse_args()
@@ -167,10 +120,6 @@ def main():
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
     elif args.model == 'cvae_part':
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
-    elif args.model == 'mlp':
-        run_id = f'{args.region}_s{args.seed}'
-    else:
-        run_id = f'{args.region}_s{args.seed}'
     if args.alpha > 0 and args.n_copies > 1:
         run_id += f'_a{args.alpha}_n{args.n_copies}'
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
@@ -236,31 +185,7 @@ def main():
                                    'val': f'{val_loss:.4f}',
                                    'active': n_active})
 
-    # gan branch
-    elif args.model == 'gan':
-        model = CGAN(latent_dim=args.latent_dim, embed_dim=args.embed_dim).to(device)
-        lr_g = args.lr_g if args.lr_g is not None else args.lr
-        lr_d = args.lr_d if args.lr_d is not None else args.lr
-        opt_g = torch.optim.Adam(model.generator.parameters(), lr=lr_g, betas=(0.5, 0.999))
-        opt_d = torch.optim.Adam(model.discriminator.parameters(), lr=lr_d, betas=(0.5, 0.999))
-
-        best_g_loss = torch.inf
-        history = []
-
-        epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
-        for epoch in epoch_bar:
-            d_loss, g_loss = train_gan_one_epoch(model, train_loader, opt_g, opt_d, device, args.n_critic)
-            # save checkpoint when loss improves
-            if g_loss < best_g_loss:
-                best_g_loss = g_loss
-                torch.save({'epoch': epoch, 'model_state': model.state_dict(),
-                            'stats': train_ds.stats, 'latent_dim': args.latent_dim,
-                            'embed_dim': args.embed_dim, 'region': args.region}, ckpt_path)
-
-            history.append({'epoch': epoch, 'd_loss': d_loss, 'g_loss': g_loss})
-            epoch_bar.set_postfix({'d_loss': f'{d_loss:.4f}', 'g_loss': f'{g_loss:.4f}'})
-
-    # save training history (vae/cvae/gan)
+    # save training history
     with open(history_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=history[0].keys())
         writer.writeheader()

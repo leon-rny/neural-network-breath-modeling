@@ -22,14 +22,13 @@ from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_sp
 from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, split_dataset
 from core.utils import seed_everything
 from models.vae import CVAE, VAE
-from models.gan import CGAN
 from models.pinn import PhysicsInformedCVAE
 
 # cli
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'gan', 'picvae', 'pinn'])
+    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'picvae', 'pinn'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
     p.add_argument('--n_synthetic', type=int, default=None)
@@ -43,6 +42,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--latent_dim', type=int, default=32)
     p.add_argument('--embed_dim', type=int, default=16)
     p.add_argument('--part_embed_dim', type=int, default=8)
+    # jittering augmentation (mirrors core/train.py for checkpoint resolution)
+    p.add_argument('--alpha', type=float, default=0.0)
+    p.add_argument('--n_copies', type=int, default=1)
     return p.parse_args()
 
 # utils
@@ -267,8 +269,6 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
         model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
     elif model_name == 'cvae_part':
         model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'], condition_on_participant=True, part_embed_dim=ckpt['part_embed_dim'])
-    elif model_name == 'gan':
-        model = CGAN(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
     elif model_name == 'pinn':
         model = PhysicsInformedCVAE(
             cir_params_init=ckpt['cir_params'],
@@ -303,7 +303,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
             z = model.sample(n_synthetic, device)
         signals_phys = (z * std_t + mean_t).cpu().numpy()
         labels = np.concatenate([np.full(c, i) for i, c in enumerate(counts)])
-    elif model_name in ('cvae', 'cvae_part', 'gan', 'picvae'):
+    elif model_name in ('cvae', 'cvae_part', 'picvae'):
         all_signals, all_labels = [], []
         for cls_idx, count in enumerate(counts):
             y_cls = torch.tensor(cls_idx, dtype=torch.long)
@@ -431,8 +431,6 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
 # main
 def main():
     args = parse_args()
-    # device = torch.device('cuda' if torch.cuda.is_available() else
-    #                       'mps'  if torch.backends.mps.is_available() else 'cpu')
     device = torch.device('cpu')
 
     # run_id for paths
@@ -449,6 +447,8 @@ def main():
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}'
     else:
         run_id = f'{args.region}_s{args.seed}'
+    if args.alpha > 0 and args.n_copies > 1:
+        run_id += f'_a{args.alpha}_n{args.n_copies}'
 
     # reproducibility
     seed_everything(args.seed)
