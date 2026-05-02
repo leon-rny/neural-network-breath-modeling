@@ -11,7 +11,7 @@ for region in "${REGIONS[@]}"; do
   for seed in "${SEEDS[@]}"; do
     export PYTHONHASHSEED=$seed
     python -m core.train --model cvae_part --region "$region" --seed "$seed" --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --beta_max 0.01 --alpha 0.05 --n_copies 10
-    python -m core.tstr  --model cvae_part --region "$region" --seed "$seed" --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM"
+    python -m core.tstr  --model cvae_part --region "$region" --seed "$seed" --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --alpha 0.05 --n_copies 10
   done
 done
 end_time=$(date +%s)
