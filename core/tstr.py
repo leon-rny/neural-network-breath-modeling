@@ -28,9 +28,10 @@ from models.pinn import PhysicsInformedCVAE
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'picvae', 'pinn'])
+    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'pinn'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
+    p.add_argument('--channel', choices=['humidity', 'temperature', 'both'], default='both')
     p.add_argument('--n_synthetic', type=int, default=None)
     p.add_argument('--augmentation_ratio', type=float, default=1.0)
     p.add_argument('--dataset_dir', default='dataset')
@@ -42,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--latent_dim', type=int, default=32)
     p.add_argument('--embed_dim', type=int, default=16)
     p.add_argument('--part_embed_dim', type=int, default=8)
+    p.add_argument('--lambda_residual', type=float, default=1.0)
     # jittering augmentation (mirrors core/train.py for checkpoint resolution)
     p.add_argument('--alpha', type=float, default=0.0)
     p.add_argument('--n_copies', type=int, default=1)
@@ -64,6 +66,14 @@ def df_to_df_long(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     labels = np.array([CLASS_TO_IDX[c] for c in df['class']])
     y = pd.Series(labels, index=np.arange(n), name='target')
     return df_long, y
+
+def filter_features(features, channel: str):
+    if channel == 'both':
+        return features
+    prefix = channel.capitalize() + '__'
+    if isinstance(features, pd.DataFrame):
+        return features[[c for c in features.columns if c.startswith(prefix)]]
+    return [c for c in features if c.startswith(prefix)]
 
 def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n_jobs: int = 4) -> pd.DataFrame:
     kind_to_fc = from_columns(top_features_raw)
@@ -137,11 +147,15 @@ def save_summary(result: dict) -> None:
     m = result['metrics']
     new_row = {'model': result['model'],
                'region': result['region'],
+               'channel': result.get('channel', 'both'),
                'seed': result.get('seed'),
                'latent_dim': result.get('latent_dim'),
                'embed_dim': result.get('embed_dim'),
                'part_embed_dim': result.get('part_embed_dim'),
                'free_bits': result.get('free_bits'),
+               'lambda_residual': result.get('lambda_residual'),
+               'alpha': result.get('alpha'),
+               'n_copies': result.get('n_copies'),
                'accuracy': m['accuracy'],
                'f1_weighted': m['f1_weighted'],
                'roc_auc_ovr': m['roc_auc_ovr'],
@@ -166,23 +180,24 @@ def save_summary(result: dict) -> None:
                 df_row[col] = df_row[col].astype(df_old[col].dtype)
             except (ValueError, TypeError):
                 pass
-        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(subset=['model', 'region', 'seed', 'latent_dim', 'embed_dim', 'part_embed_dim', 'free_bits', 'augmentation_ratio'], keep='last')
+        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(subset=['model', 'region', 'channel', 'seed', 'latent_dim', 'embed_dim', 'part_embed_dim', 'free_bits', 'lambda_residual', 'alpha', 'n_copies', 'augmentation_ratio'], keep='last')
     else:
         df_new = df_row
     df_new.to_csv(csv_path, index=False)
 
 # train real test real
-def _cache_path(region: str, seed: int) -> str:
-    return f'results/trtr/{region}_s{seed}_checkpoint.pkl'
+def _cache_path(region: str, seed: int, channel: str = 'both') -> str:
+    suffix = f'_ch{channel}' if channel != 'both' else ''
+    return f'results/trtr/{region}_s{seed}{suffix}_checkpoint.pkl'
 
-def load_cache(region: str, seed: int) -> dict | None:
-    path = _cache_path(region, seed)
+def load_cache(region: str, seed: int, channel: str = 'both') -> dict | None:
+    path = _cache_path(region, seed, channel)
     if os.path.exists(path):
         with open(path, 'rb') as f:
             return pickle.load(f)
     return None
 
-def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int) -> dict:
+def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int, channel: str = 'both') -> dict:
     # load dataset
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
@@ -195,6 +210,9 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int) -> dict:
     # feature extraction
     X_train_raw = extract_relevant_features(df_long_train, y_train, column_id='id', column_sort='time', n_jobs=n_jobs)
     impute(X_train_raw)
+    X_train_raw = filter_features(X_train_raw, channel)
+    if X_train_raw.shape[1] == 0:
+        raise ValueError(f'No relevant features remain after filtering by channel={channel!r}.')
 
     # build name mapping for sanitization
     raw_to_san = {col: re.sub(r'[^\w]', '_', col) for col in X_train_raw.columns}
@@ -247,9 +265,10 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int) -> dict:
              'stats': stats,
              'n_train': len(df_train),
              'trtr_metrics': trtr_metrics,
+             'channel': channel,
              'seed': seed}
     os.makedirs('results/trtr', exist_ok=True)
-    with open(_cache_path(region, seed), 'wb') as f:
+    with open(_cache_path(region, seed, channel), 'wb') as f:
         pickle.dump(cache, f)
 
     return cache
@@ -303,7 +322,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
             z = model.sample(n_synthetic, device)
         signals_phys = (z * std_t + mean_t).cpu().numpy()
         labels = np.concatenate([np.full(c, i) for i, c in enumerate(counts)])
-    elif model_name in ('cvae', 'cvae_part', 'picvae'):
+    elif model_name in ('cvae', 'cvae_part'):
         all_signals, all_labels = [], []
         for cls_idx, count in enumerate(counts):
             y_cls = torch.tensor(cls_idx, dtype=torch.long)
@@ -333,7 +352,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
 
     return signals_phys, labels
 
-def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8) -> dict:
+def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_residual: float = 0.0, alpha: float = 0.0, n_copies: int = 1) -> dict:
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
@@ -372,11 +391,15 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
 
     return {'model': model_name,
             'region': region,
+            'channel': cache.get('channel', 'both'),
             'seed': seed,
             'latent_dim': latent_dim,
             'embed_dim': embed_dim,
             'part_embed_dim': part_embed_dim if model_name == 'cvae_part' else None,
             'free_bits': free_bits,
+            'lambda_residual': lambda_residual if model_name == 'pinn' else None,
+            'alpha': alpha,
+            'n_copies': n_copies,
             'n_train_real': cache['n_train'],
             'n_synthetic': n_synthetic,
             'top_20_features': cache['top_20_features_sanitized'],
@@ -386,7 +409,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
             'trtr_metrics': cache['trtr_metrics']}
 
 # train synthetic/real test real
-def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8) -> dict:
+def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_residual: float = 0.0, alpha: float = 0.0, n_copies: int = 1) -> dict:
     n_synthetic = int(cache['n_train'] * augmentation_ratio)
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR+] model={model_name}, n_synthetic={n_synthetic}, n_train_real={cache["n_train"]}')
@@ -414,11 +437,15 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
 
     return {'model': f'{model_name}_plus',
             'region': region,
+            'channel': cache.get('channel', 'both'),
             'seed': seed,
             'latent_dim': latent_dim,
             'embed_dim': embed_dim,
             'part_embed_dim': part_embed_dim if model_name == 'cvae_part' else None,
             'free_bits': free_bits,
+            'lambda_residual': lambda_residual if model_name == 'pinn' else None,
+            'alpha': alpha,
+            'n_copies': n_copies,
             'n_train_real': cache['n_train'],
             'n_synthetic': n_synthetic,
             'augmentation_ratio': augmentation_ratio,
@@ -441,14 +468,14 @@ def main():
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
     elif base_model == 'cvae_part':
         run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
-    elif base_model == 'picvae':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}_lp{args.lambda_physics}'
     elif base_model == 'pinn':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}'
+        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_res{args.lambda_residual}'
     else:
         run_id = f'{args.region}_s{args.seed}'
     if args.alpha > 0 and args.n_copies > 1:
         run_id += f'_a{args.alpha}_n{args.n_copies}'
+    if args.channel != 'both':
+        run_id += f'_ch{args.channel}'
 
     # reproducibility
     seed_everything(args.seed)
@@ -458,15 +485,15 @@ def main():
     # train-real-test-real 
     # build cache
     if args.force_rebuild:
-        path = _cache_path(args.region, args.seed)
+        path = _cache_path(args.region, args.seed, args.channel)
         if os.path.exists(path):
             os.remove(path)
             print('[TRTR] Removed cache.')
-    
+
     # load cache
-    cache = load_cache(args.region, args.seed)
+    cache = load_cache(args.region, args.seed, args.channel)
     if cache is None:
-        cache = trtr(args.dataset_dir, args.region, args.n_jobs, args.seed)
+        cache = trtr(args.dataset_dir, args.region, args.n_jobs, args.seed, args.channel)
         print('[TRTR] Built cache.')
     else:
         print('[TRTR] Loaded cache.')
@@ -475,6 +502,7 @@ def main():
     if args.model == 'trtr':
         result = {'model': 'trtr',
                   'region': args.region,
+                  'channel': args.channel,
                   'seed': args.seed,
                   'n_train_real': cache['n_train'],
                   'n_synthetic': cache['n_train'],
@@ -489,12 +517,12 @@ def main():
 
     # train-synthetic-test-real
     if args.mode == 'tstr_plus':
-        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim)
+        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_residual, args.alpha, args.n_copies)
         save_result(result, result['model'], run_id)
         save_summary(result)
     else:
         n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
-        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim)
+        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_residual, args.alpha, args.n_copies)
         save_result(result, args.model, run_id)
         save_summary(result)
 

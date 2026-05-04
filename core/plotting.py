@@ -353,6 +353,31 @@ def plot_trtr_feature_stability(feature_counts):
     plt.tight_layout()
     plt.show()
 
+def plot_trtr_channel_contribution():
+    df = pd.read_csv("results/summary.csv")
+    df_trtr = df[df["model"]=="trtr"].copy()
+    df_temperature_mouth = df_trtr[(df_trtr["channel"]=="temperature") & (df_trtr["region"]=="mouth")]
+    df_temperature_nose = df_trtr[(df_trtr["channel"]=="temperature") & (df_trtr["region"]=="nose")]
+    df_humidity_mouth = df_trtr[(df_trtr["channel"]=="humidity") & (df_trtr["region"]=="mouth")]
+    df_humidity_nose = df_trtr[(df_trtr["channel"]=="humidity") & (df_trtr["region"]=="nose")]
+    df_mouth = df_trtr[(df_trtr["region"]=="mouth") & (df_trtr["channel"]!="temperature") & (df_trtr["channel"]!="humidity")]
+    df_nose = df_trtr[(df_trtr["region"]=="nose") & (df_trtr["channel"]!="temperature") & (df_trtr["channel"]!="humidity")]
+
+    fig, ax = plt.subplots(1, 2, figsize=(WIDTH*2, HEIGHT*1.5), sharey=True)
+    ax[0].bar(["Humidity", "Temperature", "Both"], [df_humidity_mouth["accuracy"].mean() * 100, df_temperature_mouth["accuracy"].mean() * 100, df_mouth["accuracy"].mean() * 100], color=["tab:blue", "tab:orange", "tab:green"])
+    ax[0].set_ylim(0, 100)
+    ax[0].set_ylabel("Accuracy in %")
+    ax[0].set_title("Mouth")
+    ax[0].grid(axis="y")
+
+    ax[1].bar(["Humidity", "Temperature", "Both"], [df_humidity_nose["accuracy"].mean() * 100, df_temperature_nose["accuracy"].mean() * 100, df_nose["accuracy"].mean() * 100], color=["tab:blue", "tab:orange", "tab:green"])
+    ax[1].set_ylim(0, 100)
+    ax[1].set_title("Nose")
+    ax[1].grid(axis="y")
+
+    plt.tight_layout()
+    plt.show()
+
 # variational autoencoder
 def load_vaes(device, latent_dim=32, free_bits=[0.0, 0.1, 2.0]):
     models = {seed: {region: {} for region in REGIONS} for seed in SEEDS}
