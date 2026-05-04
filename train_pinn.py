@@ -89,96 +89,97 @@ def train_one_epoch(model, loader, optimizer, cir_params_init, beta, lambda_base
     return {k: v / n_batches for k, v in totals.items()}
 
 # params
-device = torch.device("cuda" if torch.cuda.is_available() else
-                      "mps"  if torch.backends.mps.is_available() else "cpu")
+device = torch.device("cpu")
 REGION = ["mouth", "nose"]
-SEED = [0, 1] # 0, 1
+SEED = [0, 1, 7, 42, 123]
 NUM_EPOCHS = 500
 BATCH_SIZE = 16
 LR = 1e-3
 BETA_MAX = 0.1
 LAMBDA_BASELINE = 1.0
 LAMBDA_PRIOR = 0.001
-LAMBDA_RESIDUAL = 1.0
+LAMBDA_RESIDUAL = [0.01] # 0.001, 0.01, 0.1, 1.0
 TAU_S = 15.0
 os.makedirs("results/pinn", exist_ok=True)
 
-for seed in SEED:
-    for region in REGION:
-        run_id = f"{region}_s{seed}_ld16_ed8"
-        ckpt_path = f"results/pinn/{run_id}_checkpoint.pt"
+for lambda_residual in LAMBDA_RESIDUAL:
+    for seed in SEED:
+        for region in REGION:
+            print(f'[TRAIN] Seed: {seed} | Model: PINN | Region: {region} | Device: {device} | Epochs: {NUM_EPOCHS}')
+            run_id = f"{region}_s{seed}_ld16_ed8_res{lambda_residual}"
+            ckpt_path = f"results/pinn/{run_id}_checkpoint.pt"
 
-        # reproducibility
-        seed_everything(seed)
-        g = make_generator(seed)
+            # reproducibility
+            seed_everything(seed)
+            g = make_generator(seed)
 
-        # dataset
-        df = load_dataset("./dataset")
-        df = df[df["region"] == region].reset_index(drop=True)
-        df_train, df_val, _ = split_dataset(df, random_state=seed)
-        train_ds = PhysicsInformedDataset(df_train)
-        val_ds = PhysicsInformedDataset(df_val, stats=train_ds.stats)
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, worker_init_fn=4, generator=g)
-        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+            # dataset
+            df = load_dataset("./dataset")
+            df = df[df["region"] == region].reset_index(drop=True)
+            df_train, df_val, _ = split_dataset(df, random_state=seed)
+            train_ds = PhysicsInformedDataset(df_train)
+            val_ds = PhysicsInformedDataset(df_val, stats=train_ds.stats)
+            train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, worker_init_fn=4, generator=g)
+            val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-        # CIR parameters
-        params_cir = np.load(f"results/pinn/params_{region}.npy")
-        t_grid = np.arange(36) * 2.0
+            # CIR parameters
+            params_cir = np.load(f"results/pinn/params_{region}.npy")
+            t_grid = np.arange(36) * 2.0
 
-        model = PhysicsInformedCVAE(cir_params_init=params_cir,
-                                    t_grid=t_grid,
-                                    tau_s=TAU_S,
-                                    latent_dim=16,
-                                    num_classes=3,
-                                    condition_on_participant=True,
-                                    num_participants=3)
-        model = model.to(device)
-        optimizer = Adam(model.parameters(), lr=LR)
+            model = PhysicsInformedCVAE(cir_params_init=params_cir,
+                                        t_grid=t_grid,
+                                        tau_s=TAU_S,
+                                        latent_dim=16,
+                                        num_classes=3,
+                                        condition_on_participant=True,
+                                        num_participants=3)
+            model = model.to(device)
+            optimizer = Adam(model.parameters(), lr=LR)
 
-        history = {
-            "train_total": [], "train_recon": [], "train_kl": [],
-            "train_baseline": [], "train_prior": [], "train_residual": [],
-            "val_total": [], "val_recon": [], "val_kl": [],
-            "val_baseline": [], "val_prior": [], "val_residual": [],
-            "beta": [],
-        }
+            history = {
+                "train_total": [], "train_recon": [], "train_kl": [],
+                "train_baseline": [], "train_prior": [], "train_residual": [],
+                "val_total": [], "val_recon": [], "val_kl": [],
+                "val_baseline": [], "val_prior": [], "val_residual": [],
+                "beta": [],
+            }
 
-        best_val_recon = math.inf
-        best_epoch = -1
+            best_val_recon = math.inf
+            best_epoch = -1
 
-        pbar = tqdm(range(NUM_EPOCHS), desc=f"Training {region} s{seed}")
-        for epoch in pbar:
-            beta = beta_capped(epoch, NUM_EPOCHS // 2, BETA_MAX)
+            pbar = tqdm(range(NUM_EPOCHS), desc="[TRAIN] PINN", unit="epoch")
+            for epoch in pbar:
+                beta = beta_capped(epoch, NUM_EPOCHS // 2, BETA_MAX)
 
-            train_metrics = train_one_epoch(model, train_loader, optimizer, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, lambda_residual=LAMBDA_RESIDUAL, device=device)
-            val_metrics = evaluate(model, val_loader, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, lambda_residual=LAMBDA_RESIDUAL, device=device)
+                train_metrics = train_one_epoch(model, train_loader, optimizer, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, lambda_residual=lambda_residual, device=device)
+                val_metrics = evaluate(model, val_loader, cir_params_init=params_cir, beta=beta, lambda_baseline=LAMBDA_BASELINE, lambda_prior=LAMBDA_PRIOR, lambda_residual=lambda_residual, device=device)
 
-            for k in ("total", "recon", "kl", "baseline", "prior", "residual"):
-                history[f"train_{k}"].append(train_metrics[k])
-                history[f"val_{k}"].append(val_metrics[k])
-            history["beta"].append(beta)
+                for k in ("total", "recon", "kl", "baseline", "prior", "residual"):
+                    history[f"train_{k}"].append(train_metrics[k])
+                    history[f"val_{k}"].append(val_metrics[k])
+                history["beta"].append(beta)
 
-            if val_metrics["recon"] < best_val_recon and beta >= BETA_MAX:
-                best_val_recon = val_metrics["recon"]
-                best_epoch = epoch
-                torch.save({"model_state": model.state_dict(),
-                            "stats": train_ds.stats,
-                            "latent_dim": 16,
-                            "embed_dim": 8,
-                            "part_embed_dim": 8,
-                            "region": region,
-                            "cir_params": params_cir,
-                            "t_grid": t_grid,
-                            "tau_s": TAU_S,
-                            "condition_on_participant": True,
-                            "num_participants": 3}, ckpt_path)
+                if val_metrics["recon"] < best_val_recon and beta >= BETA_MAX:
+                    best_val_recon = val_metrics["recon"]
+                    best_epoch = epoch
+                    torch.save({"model_state": model.state_dict(),
+                                "stats": train_ds.stats,
+                                "latent_dim": 16,
+                                "embed_dim": 8,
+                                "part_embed_dim": 8,
+                                "region": region,
+                                "cir_params": params_cir,
+                                "t_grid": t_grid,
+                                "tau_s": TAU_S,
+                                "condition_on_participant": True,
+                                "num_participants": 3}, ckpt_path)
 
-            pbar.set_postfix(b=f"{beta:.3f}",
-                             tr=f"{train_metrics["recon"]:.4f}",
-                             vr=f"{val_metrics["recon"]:.4f}",
-                             kl=f"{val_metrics["kl"]:.4f}",
-                             bl=f"{val_metrics["baseline"]:.4f}",
-                             pr=f"{val_metrics["prior"]:.4f}",
-                             rs=f"{val_metrics["residual"]:.4f}")
+                pbar.set_postfix(b=f"{beta:.3f}",
+                                tr=f"{train_metrics["recon"]:.4f}",
+                                vr=f"{val_metrics["recon"]:.4f}",
+                                kl=f"{val_metrics["kl"]:.4f}",
+                                bl=f"{val_metrics["baseline"]:.4f}",
+                                pr=f"{val_metrics["prior"]:.4f}",
+                                rs=f"{val_metrics["residual"]:.4f}")
 
-        print(f"\nBest validation recon: {best_val_recon:.4f} at epoch {best_epoch}")
+            print(f"[TRAIN] Best validation recon: {best_val_recon:.4f} at epoch {best_epoch}.")

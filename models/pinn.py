@@ -88,12 +88,14 @@ class PhysicsInformedCVAE(CVAE):
 
         # residual head
         T = len(t_grid)
-        self.residual_head = nn.Sequential(nn.Linear(self.latent_dim, 64),
+
+        class_embed_dim = self.decoder.label_embed.embedding_dim
+        self.residual_head = nn.Sequential(nn.Linear(self.latent_dim + class_embed_dim, 64),
                                            nn.ReLU(),
                                            nn.Linear(64, T))
         
         with torch.no_grad():
-            self.residual_head[-1].weight.data *= 0.01
+            self.residual_head[-1].weight.data.zero_()
             self.residual_head[-1].bias.zero_()
     
     def forward(self, x, y, p=None):
@@ -112,11 +114,12 @@ class PhysicsInformedCVAE(CVAE):
         humidity_physics, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
 
         # residual path
-        residual = self.residual_head(z)
+        class_emb = self.decoder.label_embed(y)
+        residual_input = torch.cat([z, class_emb], dim=-1)
+        residual = self.residual_head(residual_input)
 
         # combine
         humidity = humidity_physics + residual
-
 
         x_hat = torch.stack([humidity, temperature], dim=1)
 
@@ -138,6 +141,10 @@ class PhysicsInformedCVAE(CVAE):
             log_A, log_D, log_v = cir_params.unbind(dim=1)
             
             humidity_physics, _ = self.cir_conv(u_raw, log_A, log_D, log_v)
-            residual = self.residual_head(z)
+
+            class_emb = self.decoder.label_embed(y.to(device))
+            residual_input = torch.cat([z, class_emb], dim=-1)
+            residual = self.residual_head(residual_input)
+
             humidity = humidity_physics + residual
             return torch.stack([humidity, temperature], dim=1)
