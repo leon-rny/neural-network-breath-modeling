@@ -11,22 +11,22 @@ class CIRConvolution(nn.Module):
         super().__init__()
         self.d0 = d0
         self.tau_s = tau_s
-        
+
         # time grid
         t = torch.tensor(t_grid, dtype=torch.float32)
         self.register_buffer("t", t)
         self.dt = float(t[1] - t[0])
         self.T = len(t_grid)
-        
+
         # fixed sensor kernel
         s = torch.where(t > 0, (1.0 / tau_s) * torch.exp(-t / tau_s), torch.zeros_like(t))
         self.register_buffer("s", s)
-        
+
         # baseline mask
         mask = torch.ones(self.T)
         mask[:baseline_samples] = 0.0
         self.register_buffer("baseline_mask", mask)
-    
+
     def compute_kernels(self, log_A, log_D, log_v):
         A = torch.exp(log_A).unsqueeze(1)
         D = torch.exp(log_D).unsqueeze(1)
@@ -53,98 +53,100 @@ class CIRConvolution(nn.Module):
         h_full = h_full / (h_full.sum(dim=1, keepdim=True) + 1e-8)
 
         return h_full
-    
+
     def forward(self, u, log_A, log_D, log_v):
         # apply softplus + baseline mask
         u_clean = F.softplus(u) * self.baseline_mask
-        
+
         # per-sample kernels
         kernels = self.compute_kernels(log_A, log_D, log_v)   # (B, T)
-        
+
         # per-sample convolution (channels-as-batch trick for groups=B)
         B, T = u_clean.shape
         u_in = u_clean.unsqueeze(0)
         k = kernels.flip(1).unsqueeze(1)
         padded = F.pad(u_in, (T - 1, 0))
         y = F.conv1d(padded, k, groups=B).squeeze(0)
-        
+
         return y, u_clean
 
-class PhysicsInformedCVAE(CVAE):   
-    def __init__(self, cir_params_init, t_grid, tau_s=15.0, d0=0.03, baseline_samples=5, **cvae_kwargs):
+
+class PhysicsInformedCVAE(CVAE):
+    """
+    CVAE with an auxiliary, training-only physics-consistency path.
+
+    The decoder outputs (humidity, temperature) directly — exactly as in the vanilla CVAE.
+    During training, an auxiliary u_head produces a latent breath-source signal u from z,
+    and CIRConvolution maps (u, A, D, v) to a physics-predicted humidity that is matched
+    to the decoder's humidity via L_phys = MSE(humidity_decoder, CIR_conv(u, A, D, v)).
+
+    Set learn_cir_params=False to fix (A, D, v) at the population-fitted values and only
+    learn u; set True to predict per-sample (log_A, log_D, log_v) from z via cir_param_head.
+    """
+    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03,
+                 baseline_samples: int = 5, learn_cir_params: bool = True, **cvae_kwargs):
         super().__init__(**cvae_kwargs)
         self.cir_conv = CIRConvolution(t_grid, tau_s=tau_s, d0=d0, baseline_samples=baseline_samples)
-
-        # head that predicts from the latent
-        self.cir_param_head = nn.Sequential(nn.Linear(self.latent_dim, 32),
-                                            nn.ReLU(),
-                                            nn.Linear(32, 3))
-        
-        # initialize to output the fitted mean values
-        A_init, D_init, v_init, _ = cir_params_init
-        with torch.no_grad():
-            self.cir_param_head[-1].bias.copy_(torch.tensor([np.log(A_init), np.log(D_init), np.log(v_init)], dtype=torch.float32))
-            self.cir_param_head[-1].weight.data *= 0.01
-
-        # residual head
         T = len(t_grid)
+        self.learn_cir_params = learn_cir_params
 
-        class_embed_dim = self.decoder.label_embed.embedding_dim
-        self.residual_head = nn.Sequential(nn.Linear(self.latent_dim + class_embed_dim, 64),
-                                           nn.ReLU(),
-                                           nn.Linear(64, T))
-        
-        with torch.no_grad():
-            self.residual_head[-1].weight.data.zero_()
-            self.residual_head[-1].bias.zero_()
-    
+        # u_head: z -> raw u (softplus + baseline mask are applied inside cir_conv)
+        self.u_head = nn.Sequential(nn.Linear(self.latent_dim, 64),
+                                    nn.ReLU(),
+                                    nn.Linear(64, T))
+
+        A_init, D_init, v_init, _ = cir_params_init
+        log_A_init = float(np.log(A_init))
+        log_D_init = float(np.log(D_init))
+        log_v_init = float(np.log(v_init))
+
+        if learn_cir_params:
+            self.cir_param_head = nn.Sequential(nn.Linear(self.latent_dim, 32),
+                                                nn.ReLU(),
+                                                nn.Linear(32, 3))
+            with torch.no_grad():
+                self.cir_param_head[-1].bias.copy_(torch.tensor([log_A_init, log_D_init, log_v_init], dtype=torch.float32))
+                self.cir_param_head[-1].weight.data *= 0.01
+        else:
+            self.register_buffer("log_A_fixed", torch.tensor(log_A_init, dtype=torch.float32))
+            self.register_buffer("log_D_fixed", torch.tensor(log_D_init, dtype=torch.float32))
+            self.register_buffer("log_v_fixed", torch.tensor(log_v_init, dtype=torch.float32))
+
+    def _cir_params(self, z):
+        if self.learn_cir_params:
+            log_A, log_D, log_v = self.cir_param_head(z).unbind(dim=1)
+        else:
+            B = z.shape[0]
+            log_A = self.log_A_fixed.expand(B)
+            log_D = self.log_D_fixed.expand(B)
+            log_v = self.log_v_fixed.expand(B)
+        return log_A, log_D, log_v
+
     def forward(self, x, y, p=None):
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
-        raw_out = self.decoder(z, y, p)
-        
-        u_raw = raw_out[:, 0, :]
-        temperature = raw_out[:, 1, :]
-        
-        # predict per-sample CIR parameters from z
-        cir_params = self.cir_param_head(z)
-        log_A, log_D, log_v = cir_params.unbind(dim=1)
-        
-        # physics-informed humidity
-        humidity_physics, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
+        x_hat = self.decoder(z, y, p)  # (B, 2, T): channel 0 humidity, channel 1 temperature
 
-        # residual path
-        class_emb = self.decoder.label_embed(y)
-        residual_input = torch.cat([z, class_emb], dim=-1)
-        residual = self.residual_head(residual_input)
+        # auxiliary physics path (training-only consistency target)
+        u_raw = self.u_head(z)
+        log_A, log_D, log_v = self._cir_params(z)
+        humidity_phys, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
 
-        # combine
-        humidity = humidity_physics + residual
+        return x_hat, mu, logvar, u_post_softplus, (log_A, log_D, log_v), humidity_phys
 
-        x_hat = torch.stack([humidity, temperature], dim=1)
-
-        return x_hat, mu, logvar, u_post_softplus, (log_A, log_D, log_v), residual
-    
-    def sample(self, n, y, device):
+    def sample(self, n, y, device, return_aux: bool = False):
         z = torch.randn(n, self.latent_dim, device=device)
         if y.dim() == 0:
             y = y.expand(n)
         p = torch.randint(0, self.num_participants, (n,), device=device) if self._cond_part else None
-        
+
         self.eval()
         with torch.no_grad():
-            raw_out = self.decoder(z, y.to(device), p)
-            u_raw = raw_out[:, 0, :]
-            temperature = raw_out[:, 1, :]
-            
-            cir_params = self.cir_param_head(z)
-            log_A, log_D, log_v = cir_params.unbind(dim=1)
-            
-            humidity_physics, _ = self.cir_conv(u_raw, log_A, log_D, log_v)
+            x_hat = self.decoder(z, y.to(device), p)
+            if not return_aux:
+                return x_hat
 
-            class_emb = self.decoder.label_embed(y.to(device))
-            residual_input = torch.cat([z, class_emb], dim=-1)
-            residual = self.residual_head(residual_input)
-
-            humidity = humidity_physics + residual
-            return torch.stack([humidity, temperature], dim=1)
+            u_raw = self.u_head(z)
+            log_A, log_D, log_v = self._cir_params(z)
+            humidity_phys, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
+            return x_hat, u_post_softplus, (log_A, log_D, log_v), humidity_phys
