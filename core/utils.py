@@ -4,12 +4,12 @@ import numpy as np
 import torch
 
 # reproducibility
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def seed_everything(init_seed: int) -> None:
+    random.seed(init_seed)
+    np.random.seed(init_seed)
+    torch.manual_seed(init_seed)
     if torch.backends.mps.is_available():
-        torch.mps.manual_seed(seed)
+        torch.mps.manual_seed(init_seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
