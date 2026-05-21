@@ -3,7 +3,7 @@ import re
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 import torch
 from torch.utils.data import Dataset
 
@@ -40,7 +40,7 @@ def load_dataset(dataset_dir: str = 'dataset') -> pd.DataFrame:
             
     return pd.DataFrame(records)
 
-def split_dataset(df: pd.DataFrame, val_size: float = 0.1, test_size: float = 0.1, random_state: int = 42,) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def split_dataset(df: pd.DataFrame, val_size: float = 0.1, test_size: float = 0.1, random_state: int = 42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Stratified train/val/test split by class label.
 
@@ -56,6 +56,41 @@ def split_dataset(df: pd.DataFrame, val_size: float = 0.1, test_size: float = 0.
     df_train, df_val = train_test_split(df_train_val, test_size=val_relative, stratify=df_train_val['class'], random_state=random_state)
     
     return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test.reset_index(drop=True)
+
+def kfold_split_dataset(df: pd.DataFrame, split_seed: int, fold: int, n_folds: int = 5, val_size: float = 0.15) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Stratified k-fold split returning the (train, val, test) DataFrames for a given fold.
+
+    The outer split (test) is determined by k-fold partitioning: each fold defines
+    a unique test set, and the remaining samples form the training pool. The training
+    pool is then further split into train and val for hyperparameter tuning and
+    early stopping.
+
+    :param df: DataFrame containing the dataset.
+    :param split_seed: Random seed for both the outer k-fold and the inner train/val split. Should be FIXED across all configurations for paired comparisons.
+    :param fold: Which fold to return (0..n_folds-1).
+    :param n_folds: Number of outer folds.
+    :param val_size: Proportion of the training pool to use as validation.
+    :return: A tuple of (train_df, val_df, test_df) DataFrames.
+    """
+    if not 0 <= fold < n_folds:
+        raise ValueError(f"fold must be in [0, {n_folds}), got {fold}")
+
+    df = df.reset_index(drop=True)
+    y = df["class"].values
+
+    # outer k-fold defines test
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=split_seed)
+    splits = list(skf.split(df, y))
+    train_idx, test_idx = splits[fold]
+
+    df_trainfull = df.iloc[train_idx].reset_index(drop=True)
+    df_test = df.iloc[test_idx].reset_index(drop=True)
+
+    # inner split: carve val out of trainfull
+    df_train, df_val = train_test_split(df_trainfull, test_size=val_size, stratify=df_trainfull["class"], random_state=split_seed)
+
+    return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test
 
 class BreathDataset(Dataset):
     def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None,
