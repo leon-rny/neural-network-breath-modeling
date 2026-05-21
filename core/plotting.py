@@ -274,33 +274,83 @@ def load_trtr_features():
 
 def plot_trtr_ablation():
     df = pd.read_csv("results/ablation_trtr/summary.csv")
+    if "single_split" not in df.columns:
+        df["single_split"] = False
+    df["single_split"] = df["single_split"].fillna(False).astype(bool)
 
-    pipelines = ["original", "shap_fix", "full"]
-    pipeline_labels = {"original": "Replication", "shap_fix": "SHAP on train", "full": "+ Train/val/test"}
-    metrics = ["accuracy", "roc_auc_ovr"]
-    metric_labels = {"accuracy": "Accuracy", "roc_auc_ovr": "ROC-AUC"}
-    metric_colors = {"accuracy": "tab:blue", "roc_auc_ovr": "tab:orange"}
+    df_kfold  = df[~df["single_split"]]
+    df_legacy = df[df["single_split"] & (df["pipeline"] == "replication")]
 
-    stats = df.groupby(["region", "pipeline"], observed=True)[metrics].agg(["mean", "std"])
+    pipelines = ["original", "replication", "shap_fix", "lgbm_fix", "tsfresh_fix", "smote_fix"]
+    pipeline_labels = ["Original\nprotocol",
+                       "Replication\n(k-fold)",
+                       "+ SHAP\non train",
+                       "+ Unified\nLGBM tuning",
+                       "+ tsfresh\nper fold",
+                       "+ SMOTE\ninside CV"]
+    regions = ["mouth", "nose"]
+    region_colors = {"mouth": "tab:blue", "nose": "tab:orange"}
 
-    fig, axes = plt.subplots(1, 2, figsize=(WIDTH * 3, HEIGHT * 1.5), sharey=True)
+    metric_cols = ["accuracy", "f1_weighted", "roc_auc_ovr", "log_loss"]
+
+    # k-fold: average over init_seeds per fold, then mean+/-std across folds
+    fold_level = df_kfold.groupby(["region", "pipeline", "fold"])[metric_cols].mean().reset_index()
+    agg_kfold = fold_level.groupby(["region", "pipeline"])[metric_cols].agg(["mean", "std"])
+    # legacy: mean+/-std across init_seeds (no folds)
+    agg_legacy = df_legacy.groupby("region")[metric_cols].agg(["mean", "std"])
+
+    def lookup(region, pipeline, metric_col):
+        if pipeline == "original":
+            if region in agg_legacy.index:
+                return (agg_legacy.loc[region, (metric_col, "mean")],
+                        agg_legacy.loc[region, (metric_col, "std")])
+        elif (region, pipeline) in agg_kfold.index:
+            return (agg_kfold.loc[(region, pipeline), (metric_col, "mean")],
+                    agg_kfold.loc[(region, pipeline), (metric_col, "std")])
+        return (np.nan, 0.0)
+
+    metrics = [("accuracy", "Accuracy in %", True),
+               ("f1_weighted", r"$F_1^w$ in %", True),
+               ("roc_auc_ovr", "ROC-AUC (OVR) in %", True),
+               ("log_loss", "Log Loss", False)]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    width = 0.38
     x = np.arange(len(pipelines))
-    bar_width = 0.38
 
-    for ax, region in zip(axes, REGIONS):
-        for i, metric in enumerate(metrics):
-            means = stats.loc[(region,), (metric, "mean")].reindex(pipelines).to_numpy() * 100
-            stds  = stats.loc[(region,), (metric, "std")].reindex(pipelines).to_numpy() * 100
-            offset = (i - 0.5) * bar_width
-            ax.bar(x + offset, means, bar_width, yerr=stds, capsize=4,
-                   color=metric_colors[metric], edgecolor="black", linewidth=0.5,
-                   label=metric_labels[metric])
-        ax.set_xticks(x, [pipeline_labels[p] for p in pipelines])
-        ax.set_title(region.capitalize())
-        ax.set_ylim(0, 105)
-        ax.set_ylabel("Value in %") if ax == axes[0] else None
-        ax.grid(axis="y")
-        ax.legend(loc="lower right")
+    for ax, (metric_col, ylabel, scale_pct) in zip(axes.flat, metrics):
+        for i, region in enumerate(regions):
+            means, stds = [], []
+            for p in pipelines:
+                m, s = lookup(region, p, metric_col)
+                means.append(m)
+                stds.append(0.0 if np.isnan(s) else s)
+            means = np.array(means, dtype=float)
+            stds  = np.array(stds, dtype=float)
+            if scale_pct:
+                means, stds = means * 100, stds * 100
+
+            offset = (i - 0.5) * width
+            ax.bar(x + offset, means, width, yerr=stds, capsize=4,
+                   label=region.capitalize(), color=region_colors[region],
+                   alpha=0.85, edgecolor="black", linewidth=0.5,
+                   error_kw=dict(ecolor="black", lw=0.8))
+
+            fmt = "{:.1f}" if scale_pct else "{:.3f}"
+            label_offset = 1.5 if scale_pct else 0.02
+            for xi, m, s in zip(x, means, stds):
+                if not np.isnan(m):
+                    ax.text(xi + offset, m + s + label_offset,
+                            fmt.format(m), ha="center", fontsize=8)
+
+        ax.axvline(0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(pipeline_labels, fontsize=8)
+        ax.set_ylabel(ylabel)
+        ax.grid(axis="y", alpha=0.3)
+        loc = "upper right" if metric_col == "log_loss" else "lower right"
+        ax.legend(loc=loc, fontsize=9)
+        ax.set_title(ylabel.replace(" in %", ""))
 
     plt.tight_layout()
     plt.show()

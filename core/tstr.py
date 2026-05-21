@@ -4,7 +4,6 @@ import os
 import pickle
 import re
 
-from imblearn.pipeline import Pipeline as ImbPipeline
 import numpy as np
 import pandas as pd
 import torch
@@ -15,12 +14,13 @@ from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 from xgboost import XGBClassifier
 from catboost import CatBoostClassifier
 from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
 import shap
 from sklearn.ensemble import RandomForestClassifier, StackingClassifier
 from sklearn.metrics import accuracy_score, classification_report, f1_score, log_loss, roc_auc_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 
-from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, split_dataset
+from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, kfold_split_dataset
 from core.utils import seed_everything
 from models.vae import CVAE, VAE
 from models.pinn import PhysicsInformedCVAE
@@ -38,7 +38,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--n_jobs', type=int, default=4)
     p.add_argument('--force_rebuild', action='store_true')
-    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--init_seed', type=int, default=42) # varies across experiments to characterize sensitivity
+    p.add_argument('--split_seed', type=int, default=42) # always fixed!
+    p.add_argument('--fold', type=int, default=0)
+    p.add_argument('--n_folds', type=int, default=5)
     # model-specific
     p.add_argument('--free_bits', type=float, default=0.0)
     p.add_argument('--latent_dim', type=int, default=32)
@@ -86,23 +89,23 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
             X[c] = 0.0
     return X[top_features_raw]
 
-def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, seed: int) -> StackingClassifier:
+def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_seed: int) -> StackingClassifier:
     def make_base(clf):
         if k_neighbors < 1: # too few samples in minority class for SMOTE
             return clf
-        return ImbPipeline([("smote", SMOTE(random_state=seed, k_neighbors=k_neighbors)),
+        return ImbPipeline([("smote", SMOTE(random_state=init_seed, k_neighbors=k_neighbors)),
                             ("clf", clf)])
-    
+
     min_class = int(np.bincount(y_train).min())
     k_neighbors = min(5, min_class - 1)
 
     # create clf and use smote
-    xgb_clf = make_base(XGBClassifier(eval_metric='mlogloss', random_state=seed, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300))
-    cat_clf = make_base(CatBoostClassifier(logging_level='Silent', random_state=seed, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,allow_writing_files=False))
-    meta_clf = RandomForestClassifier(n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=seed,)
-    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=seed), n_jobs=-1,)
+    xgb_clf = make_base(XGBClassifier(eval_metric='mlogloss', random_state=init_seed, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300))
+    cat_clf = make_base(CatBoostClassifier(logging_level='Silent', random_state=init_seed, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,allow_writing_files=False))
+    meta_clf = RandomForestClassifier(n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=init_seed)
+    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=init_seed), n_jobs=-1)
     stacker.fit(X_train, y_train)
-    
+
     return stacker
 
 def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.ndarray) -> dict:
@@ -151,7 +154,9 @@ def save_summary(result: dict) -> None:
     new_row = {'model': result['model'],
                'region': result['region'],
                'channel': result.get('channel', 'both'),
-               'seed': result.get('seed'),
+               'init_seed': result.get('init_seed'),
+               'split_seed': result.get('split_seed'),
+               'fold': result.get('fold'),
                'latent_dim': result.get('latent_dim'),
                'embed_dim': result.get('embed_dim'),
                'part_embed_dim': result.get('part_embed_dim'),
@@ -183,28 +188,28 @@ def save_summary(result: dict) -> None:
                 df_row[col] = df_row[col].astype(df_old[col].dtype)
             except (ValueError, TypeError):
                 pass
-        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(subset=['model', 'region', 'channel', 'seed', 'latent_dim', 'embed_dim', 'part_embed_dim', 'free_bits', 'lambda_phys', 'alpha', 'n_copies', 'augmentation_ratio'], keep='last')
+        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(subset=['model', 'region', 'channel', 'init_seed', 'split_seed', 'fold', 'latent_dim', 'embed_dim', 'part_embed_dim', 'free_bits', 'lambda_phys', 'alpha', 'n_copies', 'augmentation_ratio'], keep='last')
     else:
         df_new = df_row
     df_new.to_csv(csv_path, index=False)
 
 # train real test real
-def _cache_path(region: str, seed: int, channel: str = 'both') -> str:
+def _cache_path(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both') -> str:
     suffix = f'_ch{channel}' if channel != 'both' else ''
-    return f'results/trtr/{region}_s{seed}{suffix}_checkpoint.pkl'
+    return f'results/trtr/{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}{suffix}_checkpoint.pkl'
 
-def load_cache(region: str, seed: int, channel: str = 'both') -> dict | None:
-    path = _cache_path(region, seed, channel)
+def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both') -> dict | None:
+    path = _cache_path(region, init_seed, split_seed, fold, n_folds, channel)
     if os.path.exists(path):
         with open(path, 'rb') as f:
             return pickle.load(f)
     return None
 
-def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int, channel: str = 'both') -> dict:
+def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed: int, fold: int, n_folds: int = 5, channel: str = 'both') -> dict:
     # load dataset
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
-    df_train, df_val, df_test = split_dataset(df, random_state=seed)
+    df_train, df_val, df_test = kfold_split_dataset(df, fold=fold, n_folds=n_folds, split_seed=split_seed)
     stats = BreathDataset(df_train).stats
 
     ## train real
@@ -224,16 +229,16 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int, channel: str = '
     X_full_san.columns = [raw_to_san[c] for c in X_full_san.columns]
 
     # lgbm and shap feature importance
-    X_tr, X_val, y_tr, y_val = train_test_split(X_full_san, y_train, test_size=0.2, stratify=y_train, random_state=seed)
+    X_tr, X_val, y_tr, y_val = train_test_split(X_full_san, y_train, test_size=0.2, stratify=y_train, random_state=split_seed)
     param_grid = {'max_depth': [4, 6],
                   'reg_alpha': [0.1, 1.0],
                   'reg_lambda': [0.5, 1.0],
                   'colsample_bytree': [0.8, 1.0]}
-    base_lgbm = LGBMClassifier(n_estimators=1000, learning_rate=0.05, random_state=seed, verbose=-1)
-    gs = GridSearchCV(base_lgbm, param_grid, cv=StratifiedKFold(3), scoring='accuracy', n_jobs=-1, verbose=0)
+    base_lgbm = LGBMClassifier(n_estimators=1000, learning_rate=0.05, random_state=init_seed, verbose=-1)
+    gs = GridSearchCV(base_lgbm, param_grid, cv=StratifiedKFold(3, shuffle=True, random_state=split_seed), scoring='accuracy', n_jobs=-1, verbose=0)
     gs.fit(X_tr, y_tr)
 
-    best_lgbm = LGBMClassifier(**gs.best_params_, n_estimators=1000, learning_rate=0.05, random_state=seed, verbose=-1)
+    best_lgbm = LGBMClassifier(**gs.best_params_, n_estimators=1000, learning_rate=0.05, random_state=init_seed, verbose=-1)
     best_lgbm.fit(X_tr.values, y_tr.values, eval_set=[(X_val.values, y_val.values)], eval_metric='multi_logloss', callbacks=[early_stopping(50, verbose=False), log_evaluation(0)])
 
     explainer = shap.TreeExplainer(best_lgbm)
@@ -253,7 +258,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int, channel: str = '
     X_test_top = X_test_san[top_20_san].values
 
     # train stack classifier
-    clf = train_stacking_classifier(X_train_top, y_train.values, seed)
+    clf = train_stacking_classifier(X_train_top, y_train.values, init_seed)
 
     # evaluate classifier
     trtr_metrics = evaluate_classifier(clf, X_test_top, y_test.values)
@@ -269,9 +274,12 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, seed: int, channel: str = '
              'n_train': len(df_train),
              'trtr_metrics': trtr_metrics,
              'channel': channel,
-             'seed': seed}
+             'init_seed': init_seed,
+             'split_seed': split_seed,
+             'fold': fold,
+             'n_folds': n_folds}
     os.makedirs('results/trtr', exist_ok=True)
-    with open(_cache_path(region, seed, channel), 'wb') as f:
+    with open(_cache_path(region, init_seed, split_seed, fold, n_folds, channel), 'wb') as f:
         pickle.dump(cache, f)
 
     return cache
@@ -356,7 +364,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
 
     return signals_phys, labels
 
-def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1) -> dict:
+def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1) -> dict:
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
@@ -375,7 +383,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     X_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_san.columns]
     X_synth_top = X_san[cache['top_20_features_sanitized']].values
 
-    stacker_tstr = train_stacking_classifier(X_synth_top, synth_labels, seed)
+    stacker_tstr = train_stacking_classifier(X_synth_top, synth_labels, init_seed)
     tstr_metrics = evaluate_classifier(stacker_tstr, cache['X_test_top'], cache['y_test'])
 
     # feature overlap
@@ -396,7 +404,9 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     return {'model': model_name,
             'region': region,
             'channel': cache.get('channel', 'both'),
-            'seed': seed,
+            'init_seed': init_seed,
+            'split_seed': split_seed,
+            'fold': fold,
             'latent_dim': latent_dim,
             'embed_dim': embed_dim,
             'part_embed_dim': part_embed_dim if model_name == 'cvae_part' else None,
@@ -413,7 +423,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
             'trtr_metrics': cache['trtr_metrics']}
 
 # train synthetic/real test real
-def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, seed: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1) -> dict:
+def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1) -> dict:
     n_synthetic = int(cache['n_train'] * augmentation_ratio)
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR+] model={model_name}, n_synthetic={n_synthetic}, n_train_real={cache["n_train"]}')
@@ -436,13 +446,15 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     X_combined = np.concatenate([cache['X_train_top'], X_synth_top])
     y_combined = np.concatenate([cache['y_train'], synth_labels])
 
-    stacker = train_stacking_classifier(X_combined, y_combined, seed)
+    stacker = train_stacking_classifier(X_combined, y_combined, init_seed)
     metrics = evaluate_classifier(stacker, cache['X_test_top'], cache['y_test'])
 
     return {'model': f'{model_name}_plus',
             'region': region,
             'channel': cache.get('channel', 'both'),
-            'seed': seed,
+            'init_seed': init_seed,
+            'split_seed': split_seed,
+            'fold': fold,
             'latent_dim': latent_dim,
             'embed_dim': embed_dim,
             'part_embed_dim': part_embed_dim if model_name == 'cvae_part' else None,
@@ -464,40 +476,43 @@ def main():
     args = parse_args()
     device = torch.device('cpu')
 
-    # run_id for paths
+    # run_id for paths. Encodes init_seed and fold (the things that vary across
+    # paired comparisons). split_seed and n_folds are protocol-level constants
+    # and intentionally omitted.
     base_model = args.model.removesuffix('_plus')
     if base_model == 'vae':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_fb{args.free_bits}'
+        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_fb{args.free_bits}'
     elif base_model == 'cvae':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
+        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
     elif base_model == 'cvae_part':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
+        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
     elif base_model == 'pinn':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_phys{args.lambda_phys}'
+        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_phys{args.lambda_phys}'
     else:
-        run_id = f'{args.region}_s{args.seed}'
+        run_id = f'{args.region}_s{args.init_seed}'
+    run_id += f'_f{args.fold}'
     if args.alpha > 0 and args.n_copies > 1:
         run_id += f'_a{args.alpha}_n{args.n_copies}'
     if args.channel != 'both':
         run_id += f'_ch{args.channel}'
 
     # reproducibility
-    seed_everything(args.seed)
-    print(f'[TRTR] Seed: {args.seed} | Model: {args.model} | Region: {args.region} | Device: {device}' if args.model == 'trtr'
-          else f'[TSTR] Seed: {args.seed} | Model: {args.model} | Region: {args.region} | Device: {device}')
+    seed_everything(args.init_seed)
+    tag = '[TRTR]' if args.model == 'trtr' else '[TSTR]'
+    print(f'{tag} init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold}/{args.n_folds} | Model: {args.model} | Region: {args.region} | Device: {device}')
 
-    # train-real-test-real 
+    # train-real-test-real
     # build cache
     if args.force_rebuild:
-        path = _cache_path(args.region, args.seed, args.channel)
+        path = _cache_path(args.region, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel)
         if os.path.exists(path):
             os.remove(path)
             print('[TRTR] Removed cache.')
 
     # load cache
-    cache = load_cache(args.region, args.seed, args.channel)
+    cache = load_cache(args.region, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel)
     if cache is None:
-        cache = trtr(args.dataset_dir, args.region, args.n_jobs, args.seed, args.channel)
+        cache = trtr(args.dataset_dir, args.region, args.n_jobs, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel)
         print('[TRTR] Built cache.')
     else:
         print('[TRTR] Loaded cache.')
@@ -507,7 +522,9 @@ def main():
         result = {'model': 'trtr',
                   'region': args.region,
                   'channel': args.channel,
-                  'seed': args.seed,
+                  'init_seed': args.init_seed,
+                  'split_seed': args.split_seed,
+                  'fold': args.fold,
                   'n_train_real': cache['n_train'],
                   'n_synthetic': cache['n_train'],
                   'top_20_features': cache['top_20_features_sanitized'],
@@ -521,12 +538,12 @@ def main():
 
     # train-synthetic-test-real
     if args.mode == 'tstr_plus':
-        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies)
+        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies)
         save_result(result, result['model'], run_id)
         save_summary(result)
     else:
         n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
-        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.seed, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies)
+        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies)
         save_result(result, args.model, run_id)
         save_summary(result)
 
