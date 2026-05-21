@@ -4,6 +4,7 @@ import os
 import pickle
 import re
 
+from imblearn.pipeline import Pipeline as ImbPipeline
 import numpy as np
 import pandas as pd
 import torch
@@ -86,19 +87,21 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
     return X[top_features_raw]
 
 def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, seed: int) -> StackingClassifier:
+    def make_base(clf):
+        if k_neighbors < 1: # too few samples in minority class for SMOTE
+            return clf
+        return ImbPipeline([("smote", SMOTE(random_state=seed, k_neighbors=k_neighbors)),
+                            ("clf", clf)])
+    
     min_class = int(np.bincount(y_train).min())
     k_neighbors = min(5, min_class - 1)
-    if k_neighbors < 1:
-        X_res, y_res = X_train, y_train
-    else:
-        smote = SMOTE(random_state=seed, k_neighbors=k_neighbors)
-        X_res, y_res = smote.fit_resample(X_train, y_train)
 
-    xgb_clf = XGBClassifier(eval_metric='mlogloss', random_state=seed, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300,)
-    cat_clf = CatBoostClassifier(logging_level='Silent', random_state=seed, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,allow_writing_files=False)
+    # create clf and use smote
+    xgb_clf = make_base(XGBClassifier(eval_metric='mlogloss', random_state=seed, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300))
+    cat_clf = make_base(CatBoostClassifier(logging_level='Silent', random_state=seed, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,allow_writing_files=False))
     meta_clf = RandomForestClassifier(n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=seed,)
     stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=seed), n_jobs=-1,)
-    stacker.fit(X_res, y_res)
+    stacker.fit(X_train, y_train)
     
     return stacker
 
