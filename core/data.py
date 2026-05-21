@@ -94,9 +94,12 @@ class BreathDataset(Dataset):
         return signal, time, label, participant
     
 class PhysicsInformedDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None) -> None:
+    def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None,
+                 alpha: float = 0.0, n_copies: int = 1) -> None:
         self.records = dataframe.to_dict('records')
         self.stats = stats if stats is not None else self._compute_stats()
+        self.alpha = alpha
+        self.n_copies = max(n_copies, 1)
 
     def _compute_stats(self) -> dict:
         peak_devs = []
@@ -112,10 +115,10 @@ class PhysicsInformedDataset(Dataset):
                 'h_scale': h_scale}
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.records) * self.n_copies
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
-        r = self.records[idx]
+        r = self.records[idx % len(self.records)]
 
         # baseline correct
         baseline_h = np.mean(r['humidity'][:5])
@@ -136,6 +139,8 @@ class PhysicsInformedDataset(Dataset):
         
         # get all infos
         signal = torch.tensor(np.stack([h, t], axis=0), dtype=torch.float32)
+        if self.alpha > 0:
+            signal = signal + self.alpha * torch.randn_like(signal)
         time = torch.tensor(r['time'] - r['time'][0],  dtype=torch.float32)
         label = CLASS_TO_IDX[r['class']]
         participant = PARTICIPANT_TO_IDX[r['participant']]

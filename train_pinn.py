@@ -104,6 +104,9 @@ def parse_args():
     p.add_argument("--beta_max", type=float, default=0.1)
     p.add_argument("--tau_s", type=float, default=15.0)
     p.add_argument("--learn_cir_params", action="store_true")
+    # jittering augmentation (training only; defaults = off)
+    p.add_argument("--alpha", type=float, default=0.0)
+    p.add_argument("--n_copies", type=int, default=1)
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -113,6 +116,8 @@ if __name__ == "__main__":
 
     print(f'[TRAIN] Seed: {args.seed} | Model: PINN | Region: {args.region} | Device: {device} | Epochs: {args.num_epochs}')
     run_id = f"{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_phys{args.lambda_phys}"
+    if args.alpha > 0 and args.n_copies > 1:
+        run_id += f"_a{args.alpha}_n{args.n_copies}"
     ckpt_path = f"results/pinn/{run_id}_checkpoint.pt"
 
     # reproducibility
@@ -123,10 +128,13 @@ if __name__ == "__main__":
     df = load_dataset("./dataset")
     df = df[df["region"] == args.region].reset_index(drop=True)
     df_train, df_val, _ = split_dataset(df, random_state=args.seed)
-    train_ds = PhysicsInformedDataset(df_train)
+    train_ds = PhysicsInformedDataset(df_train, alpha=args.alpha, n_copies=args.n_copies)
     val_ds = PhysicsInformedDataset(df_val, stats=train_ds.stats)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False, worker_init_fn=4, generator=g)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    if args.alpha > 0 and args.n_copies > 1:
+        n_clean = len(df_train)
+        print(f'[TRAIN] Jitter: alpha={args.alpha}, n_copies={args.n_copies} ({n_clean} → {len(train_ds)} samples)')
 
     # CIR parameters
     params_cir = np.load(f"results/pinn/params_{args.region}.npy")

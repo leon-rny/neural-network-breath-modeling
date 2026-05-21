@@ -70,19 +70,7 @@ class CIRConvolution(nn.Module):
 
         return y, u_clean
 
-
 class PhysicsInformedCVAE(CVAE):
-    """
-    CVAE with an auxiliary, training-only physics-consistency path.
-
-    The decoder outputs (humidity, temperature) directly — exactly as in the vanilla CVAE.
-    During training, an auxiliary u_head produces a latent breath-source signal u from z,
-    and CIRConvolution maps (u, A, D, v) to a physics-predicted humidity that is matched
-    to the decoder's humidity via L_phys = MSE(humidity_decoder, CIR_conv(u, A, D, v)).
-
-    Set learn_cir_params=False to fix (A, D, v) at the population-fitted values and only
-    learn u; set True to predict per-sample (log_A, log_D, log_v) from z via cir_param_head.
-    """
     def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03,
                  baseline_samples: int = 5, learn_cir_params: bool = True, **cvae_kwargs):
         super().__init__(**cvae_kwargs)
@@ -90,7 +78,7 @@ class PhysicsInformedCVAE(CVAE):
         T = len(t_grid)
         self.learn_cir_params = learn_cir_params
 
-        # u_head: z -> raw u (softplus + baseline mask are applied inside cir_conv)
+        # u_head
         self.u_head = nn.Sequential(nn.Linear(self.latent_dim, 64),
                                     nn.ReLU(),
                                     nn.Linear(64, T))
@@ -125,9 +113,8 @@ class PhysicsInformedCVAE(CVAE):
     def forward(self, x, y, p=None):
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
-        x_hat = self.decoder(z, y, p)  # (B, 2, T): channel 0 humidity, channel 1 temperature
+        x_hat = self.decoder(z, y, p)
 
-        # auxiliary physics path (training-only consistency target)
         u_raw = self.u_head(z)
         log_A, log_D, log_v = self._cir_params(z)
         humidity_phys, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
