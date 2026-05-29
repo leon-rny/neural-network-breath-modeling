@@ -38,9 +38,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--n_jobs', type=int, default=4)
     p.add_argument('--force_rebuild', action='store_true')
+    p.add_argument('--no_summary', action='store_true', help='Skip writing to results/summary.csv. Use during parallel runs to avoid races; a sequential pass can then aggregate.')
     p.add_argument('--init_seed', type=int, default=42) # varies across experiments to characterize sensitivity
     p.add_argument('--split_seed', type=int, default=42) # always fixed!
-    p.add_argument('--fold', type=int, default=0)
+    p.add_argument('--fold', type=int, default=1, help='1-indexed fold in [1, n_folds].')
     p.add_argument('--n_folds', type=int, default=5)
     # model-specific
     p.add_argument('--free_bits', type=float, default=0.0)
@@ -89,7 +90,7 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
             X[c] = 0.0
     return X[top_features_raw]
 
-def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_seed: int) -> StackingClassifier:
+def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_seed: int, n_jobs: int = -1) -> StackingClassifier:
     def make_base(clf):
         if k_neighbors < 1: # too few samples in minority class for SMOTE
             return clf
@@ -103,7 +104,7 @@ def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_see
     xgb_clf = make_base(XGBClassifier(eval_metric='mlogloss', random_state=init_seed, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300))
     cat_clf = make_base(CatBoostClassifier(logging_level='Silent', random_state=init_seed, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20,allow_writing_files=False))
     meta_clf = RandomForestClassifier(n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=init_seed)
-    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=init_seed), n_jobs=-1)
+    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=init_seed), n_jobs=n_jobs)
     stacker.fit(X_train, y_train)
 
     return stacker
@@ -209,7 +210,8 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
     # load dataset
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
-    df_train, df_val, df_test = kfold_split_dataset(df, fold=fold, n_folds=n_folds, split_seed=split_seed)
+    # fold is 1-indexed at the API boundary; kfold_split_dataset takes 0-indexed.
+    df_train, df_val, df_test = kfold_split_dataset(df, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
     stats = BreathDataset(df_train).stats
 
     ## train real
@@ -235,7 +237,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
                   'reg_lambda': [0.5, 1.0],
                   'colsample_bytree': [0.8, 1.0]}
     base_lgbm = LGBMClassifier(n_estimators=1000, learning_rate=0.05, random_state=init_seed, verbose=-1)
-    gs = GridSearchCV(base_lgbm, param_grid, cv=StratifiedKFold(3, shuffle=True, random_state=split_seed), scoring='accuracy', n_jobs=-1, verbose=0)
+    gs = GridSearchCV(base_lgbm, param_grid, cv=StratifiedKFold(3, shuffle=True, random_state=split_seed), scoring='accuracy', n_jobs=n_jobs, verbose=0)
     gs.fit(X_tr, y_tr)
 
     best_lgbm = LGBMClassifier(**gs.best_params_, n_estimators=1000, learning_rate=0.05, random_state=init_seed, verbose=-1)
@@ -258,7 +260,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
     X_test_top = X_test_san[top_20_san].values
 
     # train stack classifier
-    clf = train_stacking_classifier(X_train_top, y_train.values, init_seed)
+    clf = train_stacking_classifier(X_train_top, y_train.values, init_seed, n_jobs=n_jobs)
 
     # evaluate classifier
     trtr_metrics = evaluate_classifier(clf, X_test_top, y_test.values)
@@ -383,11 +385,14 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     X_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_san.columns]
     X_synth_top = X_san[cache['top_20_features_sanitized']].values
 
-    stacker_tstr = train_stacking_classifier(X_synth_top, synth_labels, init_seed)
+    stacker_tstr = train_stacking_classifier(X_synth_top, synth_labels, init_seed, n_jobs=n_jobs)
     tstr_metrics = evaluate_classifier(stacker_tstr, cache['X_test_top'], cache['y_test'])
 
-    # feature overlap
-    xgb_clf = stacker_tstr.estimators_[0]
+    # feature overlap. After the SMOTE-leakage fix the base estimator is an
+    # ImbPipeline([(smote, ...), (clf, XGBClassifier)]); SHAP's TreeExplainer
+    # doesn't unwrap pipelines, so reach in for the underlying tree model.
+    xgb_base = stacker_tstr.estimators_[0]
+    xgb_clf = xgb_base.named_steps['clf'] if hasattr(xgb_base, 'named_steps') else xgb_base
     explainer = shap.TreeExplainer(xgb_clf)
     shap_values = explainer.shap_values(X_synth_top)
     if shap_values.ndim == 3:
@@ -446,7 +451,7 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     X_combined = np.concatenate([cache['X_train_top'], X_synth_top])
     y_combined = np.concatenate([cache['y_train'], synth_labels])
 
-    stacker = train_stacking_classifier(X_combined, y_combined, init_seed)
+    stacker = train_stacking_classifier(X_combined, y_combined, init_seed, n_jobs=n_jobs)
     metrics = evaluate_classifier(stacker, cache['X_test_top'], cache['y_test'])
 
     return {'model': f'{model_name}_plus',
@@ -533,19 +538,22 @@ def main():
                   'top_20_synth_features': None,
                   'trtr_metrics': cache['trtr_metrics']}
         save_result(result, args.model, run_id)
-        save_summary(result)
+        if not args.no_summary:
+            save_summary(result)
         return
 
     # train-synthetic-test-real
     if args.mode == 'tstr_plus':
         result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies)
         save_result(result, result['model'], run_id)
-        save_summary(result)
+        if not args.no_summary:
+            save_summary(result)
     else:
         n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
         result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies)
         save_result(result, args.model, run_id)
-        save_summary(result)
+        if not args.no_summary:
+            save_summary(result)
 
 if __name__ == '__main__':
     main()

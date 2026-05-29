@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from core.data import BreathDataset, load_dataset, split_dataset
+from core.data import BreathDataset, load_dataset, kfold_split_dataset
 from core.utils import seed_everything, seed_worker, make_generator
 from models.vae import VAE, CVAE, elbo_loss
 
@@ -18,7 +18,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--log_every', type=int, default=25)
-    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--init_seed', type=int, default=42, help='Model-internal randomness; varies across runs to characterize sensitivity.')
+    p.add_argument('--split_seed', type=int, default=42, help='Data partition; fixed for paired comparisons.')
+    p.add_argument('--fold', type=int, default=1, help='1-indexed fold in [1, n_folds].')
+    p.add_argument('--n_folds', type=int, default=5)
     p.add_argument('--epochs', type=int, default=500)
     p.add_argument('--batch_size', type=int, default=32)
     # model-specific
@@ -110,29 +113,34 @@ def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_pa
 def main():
     args = parse_args()
     device = torch.device('cpu')
-    print(f'[TRAIN] Seed: {args.seed} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
+    print(f'[TRAIN] init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold}/{args.n_folds} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
 
-    # paths
+    # paths. run_id mirrors core/tstr.py exactly so the checkpoint is findable
+    # downstream: ..._s{init_seed}_<model-specific>_f{fold}[_a{alpha}_n{n_copies}].
     os.makedirs(f'results/{args.model}', exist_ok=True)
     if args.model == 'vae':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_fb{args.free_bits}'
+        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_fb{args.free_bits}'
     elif args.model == 'cvae':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
+        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
     elif args.model == 'cvae_part':
-        run_id = f'{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
+        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
+    run_id += f'_f{args.fold}'
     if args.alpha > 0 and args.n_copies > 1:
         run_id += f'_a{args.alpha}_n{args.n_copies}'
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
     history_path = f'results/{args.model}/{run_id}_train_history.csv'
 
-    # reproducibility
-    seed_everything(args.seed)
-    g = make_generator(args.seed)
+    # reproducibility. init_seed drives torch / numpy / DataLoader stochasticity;
+    # split_seed only feeds the dataset partition (next step).
+    seed_everything(args.init_seed)
+    g = make_generator(args.init_seed)
 
-    # dataset
+    # dataset. kfold_split_dataset is keyed by (fold, n_folds, split_seed) and
+    # must produce the same partition as core/tstr.py for the same arguments.
     df = load_dataset(args.dataset_dir)
     df = df[df['region'] == args.region].reset_index(drop=True)
-    df_train, df_val, _ = split_dataset(df, random_state=args.seed)
+    # args.fold is 1-indexed; kfold_split_dataset takes 0-indexed.
+    df_train, df_val, _ = kfold_split_dataset(df, fold=args.fold - 1, n_folds=args.n_folds, split_seed=args.split_seed)
     train_ds = BreathDataset(df_train, alpha=args.alpha, n_copies=args.n_copies)
     train_ds_clean = BreathDataset(df_train, stats=train_ds.stats) if args.alpha > 0 else train_ds
     val_ds = BreathDataset(df_val, stats=train_ds.stats)

@@ -4,7 +4,7 @@ set -euo pipefail
 PIPELINES=(replication shap_fix lgbm_fix tsfresh_fix smote_fix)
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
-FOLDS=(0 1 2 3 4)
+FOLDS=(1 2 3 4 5)
 SPLIT_SEED=42
 N_FOLDS=5
 export SPLIT_SEED N_FOLDS
@@ -18,7 +18,7 @@ export OPENBLAS_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-# build the k-fold job list
+# build configs
 COMBOS=()
 for pipeline in "${PIPELINES[@]}"; do
   for region in "${REGIONS[@]}"; do
@@ -75,7 +75,7 @@ else
   [ $legacy_build_status -ne 0 ] && echo "[ABLATION] WARNING: $legacy_build_status from legacy build phase (some combos may have failed)"
 fi
 
-# phase 2: write summary
+# phase 2: write summary sequentially
 echo "[ABLATION] phase 2/2: write summary (k-fold)"
 for combo in "${COMBOS[@]}"; do
   read -r region pipeline init_seed fold <<<"$combo"

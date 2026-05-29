@@ -1,3 +1,13 @@
+"""Architecture ablation variants for the small-data CVAE.
+
+Ablation axes covered:
+- Capacity: tiny vs small vs full (3 levels)
+- Inductive bias: MLP vs Conv vs Attention
+- Kernel size: 3 vs 7 (within the Conv family)
+- Regularization: dropout vs no dropout
+- Encoder/decoder symmetry: symmetric vs weak decoder
+"""
+
 import torch
 import torch.nn as nn
 
@@ -91,6 +101,96 @@ class ConvBaseline(AblationCVAE):
                   part_embed_dim=part_embed_dim)
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvBaseline(**kw)
+
+# conv_large_kernel — same shape as ConvBaseline but kernel=7 throughout
+class _Enc_ConvLargeKernel(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(2, 16, 7, padding=3), nn.ReLU(),
+            nn.Conv1d(16, 32, 7, padding=3), nn.ReLU(),
+            nn.Conv1d(32, 64, 7, padding=3), nn.ReLU(),
+        )
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = 64 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU())
+        self.mu_head = nn.Linear(128, latent_dim)
+        self.logvar_head = nn.Linear(128, latent_dim)
+
+    def forward(self, x, y, p=None):
+        h = self.conv(x).flatten(1)
+        h = self.fc(_gather_parts(h, y, p, self.label_embed, self.part_embed))
+        return self.mu_head(h), self.logvar_head(h)
+
+class _Dec_ConvLargeKernel(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Linear(128, 64 * 36))
+        self.conv = nn.Sequential(
+            nn.ConvTranspose1d(64, 32, 7, padding=3), nn.ReLU(),
+            nn.ConvTranspose1d(32, 16, 7, padding=3), nn.ReLU(),
+            nn.ConvTranspose1d(16, 2, 7, padding=3),
+        )
+
+    def forward(self, z, y, p=None):
+        h = self.fc(_gather_parts(z, y, p, self.label_embed, self.part_embed)).view(-1, 64, 36)
+        return self.conv(h)
+
+class ConvLargeKernel(AblationCVAE):
+    """ConvBaseline with kernel size 7 throughout — tests receptive-field effect at fixed depth."""
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8,
+                 condition_on_participant=False, num_participants=3, part_embed_dim=8):
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim,
+                  cond_part=condition_on_participant, num_participants=num_participants,
+                  part_embed_dim=part_embed_dim)
+        self.encoder = _Enc_ConvLargeKernel(**kw)
+        self.decoder = _Dec_ConvLargeKernel(**kw)
+
+# conv_tiny — single Conv1d(2→8), FC 16; smallest conv variant
+class _Enc_ConvTiny(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.conv = nn.Sequential(nn.Conv1d(2, 8, 3, padding=1), nn.ReLU())
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = 8 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Sequential(nn.Linear(in_fc, 16), nn.ReLU())
+        self.mu_head = nn.Linear(16, latent_dim)
+        self.logvar_head = nn.Linear(16, latent_dim)
+
+    def forward(self, x, y, p=None):
+        h = self.conv(x).flatten(1)
+        h = self.fc(_gather_parts(h, y, p, self.label_embed, self.part_embed))
+        return self.mu_head(h), self.logvar_head(h)
+
+class _Dec_ConvTiny(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Sequential(nn.Linear(in_fc, 16), nn.ReLU(), nn.Linear(16, 8 * 36))
+        self.conv = nn.ConvTranspose1d(8, 2, 3, padding=1)
+
+    def forward(self, z, y, p=None):
+        h = self.fc(_gather_parts(z, y, p, self.label_embed, self.part_embed)).view(-1, 8, 36)
+        return self.conv(h)
+
+class ConvTiny(AblationCVAE):
+    """Tiny conv baseline — tests whether small data prefers a small model."""
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8,
+                 condition_on_participant=False, num_participants=3, part_embed_dim=8):
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim,
+                  cond_part=condition_on_participant, num_participants=num_participants,
+                  part_embed_dim=part_embed_dim)
+        self.encoder = _Enc_ConvTiny(**kw)
+        self.decoder = _Dec_ConvTiny(**kw)
 
 # conv_slim — 2-layer Conv1d 2→8→16, FC 64
 class _Enc_ConvSlim(nn.Module):
@@ -220,6 +320,45 @@ class MLPSmall(AblationCVAE):
         self.encoder = _Enc_MLPSmall(**kw)
         self.decoder = _Dec_MLPSmall(**kw)
 
+# mlp_tiny — single hidden layer, no nonlinearity before output projection
+class _Enc_MLPTiny(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = 72 + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Sequential(nn.Linear(in_fc, 32), nn.ReLU())
+        self.mu_head = nn.Linear(32, latent_dim)
+        self.logvar_head = nn.Linear(32, latent_dim)
+
+    def forward(self, x, y, p=None):
+        h = x.flatten(1)
+        h = self.fc(_gather_parts(h, y, p, self.label_embed, self.part_embed))
+        return self.mu_head(h), self.logvar_head(h)
+
+class _Dec_MLPTiny(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
+        # one hidden layer (32), then output projection to 72 with no intermediate ReLU
+        self.fc = nn.Sequential(nn.Linear(in_fc, 32), nn.Linear(32, 72))
+
+    def forward(self, z, y, p=None):
+        return self.fc(_gather_parts(z, y, p, self.label_embed, self.part_embed)).view(-1, 2, 36)
+
+class MLPTiny(AblationCVAE):
+    """Tiny MLP — single hidden layer; decoder has no nonlinearity before output."""
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8,
+                 condition_on_participant=False, num_participants=3, part_embed_dim=8):
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim,
+                  cond_part=condition_on_participant, num_participants=num_participants,
+                  part_embed_dim=part_embed_dim)
+        self.encoder = _Enc_MLPTiny(**kw)
+        self.decoder = _Dec_MLPTiny(**kw)
+
 # conv_asym — full conv encoder, single-layer decoder with dropout
 class _Dec_ConvAsym(nn.Module):
     def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
@@ -250,8 +389,151 @@ class ConvAsym(AblationCVAE):
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvAsym(**kw)
 
-VARIANT_MAP: dict[str, type] = {"conv_baseline": ConvBaseline,
-                                "conv_slim": ConvSlim,
-                                "mlp": MLP,
-                                "mlp_small": MLPSmall,
-                                "conv_asym": ConvAsym,}
+# conv_asym_no_dropout — weak single-layer decoder, no dropout (isolates decoder weakness)
+class _Dec_ConvAsymNoDropout(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Linear(128, 64 * 36))
+        self.conv = nn.ConvTranspose1d(64, 2, 3, padding=1)  # single deconv layer
+
+    def forward(self, z, y, p=None):
+        h = self.fc(_gather_parts(z, y, p, self.label_embed, self.part_embed)).view(-1, 64, 36)
+        return self.conv(h)
+
+class ConvAsymNoDropout(AblationCVAE):
+    """Baseline encoder + weak single-layer decoder, no dropout — isolates decoder-weakness effect."""
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8,
+                 condition_on_participant=False, num_participants=3, part_embed_dim=8):
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim,
+                  cond_part=condition_on_participant, num_participants=num_participants,
+                  part_embed_dim=part_embed_dim)
+        self.encoder = _Enc_ConvBaseline(**kw)
+        self.decoder = _Dec_ConvAsymNoDropout(**kw)
+
+# conv_baseline_dropout — full symmetric architecture, dropout in both encoder and decoder FCs
+class _Enc_ConvBaselineDropout(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(2, 16, 3, padding=1), nn.ReLU(),
+            nn.Conv1d(16, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv1d(32, 64, 3, padding=1), nn.ReLU(),
+        )
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = 64 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Dropout(0.4))
+        self.mu_head = nn.Linear(128, latent_dim)
+        self.logvar_head = nn.Linear(128, latent_dim)
+
+    def forward(self, x, y, p=None):
+        h = self.conv(x).flatten(1)
+        h = self.fc(_gather_parts(h, y, p, self.label_embed, self.part_embed))
+        return self.mu_head(h), self.logvar_head(h)
+
+class _Dec_ConvBaselineDropout(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Sequential(
+            nn.Linear(in_fc, 128), nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(128, 64 * 36),
+        )
+        self.conv = nn.Sequential(
+            nn.ConvTranspose1d(64, 32, 3, padding=1), nn.ReLU(),
+            nn.ConvTranspose1d(32, 16, 3, padding=1), nn.ReLU(),
+            nn.ConvTranspose1d(16, 2, 3, padding=1),
+        )
+
+    def forward(self, z, y, p=None):
+        h = self.fc(_gather_parts(z, y, p, self.label_embed, self.part_embed)).view(-1, 64, 36)
+        return self.conv(h)
+
+class ConvBaselineDropout(AblationCVAE):
+    """ConvBaseline with Dropout(0.4) in both encoder and decoder FC bottlenecks — isolates dropout effect."""
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8,
+                 condition_on_participant=False, num_participants=3, part_embed_dim=8):
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim,
+                  cond_part=condition_on_participant, num_participants=num_participants,
+                  part_embed_dim=part_embed_dim)
+        self.encoder = _Enc_ConvBaselineDropout(**kw)
+        self.decoder = _Dec_ConvBaselineDropout(**kw)
+
+# transformer — small attention-based variant; non-autoregressive seed-sequence decoder
+class _Enc_Transformer(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.input_proj = nn.Linear(2, 32)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 36, 32))
+        layer = nn.TransformerEncoderLayer(d_model=32, nhead=4, dim_feedforward=64,
+                                           batch_first=True, dropout=0.1)
+        self.transformer = nn.TransformerEncoder(layer, num_layers=2)
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = 32 + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Sequential(nn.Linear(in_fc, 64), nn.ReLU())
+        self.mu_head = nn.Linear(64, latent_dim)
+        self.logvar_head = nn.Linear(64, latent_dim)
+
+    def forward(self, x, y, p=None):
+        # (B, 2, 36) -> (B, 36, 2) -> per-timestep projection to (B, 36, 32)
+        h = self.input_proj(x.transpose(1, 2)) + self.pos_embed
+        h = self.transformer(h).mean(dim=1)  # mean-pool over time -> (B, 32)
+        h = self.fc(_gather_parts(h, y, p, self.label_embed, self.part_embed))
+        return self.mu_head(h), self.logvar_head(h)
+
+class _Dec_Transformer(nn.Module):
+    def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
+        super().__init__()
+        self.label_embed = nn.Embedding(num_classes, embed_dim)
+        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
+        self.fc = nn.Linear(in_fc, 36 * 32)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 36, 32))
+        layer = nn.TransformerEncoderLayer(d_model=32, nhead=4, dim_feedforward=64,
+                                           batch_first=True, dropout=0.1)
+        self.transformer = nn.TransformerEncoder(layer, num_layers=2)
+        self.output_proj = nn.Linear(32, 2)
+
+    def forward(self, z, y, p=None):
+        h = self.fc(_gather_parts(z, y, p, self.label_embed, self.part_embed))
+        h = h.view(-1, 36, 32) + self.pos_embed
+        h = self.transformer(h)
+        return self.output_proj(h).transpose(1, 2)  # (B, 36, 2) -> (B, 2, 36)
+
+class Transformer(AblationCVAE):
+    """Small attention-based CVAE — tests attention as an inductive bias at small data scale."""
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8,
+                 condition_on_participant=False, num_participants=3, part_embed_dim=8):
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim,
+                  cond_part=condition_on_participant, num_participants=num_participants,
+                  part_embed_dim=part_embed_dim)
+        self.encoder = _Enc_Transformer(**kw)
+        self.decoder = _Dec_Transformer(**kw)
+
+VARIANT_MAP: dict[str, type] = {
+    "conv_baseline": ConvBaseline,
+    "conv_slim": ConvSlim,
+    "conv_tiny": ConvTiny,
+    "conv_large_kernel": ConvLargeKernel,
+    "conv_asym": ConvAsym,                          # weak decoder + dropout (legacy)
+    "conv_asym_no_dropout": ConvAsymNoDropout,      # weak decoder, no dropout
+    "conv_baseline_dropout": ConvBaselineDropout,   # full decoder + dropout
+    "mlp": MLP,
+    "mlp_small": MLPSmall,
+    "mlp_tiny": MLPTiny,
+    "transformer": Transformer,
+}
+
+def count_parameters(variant_name: str) -> int:
+    """Instantiate the named variant with default args and return its trainable parameter count."""
+    model = VARIANT_MAP[variant_name]()
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)

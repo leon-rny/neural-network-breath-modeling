@@ -21,12 +21,12 @@ from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_sp
 
 from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset
 
-# original: pipeline on a single 80/10/10 split (no CV)
-# replication: paper's pipeline, with leakage in SHAP, tsfresh, SMOTE and hardcoded nose hyperparams
-# shap_fix: + SHAP computed on train only (was: on test)
-# lgbm_fix: + unified LightGBM tuning (was: hardcoded nose params)
-# tsfresh_fix: + tsfresh feature selection per fold (was: on full dataset)
-# smote_fix: + SMOTE inside the stacker's CV pipeline (was: global)
+# 1. original: pipeline on a single 80/10/10 split (no CV)
+# 2. replication: paper's pipeline, with leakage in SHAP, tsfresh, SMOTE and hardcoded nose hyperparams
+# 3. shap_fix: + SHAP computed on train only (was: on test)
+# 4. lgbm_fix: + unified LightGBM tuning (was: hardcoded nose params)
+# 5. tsfresh_fix: + tsfresh feature selection per fold (was: on full dataset)
+# 6. smote_fix: + SMOTE inside the stacker's CV pipeline (was: global)
 _PIPELINES = ("replication", "shap_fix", "lgbm_fix", "tsfresh_fix", "smote_fix")
 
 # cli
@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pipeline", required=True, choices=list(_PIPELINES), help="Which cumulative pipeline variant to run")
     p.add_argument("--init_seed", type=int, default=42, help="Classifier-internal randomness; varies across runs.")
     p.add_argument("--split_seed", type=int, default=42, help="Outer/inner data partition; fixed for paired comparisons.")
-    p.add_argument("--fold", type=int, default=0)
+    p.add_argument("--fold", type=int, default=1, help="1-indexed fold in [1, n_folds].")
     p.add_argument("--n_folds", type=int, default=5)
     p.add_argument("--single_split", action="store_true", help="Legacy protocol: one 80/10/10 stratified train/val/test split (mirrors core/data.split_dataset). When set, --fold and --n_folds are ignored.")
     p.add_argument("--dataset_dir", default="dataset")
@@ -209,9 +209,10 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
         train_idx, _ = train_test_split(idx_trainval, test_size=val_relative,
                                         stratify=labels_full[idx_trainval], random_state=split_seed)
     else:
+        # fold is 1-indexed at the API boundary; splits list is 0-indexed.
         skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=split_seed)
         splits = list(skf.split(df, labels_full))
-        trainfull_idx, test_idx = splits[fold]
+        trainfull_idx, test_idx = splits[fold - 1]
         trainfull_pos = np.arange(len(trainfull_idx))
         train_pos, _ = train_test_split(trainfull_pos, test_size=0.15,
                                         stratify=labels_full[trainfull_idx], random_state=split_seed)
