@@ -10,8 +10,8 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from core.data import load_dataset, split_dataset, PhysicsInformedDataset
-from core.utils import seed_everything, make_generator
+from core.data import load_dataset, kfold_split_dataset, PhysicsInformedDataset
+from core.utils import seed_everything, seed_worker, make_generator
 from core.train import beta_capped
 from models.pinn import PhysicsInformedCVAE
 
@@ -93,7 +93,10 @@ def train_one_epoch(model, loader, optimizer, beta, lambda_phys, device):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--region", required=True, choices=["mouth", "nose"])
-    p.add_argument("--seed", type=int, required=True)
+    p.add_argument("--init_seed", type=int, default=42, help="Model-internal randomness; varies across runs to characterize sensitivity.")
+    p.add_argument("--split_seed", type=int, default=42, help="Data partition; fixed for paired comparisons.")
+    p.add_argument("--fold", type=int, default=1, help="1-indexed fold in [1, n_folds].")
+    p.add_argument("--n_folds", type=int, default=5)
     p.add_argument("--lambda_phys", type=float, required=True)
     p.add_argument("--latent_dim", type=int, default=16)
     p.add_argument("--embed_dim", type=int, default=8)
@@ -114,23 +117,23 @@ if __name__ == "__main__":
     device = torch.device("cpu")
     os.makedirs("results/pinn", exist_ok=True)
 
-    print(f'[TRAIN] Seed: {args.seed} | Model: PINN | Region: {args.region} | Device: {device} | Epochs: {args.num_epochs}')
-    run_id = f"{args.region}_s{args.seed}_ld{args.latent_dim}_ed{args.embed_dim}_phys{args.lambda_phys}"
+    print(f'[TRAIN] init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold}/{args.n_folds} | Model: PINN | Region: {args.region} | Device: {device} | Epochs: {args.num_epochs}')
+    run_id = f"{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_phys{args.lambda_phys}"
+    run_id += f"_f{args.fold}"
     if args.alpha > 0 and args.n_copies > 1:
         run_id += f"_a{args.alpha}_n{args.n_copies}"
     ckpt_path = f"results/pinn/{run_id}_checkpoint.pt"
 
     # reproducibility
-    seed_everything(args.seed)
-    g = make_generator(args.seed)
+    seed_everything(args.init_seed)
+    g = make_generator(args.init_seed)
 
-    # dataset
     df = load_dataset("./dataset")
     df = df[df["region"] == args.region].reset_index(drop=True)
-    df_train, df_val, _ = split_dataset(df, random_state=args.seed)
+    df_train, df_val, _ = kfold_split_dataset(df, fold=args.fold - 1, n_folds=args.n_folds, split_seed=args.split_seed)
     train_ds = PhysicsInformedDataset(df_train, alpha=args.alpha, n_copies=args.n_copies)
     val_ds = PhysicsInformedDataset(df_val, stats=train_ds.stats)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False, worker_init_fn=4, generator=g)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     if args.alpha > 0 and args.n_copies > 1:
         n_clean = len(df_train)
