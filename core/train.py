@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--free_bits', type=float, default=0.0)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--beta_max', type=float, default=0.1)
-    p.add_argument('--beta_warmup_epochs', type=int, default=250)
+    p.add_argument('--beta_warmup_epochs', type=int, default=None, help='Epochs to linearly warm beta 0->beta_max. Defaults to epochs // 2 (matches the ablations).')
     # jittering augmentation (training only; defaults = off)
     p.add_argument('--alpha', type=float, default=0.0)
     p.add_argument('--n_copies', type=int, default=1)
@@ -112,6 +112,10 @@ def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_pa
 # main loop
 def main():
     args = parse_args()
+    # warmup defaults to half of total epochs (matches the ablations); an explicit
+    # --beta_warmup_epochs (e.g. from core/tuning.py) still overrides this.
+    if args.beta_warmup_epochs is None:
+        args.beta_warmup_epochs = args.epochs // 2
     device = torch.device('cpu')
     print(f'[TRAIN] init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold}/{args.n_folds} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
 

@@ -321,7 +321,7 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
 
     return model, ckpt['stats']
 
-def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: dict, device: 'torch.device') -> tuple[np.ndarray, np.ndarray]:
+def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: dict, device: 'torch.device', init_seed: int) -> tuple[np.ndarray, np.ndarray]:
     # determine num per class
     n_classes = len(CLASSES)
     n_per_class = n_synthetic // n_classes
@@ -329,6 +329,9 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
     counts = [n_per_class + (1 if i < remainder else 0) for i in range(n_classes)]
     mean_t = torch.tensor(stats['mean'], dtype=torch.float32).view(1, 2, 1).to(device)
     std_t = torch.tensor(stats['std'], dtype=torch.float32).view(1, 2, 1).to(device)
+
+    # deterministic pre-sampling seed
+    torch.manual_seed(init_seed)
 
     # generate synthetic signals
     if model_name == 'vae':
@@ -370,7 +373,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
-    synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device)
+    synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed)
     print(f'[TSTR] Generated {n_synthetic} synthetic signals')
 
     n, _C, T = synth_signals.shape
@@ -433,7 +436,7 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR+] model={model_name}, n_synthetic={n_synthetic}, n_train_real={cache["n_train"]}')
 
-    synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device)
+    synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed)
     print(f'[TSTR+] Generated {n_synthetic} synthetic signals')
 
     n, _C, T = synth_signals.shape

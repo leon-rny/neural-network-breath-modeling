@@ -11,9 +11,10 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from core.data import CLASSES, BreathDataset, load_dataset, kfold_split_dataset
-from core.train import active_dims
-from core.tstr import evaluate_classifier, extract_fixed_features, load_cache, train_stacking_classifier, trtr
+from core.data import BreathDataset, load_dataset, kfold_split_dataset
+from core.train import active_dims, beta_capped, evaluate, train_vae_one_epoch
+from core.tstr import evaluate_classifier, extract_fixed_features, generate_synthetic_signals, load_cache, train_stacking_classifier, trtr
+from core.utils import make_generator, seed_everything, seed_worker
 from models.vae import CVAE, elbo_loss
 
 CONFIGS: dict[str, dict] = {
@@ -37,13 +38,12 @@ CONFIGS: dict[str, dict] = {
     "warmup_0.25": {"beta_max": 0.1, "lag_n": 0, "lag_phase": 0, "warmup_frac": 0.25},
     "warmup_0.75": {"beta_max": 0.1, "lag_n": 0, "lag_phase": 0, "warmup_frac": 0.75},
 }
-
+# fix parameters
 LATENT_DIM = 16
 EMBED_DIM = 8
 PART_EMBED_DIM = 8
 BATCH_SIZE = 32
 LOG_EVERY = 25
-SAVE_WINDOW_START = 400
 RESULTS_DIR = "results/ablation_cvae_training_dynamics"
 
 # cli
@@ -56,26 +56,21 @@ def parse_args() -> argparse.Namespace:
     # single-combo overrides
     p.add_argument("--config", default=None)
     p.add_argument("--init_seed", type=int, default=None)
-    p.add_argument("--fold", type=int, default=None, help="1-indexed fold in [1, n_folds].")
+    p.add_argument("--fold", type=int, default=None)
     p.add_argument("--region", default=None)
     # protocol-level constants
     p.add_argument("--split_seed", type=int, default=42)
     p.add_argument("--n_folds", type=int, default=5)
     p.add_argument("--dataset_dir", default="dataset")
     p.add_argument("--epochs", type=int, default=500)
-    p.add_argument("--save_window_start", type=int, default=SAVE_WINDOW_START, help="Earliest epoch eligible to save a checkpoint. Lower this for smoke tests.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--latent_dim", type=int, default=16)
     p.add_argument("--n_jobs", type=int, default=4)
     p.add_argument("--skip_existing", action="store_true")
-    p.add_argument("--no_summary", action="store_true", help="Skip writing to summary.csv. Use during parallel runs to avoid races.")
-    p.add_argument("--aggregate", action="store_true", help="Don't train/eval; just read existing per-combo result JSONs and write summary rows.")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--no_summary", action="store_true")
+    p.add_argument("--aggregate", action="store_true")
     return p.parse_args()
-
-def beta_capped(epoch: int, total_epochs: int, beta_max: float, warmup_frac: float = 0.5) -> float:
-    """Linear warmup from 0 -> beta_max over the first `warmup_frac` of training, then hold."""
-    warmup_epochs = total_epochs * warmup_frac
-    return min(beta_max, (epoch / warmup_epochs) * beta_max)
 
 # paths
 def _stem(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
@@ -91,19 +86,18 @@ def result_path(config: str, region: str, init_seed: int, split_seed: int, fold:
     return f"{RESULTS_DIR}/{_stem(config, region, init_seed, split_seed, fold, n_folds)}_result.json"
 
 # training
-def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int,
-                 dataset_dir: str, device: torch.device, epochs: int, lr: float, latent_dim: int,
-                 save_window_start: int = SAVE_WINDOW_START) -> None:
+def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, dataset_dir: str, device: torch.device, epochs: int, lr: float, latent_dim: int, verbose: bool = False) -> None:
     cfg = CONFIGS[config]
     beta_max = cfg["beta_max"]
     lag_n = cfg["lag_n"]
     lag_phase = cfg["lag_phase"]
     free_bits = cfg.get("free_bits", 0.0)
     warmup_frac = cfg.get("warmup_frac", 0.5)
+    warmup_epochs = int(epochs * warmup_frac)
 
-    torch.manual_seed(init_seed)
-    np.random.seed(init_seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    # reproducibility
+    seed_everything(init_seed)
+    g = make_generator(init_seed)
 
     # data
     df = load_dataset(dataset_dir)
@@ -111,7 +105,7 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
     df_train, df_val, _ = kfold_split_dataset(df, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
     train_ds = BreathDataset(df_train)
     val_ds = BreathDataset(df_val, stats=train_ds.stats)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     # model (baseline)
@@ -124,22 +118,20 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
     best_val_loss = float("inf")
     history: list[dict] = []
 
-    epoch_bar = tqdm(range(1, epochs + 1), desc=f"[DYNAMICS] {config}|{region}|is{init_seed}|f{fold}", unit="epoch")
+    epoch_bar = tqdm(range(1, epochs + 1), desc=f"[DYNAMICS] {config}|{region}|is{init_seed}|f{fold}", unit="epoch", disable=not verbose)
     for epoch in epoch_bar:
-        beta = beta_capped(epoch, epochs, beta_max, warmup_frac)
+        beta = beta_capped(epoch, warmup_epochs, beta_max)
         in_aggressive_phase = lag_n > 0 and epoch <= lag_phase
 
-        # training
-        model.train()
-        t_loss = t_recon = t_kl = 0.0
-        n_batches = 0
+        if in_aggressive_phase:
+            model.train()
+            t_loss = t_recon = t_kl = 0.0
+            n_batches = 0
+            for signal, _time, label, participant in train_loader:
+                signal = signal.to(device)
+                label = label.long().to(device)
+                participant = participant.long().to(device)
 
-        for signal, _time, label, participant in train_loader:
-            signal = signal.to(device)
-            label = label.long().to(device)
-            participant = participant.long().to(device)
-
-            if in_aggressive_phase:
                 for _ in range(lag_n):
                     opt_enc.zero_grad()
                     x_hat, mu, logvar = model(signal, label, participant)
@@ -147,43 +139,28 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
                     loss_enc.backward()
                     opt_enc.step()
 
-            # one full update per batch
-            opt_full.zero_grad()
-            x_hat, mu, logvar = model(signal, label, participant)
-            loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
-            loss.backward()
-            opt_full.step()
-
-            t_loss += loss.item()
-            t_recon += recon.item()
-            t_kl += kl.item()
-            n_batches += 1
-
-        t_loss /= n_batches
-        t_recon /= n_batches
-        t_kl /= n_batches
-
-        # validation
-        model.eval()
-        v_loss = v_recon = v_kl = 0.0
-        with torch.no_grad():
-            for signal, _time, label, participant in val_loader:
-                signal = signal.to(device)
-                label = label.long().to(device)
-                participant = participant.long().to(device)
+                # one full update per batch
+                opt_full.zero_grad()
                 x_hat, mu, logvar = model(signal, label, participant)
                 loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
-                v_loss += loss.item()
-                v_recon += recon.item()
-                v_kl += kl.item()
-        n_val = len(val_loader)
-        v_loss /= n_val
-        v_recon /= n_val
-        v_kl /= n_val
+                loss.backward()
+                opt_full.step()
 
+                t_loss += loss.item()
+                t_recon += recon.item()
+                t_kl += kl.item()
+                n_batches += 1
+            t_loss /= n_batches
+            t_recon /= n_batches
+            t_kl /= n_batches
+        else:
+            t_loss, t_recon, t_kl = train_vae_one_epoch(model, train_loader, opt_full, epoch, warmup_epochs, device, free_bits=free_bits, conditional=True, use_participant=True, beta_max=beta_max)
+
+        # validation
+        v_loss, v_recon, v_kl = evaluate(model, val_loader, epoch, warmup_epochs, device, free_bits=free_bits, conditional=True, use_participant=True, beta_max=beta_max)
         scheduler.step()
 
-        if epoch >= save_window_start and v_loss < best_val_loss:
+        if v_loss < best_val_loss and beta >= beta_max:
             best_val_loss = v_loss
             os.makedirs(RESULTS_DIR, exist_ok=True)
             torch.save({"config": config,
@@ -230,11 +207,10 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
         writer.writeheader()
         writer.writerows(history)
 
-    print(f"  [{config}|{region}|is{init_seed}|f{fold}] done. best_val={best_val_loss:.4f} | ckpt: {ckpt_path(config, region, init_seed, split_seed, fold, n_folds)}")
+    print(f"  [DYNAMICS] {config}|{region}|is{init_seed}|f{fold} | Done. best_val={best_val_loss:.4f} | ckpt: {ckpt_path(config, region, init_seed, split_seed, fold, n_folds)}")
 
 # tstr evaluation
-def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int,
-                cache: dict, device: torch.device, n_jobs: int) -> dict:
+def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cache: dict, device: torch.device, n_jobs: int) -> dict:
     path = ckpt_path(config, region, init_seed, split_seed, fold, n_folds)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
@@ -248,24 +224,10 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
     model.eval()
     stats = ckpt["stats"]
 
-    # generate synthetic signals
+    # generate synthetic
     n_synthetic = cache["n_train"]
-    n_per_class = n_synthetic // len(CLASSES)
-    remainder = n_synthetic % len(CLASSES)
-    counts = [n_per_class + (1 if i < remainder else 0) for i in range(len(CLASSES))]
-
-    mean_t = torch.tensor(stats["mean"], dtype=torch.float32).view(1, 2, 1).to(device)
-    std_t  = torch.tensor(stats["std"],  dtype=torch.float32).view(1, 2, 1).to(device)
-
-    all_signals, all_labels = [], []
-    for cls_idx, count in enumerate(counts):
-        y_cls = torch.tensor(cls_idx, dtype=torch.long)
-        sigs  = model.sample(count, y_cls, device)
-        all_signals.append((sigs * std_t + mean_t).cpu().numpy())
-        all_labels.append(np.full(count, cls_idx))
-    synth_signals = np.concatenate(all_signals, axis=0)
-    synth_labels  = np.concatenate(all_labels,  axis=0)
-    print(f"  [{config}|{region}|is{init_seed}|f{fold}] generated {n_synthetic} synthetic signals")
+    synth_signals, synth_labels = generate_synthetic_signals(model, "cvae_part", n_synthetic, stats, device, init_seed)
+    print(f"  [DYNAMICS] {config}|{region}|is{init_seed}|f{fold} | Generated {n_synthetic} synthetic signals")
 
     # tsfresh feature extraction using the top-20 features from the TRTR cache
     n, _C, T = synth_signals.shape
@@ -349,7 +311,7 @@ def save_summary(rows: list[dict]) -> None:
         df_new = pd.concat([df_old, df_new], ignore_index=True).drop_duplicates(
             subset=["config", "region", "init_seed", "split_seed", "fold", "n_folds"], keep="last")
     df_new.to_csv(csv_path, index=False)
-    print(f"[DYNAMICS] Saved {len(df_new)} rows -> {csv_path}")
+    print(f"[DYNAMICS] Saved {len(df_new)} rows → {csv_path}")
 
 # main
 def main() -> None:
@@ -408,8 +370,7 @@ def main() -> None:
                         print("  checkpoint exists, skipping training")
                     else:
                         train_config(config, region, init_seed, args.split_seed, fold, args.n_folds,
-                                     args.dataset_dir, device, args.epochs, args.lr, args.latent_dim,
-                                     save_window_start=args.save_window_start)
+                                     args.dataset_dir, device, args.epochs, args.lr, args.latent_dim, verbose=args.verbose)
 
                     row = eval_config(config, region, init_seed, args.split_seed, fold, args.n_folds, cache, device, args.n_jobs)
                     save_result(row)
