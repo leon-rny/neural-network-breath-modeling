@@ -13,12 +13,12 @@ PARTICIPANTS = ['a', 'p', 's']
 PARTICIPANT_TO_IDX = {p: i for i, p in enumerate(PARTICIPANTS)}
 
 def load_dataset(dataset_dir: str = 'dataset') -> pd.DataFrame:
-    """
+    '''
     Loads all .dat files from speficied dataset directory and returns a DataFrame with columns.
 
     :param dataset_dir: Path to the dataset directory containing class subfolders.
     :return: A pandas DataFrame with the loaded data.
-    """
+    '''
     records = []
     for cls in CLASSES:
         folder = os.path.join(dataset_dir, cls)
@@ -41,7 +41,7 @@ def load_dataset(dataset_dir: str = 'dataset') -> pd.DataFrame:
     return pd.DataFrame(records)
 
 def split_dataset(df: pd.DataFrame, val_size: float = 0.1, test_size: float = 0.1, random_state: int = 42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
+    '''
     Stratified train/val/test split by class label.
 
     :param df: DataFrame containing the dataset.
@@ -49,7 +49,7 @@ def split_dataset(df: pd.DataFrame, val_size: float = 0.1, test_size: float = 0.
     :param test_size: Proportion of the dataset to include in the test split.
     :param random_state: Random seed for reproducibility.
     :return: A tuple of (train_df, val_df, test_df) DataFrames.
-    """
+    '''
     df_train_val, df_test = train_test_split(df, test_size=test_size, stratify=df['class'], random_state=random_state)
     
     val_relative = val_size/(1-test_size)
@@ -58,7 +58,7 @@ def split_dataset(df: pd.DataFrame, val_size: float = 0.1, test_size: float = 0.
     return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test.reset_index(drop=True)
 
 def kfold_split_dataset(df: pd.DataFrame, split_seed: int, fold: int, n_folds: int = 5, val_size: float = 0.15) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
+    '''
     Stratified k-fold split returning the (train, val, test) DataFrames for a given fold.
 
     The outer split (test) is determined by k-fold partitioning: each fold defines
@@ -72,12 +72,12 @@ def kfold_split_dataset(df: pd.DataFrame, split_seed: int, fold: int, n_folds: i
     :param n_folds: Number of outer folds.
     :param val_size: Proportion of the training pool to use as validation.
     :return: A tuple of (train_df, val_df, test_df) DataFrames.
-    """
+    '''
     if not 0 <= fold < n_folds:
-        raise ValueError(f"fold must be in [0, {n_folds}), got {fold}")
+        raise ValueError(f'fold must be in [0, {n_folds}), got {fold}')
 
     df = df.reset_index(drop=True)
-    y = df["class"].values
+    y = df['class'].values
 
     # outer k-fold defines test
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=split_seed)
@@ -88,7 +88,7 @@ def kfold_split_dataset(df: pd.DataFrame, split_seed: int, fold: int, n_folds: i
     df_test = df.iloc[test_idx].reset_index(drop=True)
 
     # inner split: carve val out of trainfull
-    df_train, df_val = train_test_split(df_trainfull, test_size=val_size, stratify=df_trainfull["class"], random_state=split_seed)
+    df_train, df_val = train_test_split(df_trainfull, test_size=val_size, stratify=df_trainfull['class'], random_state=split_seed)
 
     return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test
 
