@@ -16,7 +16,7 @@ from core.train import active_dims, beta_capped, evaluate, train_vae_one_epoch
 from core.tstr import (evaluate_classifier, extract_fixed_features, generate_synthetic_signals,
                        load_cache, train_stacking_classifier, trtr)
 from core.utils import make_generator, seed_everything, seed_worker
-from models.vae import CVAE
+from ablations.cvae_architecture_models import VARIANT_MAP
 
 CONFIGS: dict[str, dict] = {"baseline": {"alpha": 0.0, "n_copies": 0},
                             "a0.01_n2": {"alpha": 0.01, "n_copies": 2},
@@ -55,6 +55,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init_seed", type=int, default=None)
     p.add_argument("--fold", type=int, default=None)
     p.add_argument("--region", default=None)
+    # architecture selection (test different models)
+    p.add_argument("--variant", default="conv_baseline", choices=list(VARIANT_MAP))
+    p.add_argument("--variants", default=None,
+                   help="Comma-separated variants to aggregate over (defaults to --variant).")
     # protocol-level constants
     p.add_argument("--split_seed", type=int, default=42)
     p.add_argument("--n_folds", type=int, default=5)
@@ -69,20 +73,20 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 # paths
-def _stem(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{config}_{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}"
+def _stem(variant: str, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
+    return f"{variant}_{config}_{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}"
 
-def ckpt_path(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{RESULTS_DIR}/{_stem(config, region, init_seed, split_seed, fold, n_folds)}.pt"
+def ckpt_path(variant: str, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
+    return f"{RESULTS_DIR}/{_stem(variant, config, region, init_seed, split_seed, fold, n_folds)}.pt"
 
-def hist_path(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{RESULTS_DIR}/{_stem(config, region, init_seed, split_seed, fold, n_folds)}_history.csv"
+def hist_path(variant: str, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
+    return f"{RESULTS_DIR}/{_stem(variant, config, region, init_seed, split_seed, fold, n_folds)}_history.csv"
 
-def result_path(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{RESULTS_DIR}/{_stem(config, region, init_seed, split_seed, fold, n_folds)}_result.json"
+def result_path(variant: str, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
+    return f"{RESULTS_DIR}/{_stem(variant, config, region, init_seed, split_seed, fold, n_folds)}_result.json"
 
 # training
-def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, dataset_dir: str, device: torch.device, epochs: int, lr: float, verbose: bool = False) -> None:
+def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, dataset_dir: str, device: torch.device, epochs: int, lr: float, variant: str = "conv_baseline", verbose: bool = False) -> None:
     cfg = CONFIGS[config]
     alpha = cfg["alpha"]
     n_copies = cfg["n_copies"]
@@ -107,8 +111,9 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    # model
-    model = CVAE(latent_dim=LATENT_DIM, embed_dim=EMBED_DIM, condition_on_participant=True, part_embed_dim=PART_EMBED_DIM).to(device)
+    # model (selected variant)
+    model_cls = VARIANT_MAP[variant]
+    model = model_cls(latent_dim=LATENT_DIM, embed_dim=EMBED_DIM, condition_on_participant=True, part_embed_dim=PART_EMBED_DIM).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -136,13 +141,14 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
                         "epoch": epoch,
                         "model_state": model.state_dict(),
                         "stats": train_ds.stats,
+                        "variant": variant,
                         "latent_dim": LATENT_DIM,
                         "embed_dim": EMBED_DIM,
                         "part_embed_dim": PART_EMBED_DIM,
                         "beta_max": beta_max,
                         "alpha": alpha,
                         "n_copies": n_copies},
-                       ckpt_path(config, region, init_seed, split_seed, fold, n_folds))
+                       ckpt_path(variant, config, region, init_seed, split_seed, fold, n_folds))
 
         # active dims
         if epoch % LOG_EVERY == 0 or epoch == 1:
@@ -163,21 +169,23 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
 
     # persist full training history
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(hist_path(config, region, init_seed, split_seed, fold, n_folds), "w", newline="") as f:
+    with open(hist_path(variant, config, region, init_seed, split_seed, fold, n_folds), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=history[0].keys())
         writer.writeheader()
         writer.writerows(history)
 
-    print(f"  [JITTER] {config}|{region}|is{init_seed}|f{fold} | Done. best_val={best_val_loss:.4f} | ckpt: {ckpt_path(config, region, init_seed, split_seed, fold, n_folds)}")
+    print(f"  [JITTER] {config}|{region}|is{init_seed}|f{fold} | Done. best_val={best_val_loss:.4f} | ckpt: {ckpt_path(variant, config, region, init_seed, split_seed, fold, n_folds)}")
 
 # tstr evaluation
-def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cache: dict, device: torch.device, n_jobs: int) -> dict:
-    path = ckpt_path(config, region, init_seed, split_seed, fold, n_folds)
+def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cache: dict, device: torch.device, n_jobs: int, variant: str = "conv_baseline") -> dict:
+    path = ckpt_path(variant, config, region, init_seed, split_seed, fold, n_folds)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    model = CVAE(latent_dim=ckpt["latent_dim"], embed_dim=ckpt["embed_dim"], condition_on_participant=True, part_embed_dim=ckpt["part_embed_dim"]).to(device)
+    variant = ckpt.get("variant", "conv_baseline")  # backward compat with old ckpts
+    model_cls = VARIANT_MAP[variant]
+    model = model_cls(latent_dim=ckpt["latent_dim"], embed_dim=ckpt["embed_dim"], condition_on_participant=True, part_embed_dim=ckpt["part_embed_dim"]).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     stats = ckpt["stats"]
@@ -203,13 +211,14 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
 
     kl_final = float("nan")
     active_dims_final = 0
-    hp = hist_path(config, region, init_seed, split_seed, fold, n_folds)
+    hp = hist_path(variant, config, region, init_seed, split_seed, fold, n_folds)
     if os.path.exists(hp):
         hist_df = pd.read_csv(hp)
         kl_final = float(hist_df["train_kl"].iloc[-1])
         active_dims_final = int(hist_df["active_dims"].iloc[-1])
 
     return {"config": config,
+            "variant": variant,
             "alpha": CONFIGS[config]["alpha"],
             "n_copies": CONFIGS[config]["n_copies"],
             "region": region,
@@ -245,7 +254,7 @@ def _json_safe(obj):
 
 def save_result(row: dict) -> None:
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    path = result_path(row["config"], row["region"], row["init_seed"], row["split_seed"], row["fold"], row["n_folds"])
+    path = result_path(row["variant"], row["config"], row["region"], row["init_seed"], row["split_seed"], row["fold"], row["n_folds"])
     with open(path, "w") as f:
         json.dump(_json_safe(row), f, indent=2)
 
@@ -256,7 +265,7 @@ def save_summary(rows: list[dict]) -> None:
     if os.path.exists(csv_path):
         df_old = pd.read_csv(csv_path)
         df_new = pd.concat([df_old, df_new], ignore_index=True).drop_duplicates(
-            subset=["config", "region", "init_seed", "split_seed", "fold", "n_folds"], keep="last")
+            subset=["variant", "config", "region", "init_seed", "split_seed", "fold", "n_folds"], keep="last")
     df_new.to_csv(csv_path, index=False)
     print(f"[JITTER] Saved {len(df_new)} rows → {csv_path}")
 
@@ -293,25 +302,31 @@ def main() -> None:
 
     device = torch.device("cpu")
 
-    # aggregate mode
+    # aggregate mode: sweep over variant axis and collect result.json files
     if args.aggregate:
+        variants = [v.strip() for v in args.variants.split(",")] if args.variants else [args.variant]
+        for v in variants:
+            if v not in VARIANT_MAP:
+                print(f'Unknown variant "{v}". Valid: {list(VARIANT_MAP)}')
+                sys.exit(1)
         rows = []
-        for region in regions:
-            for config in configs:
-                for init_seed in init_seeds:
-                    for fold in folds:
-                        rp = result_path(config, region, init_seed, args.split_seed, fold, args.n_folds)
-                        if not os.path.exists(rp):
-                            print(f"  [AGGREGATE] missing {rp}, skipping")
-                            continue
-                        with open(rp) as f:
-                            rows.append(json.load(f))
+        for variant in variants:
+            for region in regions:
+                for config in configs:
+                    for init_seed in init_seeds:
+                        for fold in folds:
+                            rp = result_path(variant, config, region, init_seed, args.split_seed, fold, args.n_folds)
+                            if not os.path.exists(rp):
+                                print(f"  [AGGREGATE] missing {rp}, skipping")
+                                continue
+                            with open(rp) as f:
+                                rows.append(json.load(f))
         if rows:
             save_summary(rows)
         return
 
     # normal mode
-    print(f"[JITTER] device={device} | configs={configs} | init_seeds={init_seeds} | folds={folds} | regions={regions}")
+    print(f"[JITTER] device={device} | variant={args.variant} | configs={configs} | init_seeds={init_seeds} | folds={folds} | regions={regions}")
     all_results: list[dict] = []
 
     for region in regions:
@@ -325,13 +340,13 @@ def main() -> None:
 
                     print(f"\n[JITTER] {config} | {region} | is={init_seed} | f={fold}/{args.n_folds}")
 
-                    path = ckpt_path(config, region, init_seed, args.split_seed, fold, args.n_folds)
+                    path = ckpt_path(args.variant, config, region, init_seed, args.split_seed, fold, args.n_folds)
                     if args.skip_existing and os.path.exists(path):
                         print("  checkpoint exists, skipping training")
                     else:
-                        train_config(config, region, init_seed, args.split_seed, fold, args.n_folds, args.dataset_dir, device, args.epochs, args.lr, verbose=args.verbose)
+                        train_config(config, region, init_seed, args.split_seed, fold, args.n_folds, args.dataset_dir, device, args.epochs, args.lr, variant=args.variant, verbose=args.verbose)
 
-                    row = eval_config(config, region, init_seed, args.split_seed, fold, args.n_folds, cache, device, args.n_jobs)
+                    row = eval_config(config, region, init_seed, args.split_seed, fold, args.n_folds, cache, device, args.n_jobs, variant=args.variant)
                     save_result(row)
                     all_results.append(row)
                     print(f"  TSTR: acc={row['accuracy']:.3f}, f1={row['f1_weighted']:.3f}, roc={row['roc_auc_ovr']:.3f}, log_loss={row['log_loss']:.3f}, kl={row['kl_final']:.4f}, active_dims={row['active_dims']}")

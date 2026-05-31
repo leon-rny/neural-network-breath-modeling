@@ -15,7 +15,8 @@ from core.data import BreathDataset, load_dataset, kfold_split_dataset
 from core.train import active_dims, beta_capped, evaluate, train_vae_one_epoch
 from core.tstr import evaluate_classifier, extract_fixed_features, generate_synthetic_signals, load_cache, train_stacking_classifier, trtr
 from core.utils import make_generator, seed_everything, seed_worker
-from models.vae import CVAE, elbo_loss
+from models.vae import elbo_loss
+from ablations.cvae_architecture_models import VARIANT_MAP
 
 CONFIGS: dict[str, dict] = {
     # beta-cap sweep
@@ -37,6 +38,8 @@ CONFIGS: dict[str, dict] = {
     # warmup-fraction sweep at beta_max=0.1
     "warmup_0.25": {"beta_max": 0.1, "lag_n": 0, "lag_phase": 0, "warmup_frac": 0.25},
     "warmup_0.75": {"beta_max": 0.1, "lag_n": 0, "lag_phase": 0, "warmup_frac": 0.75},
+    # joint architecture x beta sweep (beta_max overridden by --beta_max)
+    "joint": {"beta_max": 0.1, "lag_n": 0, "lag_phase": 0},
 }
 # fix parameters
 LATENT_DIM = 16
@@ -58,6 +61,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init_seed", type=int, default=None)
     p.add_argument("--fold", type=int, default=None)
     p.add_argument("--region", default=None)
+    # joint architecture x beta sweep
+    p.add_argument("--variant", default="conv_baseline", choices=list(VARIANT_MAP))
+    p.add_argument("--beta_max", type=float, default=None,
+                   help="Override config's beta_max for joint architecture x beta sweep.")
+    # plural sweep axes (aggregate mode only)
+    p.add_argument("--variants", default=None,
+                   help="Comma-separated variants to aggregate over (defaults to --variant).")
+    p.add_argument("--beta_maxes", default=None,
+                   help="Comma-separated beta_max values to aggregate over (defaults to --beta_max).")
     # protocol-level constants
     p.add_argument("--split_seed", type=int, default=42)
     p.add_argument("--n_folds", type=int, default=5)
@@ -73,22 +85,22 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 # paths
-def _stem(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{config}_{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}"
+def _stem(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
+    return f"{variant}_b{beta_max}_{config}_{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}"
 
-def ckpt_path(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{RESULTS_DIR}/{_stem(config, region, init_seed, split_seed, fold, n_folds)}.pt"
+def ckpt_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
+    return f"{RESULTS_DIR}/{variant}_b{beta_max}_{config}_{region}_is{init_seed}_ss{split_seed}_f{fold}of{n_folds}_checkpoint.pt"
 
-def hist_path(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{RESULTS_DIR}/{_stem(config, region, init_seed, split_seed, fold, n_folds)}_history.csv"
+def hist_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
+    return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)}_history.csv"
 
-def result_path(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{RESULTS_DIR}/{_stem(config, region, init_seed, split_seed, fold, n_folds)}_result.json"
+def result_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
+    return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)}_result.json"
 
 # training
-def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, dataset_dir: str, device: torch.device, epochs: int, lr: float, latent_dim: int, verbose: bool = False) -> None:
+def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, dataset_dir: str, device: torch.device, epochs: int, lr: float, latent_dim: int, variant: str = "conv_baseline", beta_max_override: float | None = None, verbose: bool = False) -> None:
     cfg = CONFIGS[config]
-    beta_max = cfg["beta_max"]
+    beta_max = beta_max_override if beta_max_override is not None else cfg["beta_max"]
     lag_n = cfg["lag_n"]
     lag_phase = cfg["lag_phase"]
     free_bits = cfg.get("free_bits", 0.0)
@@ -108,8 +120,9 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    # model (baseline)
-    model = CVAE(latent_dim=latent_dim, embed_dim=EMBED_DIM, condition_on_participant=True, part_embed_dim=PART_EMBED_DIM).to(device)
+    # model (selected variant)
+    model_cls = VARIANT_MAP[variant]
+    model = model_cls(latent_dim=latent_dim, embed_dim=EMBED_DIM, condition_on_participant=True, part_embed_dim=PART_EMBED_DIM).to(device)
 
     opt_full = torch.optim.Adam(model.parameters(), lr=lr)
     opt_enc = torch.optim.Adam(model.encoder.parameters(), lr=lr)
@@ -172,6 +185,7 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
                         "epoch": epoch,
                         "model_state": model.state_dict(),
                         "stats": train_ds.stats,
+                        "variant": variant,
                         "latent_dim": latent_dim,
                         "embed_dim": EMBED_DIM,
                         "part_embed_dim": PART_EMBED_DIM,
@@ -180,7 +194,7 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
                         "lag_phase": lag_phase,
                         "free_bits": free_bits,
                         "warmup_frac": warmup_frac},
-                       ckpt_path(config, region, init_seed, split_seed, fold, n_folds))
+                       ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds))
 
         # active dims
         if epoch % LOG_EVERY == 0 or epoch == 1:
@@ -202,24 +216,28 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
 
     # persist full training history
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(hist_path(config, region, init_seed, split_seed, fold, n_folds), "w", newline="") as f:
+    with open(hist_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=history[0].keys())
         writer.writeheader()
         writer.writerows(history)
 
-    print(f"  [DYNAMICS] {config}|{region}|is{init_seed}|f{fold} | Done. best_val={best_val_loss:.4f} | ckpt: {ckpt_path(config, region, init_seed, split_seed, fold, n_folds)}")
+    print(f"  [DYNAMICS] {config}|{region}|is{init_seed}|f{fold} | Done. best_val={best_val_loss:.4f} | ckpt: {ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)}")
 
 # tstr evaluation
-def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cache: dict, device: torch.device, n_jobs: int) -> dict:
-    path = ckpt_path(config, region, init_seed, split_seed, fold, n_folds)
+def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cache: dict, device: torch.device, n_jobs: int, variant: str = "conv_baseline", beta_max_override: float | None = None) -> dict:
+    cfg = CONFIGS[config]
+    beta_max = beta_max_override if beta_max_override is not None else cfg["beta_max"]
+    path = ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    model = CVAE(latent_dim=ckpt["latent_dim"],
-                 embed_dim=ckpt["embed_dim"],
-                 condition_on_participant=True,
-                 part_embed_dim=ckpt["part_embed_dim"]).to(device)
+    variant = ckpt.get("variant", "conv_baseline")  # backward compat with old ckpts
+    model_cls = VARIANT_MAP[variant]
+    model = model_cls(latent_dim=ckpt["latent_dim"],
+                      embed_dim=ckpt["embed_dim"],
+                      condition_on_participant=True,
+                      part_embed_dim=ckpt["part_embed_dim"]).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     stats = ckpt["stats"]
@@ -245,13 +263,12 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
 
     kl_final = float("nan")
     active_dims_final = 0
-    hp = hist_path(config, region, init_seed, split_seed, fold, n_folds)
+    hp = hist_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)
     if os.path.exists(hp):
         hist_df = pd.read_csv(hp)
         kl_final = float(hist_df["train_kl"].iloc[-1])
         active_dims_final = int(hist_df["active_dims"].iloc[-1])
 
-    cfg = CONFIGS[config]
     return {"config": config,
             "region": region,
             "init_seed": init_seed,
@@ -259,7 +276,8 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
             "fold": fold,
             "n_folds": n_folds,
             # broken-out hyperparameters (varied across this ablation)
-            "beta_max": cfg["beta_max"],
+            "variant": variant,
+            "beta_max": beta_max,
             "lag_n": cfg["lag_n"],
             "lag_phase": cfg["lag_phase"],
             "free_bits": cfg.get("free_bits", 0.0),
@@ -269,7 +287,7 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
             "embed_dim": ckpt["embed_dim"],
             "part_embed_dim": ckpt["part_embed_dim"],
             "condition_on_participant": True,
-            "architecture": "conv_baseline",
+            "architecture": variant,
             "accuracy": metrics["accuracy"],
             "f1_weighted": metrics["f1_weighted"],
             "roc_auc_ovr": metrics["roc_auc_ovr"],
@@ -298,7 +316,7 @@ def _json_safe(obj):
 
 def save_result(row: dict) -> None:
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    path = result_path(row["config"], row["region"], row["init_seed"], row["split_seed"], row["fold"], row["n_folds"])
+    path = result_path(row["variant"], row["beta_max"], row["config"], row["region"], row["init_seed"], row["split_seed"], row["fold"], row["n_folds"])
     with open(path, "w") as f:
         json.dump(_json_safe(row), f, indent=2)
 
@@ -309,7 +327,7 @@ def save_summary(rows: list[dict]) -> None:
     if os.path.exists(csv_path):
         df_old = pd.read_csv(csv_path)
         df_new = pd.concat([df_old, df_new], ignore_index=True).drop_duplicates(
-            subset=["config", "region", "init_seed", "split_seed", "fold", "n_folds"], keep="last")
+            subset=["variant", "beta_max", "config", "region", "init_seed", "split_seed", "fold", "n_folds"], keep="last")
     df_new.to_csv(csv_path, index=False)
     print(f"[DYNAMICS] Saved {len(df_new)} rows → {csv_path}")
 
@@ -335,17 +353,22 @@ def main() -> None:
 
     # aggregate mode
     if args.aggregate:
+        variants = args.variants.split(",") if args.variants else [args.variant]
+        beta_maxes = [float(b) for b in args.beta_maxes.split(",")] if args.beta_maxes else [args.beta_max]
         rows = []
-        for region in regions:
-            for config in configs:
-                for init_seed in init_seeds:
-                    for fold in folds:
-                        rp = result_path(config, region, init_seed, args.split_seed, fold, args.n_folds)
-                        if not os.path.exists(rp):
-                            print(f"  [AGGREGATE] missing {rp}, skipping")
-                            continue
-                        with open(rp) as f:
-                            rows.append(json.load(f))
+        for variant in variants:
+            for region in regions:
+                for config in configs:
+                    for bm in beta_maxes:
+                        beta_max = bm if bm is not None else CONFIGS[config]["beta_max"]
+                        for init_seed in init_seeds:
+                            for fold in folds:
+                                rp = result_path(variant, beta_max, config, region, init_seed, args.split_seed, fold, args.n_folds)
+                                if not os.path.exists(rp):
+                                    print(f"  [AGGREGATE] missing {rp}, skipping")
+                                    continue
+                                with open(rp) as f:
+                                    rows.append(json.load(f))
         if rows:
             save_summary(rows)
         return
@@ -365,14 +388,17 @@ def main() -> None:
 
                     print(f"[DYNAMICS] {config} | {region} | is={init_seed} | f={fold}/{args.n_folds}")
 
-                    path = ckpt_path(config, region, init_seed, args.split_seed, fold, args.n_folds)
+                    beta_max = args.beta_max if args.beta_max is not None else CONFIGS[config]["beta_max"]
+                    path = ckpt_path(args.variant, beta_max, config, region, init_seed, args.split_seed, fold, args.n_folds)
                     if args.skip_existing and os.path.exists(path):
                         print("  checkpoint exists, skipping training")
                     else:
                         train_config(config, region, init_seed, args.split_seed, fold, args.n_folds,
-                                     args.dataset_dir, device, args.epochs, args.lr, args.latent_dim, verbose=args.verbose)
+                                     args.dataset_dir, device, args.epochs, args.lr, args.latent_dim,
+                                     variant=args.variant, beta_max_override=args.beta_max, verbose=args.verbose)
 
-                    row = eval_config(config, region, init_seed, args.split_seed, fold, args.n_folds, cache, device, args.n_jobs)
+                    row = eval_config(config, region, init_seed, args.split_seed, fold, args.n_folds, cache, device, args.n_jobs,
+                                      variant=args.variant, beta_max_override=args.beta_max)
                     save_result(row)
                     all_results.append(row)
                     print(f"  TSTR: acc={row['accuracy']:.3f}, f1={row['f1_weighted']:.3f}, roc={row['roc_auc_ovr']:.3f}, log_loss={row['log_loss']:.3f}, kl={row['kl_final']:.4f}, active_dims={row['active_dims']}")
