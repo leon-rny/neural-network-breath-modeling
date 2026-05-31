@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REGIONS=(nose mouth)
+REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
 FOLDS=(1 2 3 4 5)
 SPLIT_SEED=42
@@ -14,7 +14,7 @@ export EMBED_DIM=8
 region_cfg() {
   case "$1" in
     mouth) echo "0 1 0.1" ;;
-    nose)  echo "0.05 10 0.01" ;;
+    nose)  echo "0.1 10 0.1" ;;
     *) echo "[SWEEP] ERROR: unknown region '$1'" >&2; return 1 ;;
   esac
 }

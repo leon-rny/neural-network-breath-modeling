@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-read -r -a INIT_SEEDS  <<< "${INIT_SEEDS:-0 1 7 42 123}"
-read -r -a FOLDS       <<< "${FOLDS:-1 2 3 4 5}"
-read -r -a REGIONS     <<< "${REGIONS:-nose mouth}"
+read -r -a INIT_SEEDS <<< "${INIT_SEEDS:-0 1 7 42 123}"
+read -r -a FOLDS <<< "${FOLDS:-1 2 3 4 5}"
+read -r -a REGIONS <<< "${REGIONS:-nose mouth}"
 read -r -a LAMBDA_PHYS <<< "${LAMBDA_PHYS:-0 0.001 0.005 0.01 0.05 0.1}"
 SPLIT_SEED=42
 N_FOLDS=5
