@@ -1,26 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=cvae_jitter
+#SBATCH --job-name=cvae_grid_jitter_beta
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=4G
 #SBATCH --time=12:00:00
-#SBATCH --output=/home/rane10/logs/cvae_jitter.o%A_%a
-#SBATCH --error=/home/rane10/logs/cvae_jitter.e%A_%a
-#SBATCH --array=0-1799%50
+#SBATCH --output=/home/rane10/logs/cvae_grid_jitter_beta.o%A_%a
+#SBATCH --error=/home/rane10/logs/cvae_grid_jitter_beta.e%A_%a
+#SBATCH --array=0-3599%50
 set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# Expanded joint grid: architecture x beta_max x jitter x region.
-# beta_max is now an explicit axis to resolve whether nose prefers a lower
-# beta_max when jittering is active (the open question from the inconsistent
-# pipeline, where nose jitter ran at beta=0.01 and scored ~70%).
-#
-#   2 variants x 3 beta_max x 6 jitter x 2 regions x 5 seeds x 5 folds = 1800 runs
+# 2 variants x 6 beta_max x 6 jitter configs x 2 regions x 5 seeds x 5 folds = 3600 runs
 VARIANTS=(conv_baseline mlp)
-BETA_MAXES=(0.01 0.05 0.1)
+BETA_MAXES=(0.001 0.005 0.01 0.03 0.05 0.1)
 CONFIGS=(baseline a0.025_n10 a0.05_n5 a0.05_n10 a0.1_n5 a0.1_n10)
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
@@ -44,8 +39,8 @@ export VECLIB_MAXIMUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
-  echo "[JITTER] aggregate-only: building summary.csv"
-  python -m ablations.cvae_jittering --aggregate \
+  echo "[JIT-BETA] aggregate-only: building summary.csv"
+  python -m ablations.cvae_ablation --mode jittering --aggregate \
     --variants "$(IFS=, ; echo "${VARIANTS[*]}")" \
     --beta_maxes "$(IFS=, ; echo "${BETA_MAXES[*]}")" \
     --configs "$(IFS=, ; echo "${CONFIGS[*]}")" \
@@ -56,9 +51,7 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
   exit 0
 fi
 
-# task id comes from SLURM under sbatch; for a local smoke test pass TASK_ID=<n> instead.
-IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..1799> for a local run}}
-# unravel: fold (fastest) -> seed -> region -> config -> beta -> variant (slowest)
+IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..2999> for a local run}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
 SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ));  IDX=$(( IDX / N_REGIONS ))
@@ -73,14 +66,14 @@ REGION=${REGIONS[$REGION_IDX]}
 INIT_SEED=${INIT_SEEDS[$SEED_IDX]}
 FOLD=${FOLDS[$FOLD_IDX]}
 
-echo "[JITTER] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} variant=$VARIANT beta_max=$BETA_MAX config=$CONFIG region=$REGION init_seed=$INIT_SEED fold=$FOLD"
+echo "[JIT-BETA] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} variant=$VARIANT beta_max=$BETA_MAX config=$CONFIG region=$REGION init_seed=$INIT_SEED fold=$FOLD"
 
 CACHE="results/trtr/${REGION}_is${INIT_SEED}_ss${SPLIT_SEED}_fold${FOLD}of${N_FOLDS}_checkpoint.pkl"
 if [ ! -f "$CACHE" ]; then
-  echo "[JITTER] WARNING: TRTR cache missing ($CACHE); this task will build it (possible parallel race)."
+  echo "[JIT-BETA] WARNING: TRTR cache missing ($CACHE); this task will build it (possible parallel race)."
 fi
 
-PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae_jittering \
+PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae_ablation --mode jittering \
   --variant "$VARIANT" \
   --beta_max "$BETA_MAX" \
   --config "$CONFIG" \
@@ -94,6 +87,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae_jittering \
   --skip_existing \
   --no_summary
 
-# Aggregate after the array finishes:
-#   AGGREGATE=1 sbatch --array=0 experiments/ablations_cvae_architecture_dynamics_jittering.sh
-# or run the aggregate block above directly on a login node.
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/ablations_cvae_3_grid_jitter_beta.sh
