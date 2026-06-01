@@ -14,25 +14,33 @@ matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-
 PORT = '/dev/cu.usbmodem21101'
 BAUD = 9600
 DATASET_ROOT = './dataset/new_measurements'
 
 MONITOR_WINDOW = 70.0
 DEFAULT_DURATION = 70
+# protocol: hold still for the first BASELINE_SECONDS, then breathe the pattern
+BASELINE_SECONDS = 10
+# impulse-response (sir) protocol: baseline, then one short strong breath, then settle
+IMPULSE_SECONDS = 2
+
+# measurement types: 'breathing' = paced pattern, 'impulse' = system impulse response
+MEAS_TYPES = ['breathing', 'impulse']
 
 # baseline-stability
 BASE_WINDOW = 10     # number of recent samples to judge stability
 TEMP_TOL = 0.2       # max std of consecutive-sample changes in °C
-HUM_TOL = 0.9        # max std of consecutive-sample changes in %RH
+HUM_TOL = 1.4        # max std of consecutive-sample changes in %RH
 TEMP_DRIFT_TOL = 0.3 # max |last-third mean − first-third mean| in °C
-HUM_DRIFT_TOL = 1.0  # max |last-third mean − first-third mean| in %RH
+HUM_DRIFT_TOL = 1.6  # max |last-third mean − first-third mean| in %RH
 
 CLASSES = ['bradypnea', 'eupnea', 'tachypnea']
 REGIONS = ['mouth', 'nose']
+# pacing guide: typical breathing rate per class, in breaths per minute
+BREATH_RATES = {'bradypnea': 10, 'eupnea': 15, 'tachypnea': 20}
 PARTICIPANTS = ['b', 'c', 'd']
-PARTICIPANT_PREFIX = {'b': '', 'c': 'c_', 'd': 'd_'}
+PARTICIPANT_PREFIX = { 'b': 'b_', 'c': 'c_', 'd': 'd_'}
 
 # serial reader
 class SerialReader(threading.Thread):
@@ -97,19 +105,35 @@ class SerialReader(threading.Thread):
             pass
 
 # saving
+def _next_index(folder, pat):
+    """Next trial number = max existing match + 1, so discards never collide."""
+    existing = [int(m.group(1)) for f in os.listdir(folder) if (m := pat.match(f))]
+    return max(existing) + 1 if existing else 1
+
+def _write_dat(path, rows):
+    with open(path, 'w') as f:
+        f.write('Time,Humidity,Temperature\n')
+        for t, h, temp in rows:
+            f.write(f'{t},{h},{temp}\n')
+
 def save_measurement(rows, breath_class, region, participant):
     folder = os.path.join(DATASET_ROOT, breath_class)
     os.makedirs(folder, exist_ok=True)
     prefix = PARTICIPANT_PREFIX[participant]
     pat = re.compile(rf'^{re.escape(prefix)}{region}_trial_(\d+)\.dat$')
-    existing = [int(m.group(1)) for f in os.listdir(folder) if (m := pat.match(f))]
-    idx = max(existing) + 1 if existing else 1
-    fname = f'{prefix}{region}_trial_{idx}.dat'
+    fname = f'{prefix}{region}_trial_{_next_index(folder, pat)}.dat'
     path = os.path.join(folder, fname)
-    with open(path, 'w') as f:
-        f.write('Time,Humidity,Temperature\n')
-        for t, h, temp in rows:
-            f.write(f'{t},{h},{temp}\n')
+    _write_dat(path, rows)
+    return path
+
+def save_sir(rows, region):
+    """Impulse-response trial -> dataset/sir/{region}_trial_N.dat (matches load_cir)."""
+    folder = os.path.join(DATASET_ROOT, 'sir')
+    os.makedirs(folder, exist_ok=True)
+    pat = re.compile(rf'^{re.escape(region)}_trial_(\d+)\.dat$')
+    fname = f'{region}_trial_{_next_index(folder, pat)}.dat'
+    path = os.path.join(folder, fname)
+    _write_dat(path, rows)
     return path
 
 # gui
@@ -120,6 +144,8 @@ class CampaignGUI:
         self.last_saved_path = None
         self.measuring = False
         self._countdown_id = None
+        self._measure_start = None  # wall-clock time Start was pressed (for protocol phases)
+        self._measure_total = None  # total duration of the active measurement (s)
 
         root.title('Breath Measurement Campaign')
 
@@ -135,36 +161,51 @@ class CampaignGUI:
         ctrl = ttk.Frame(root, padding=8)
         ctrl.grid(row=1, column=0, sticky='ew')
 
-        ttk.Label(ctrl, text='Participant:').grid(row=0, column=0, sticky='w')
+        ttk.Label(ctrl, text='Type:').grid(row=0, column=0, sticky='w')
+        self.type_var = tk.StringVar(value=MEAS_TYPES[0])
+        ttk.OptionMenu(ctrl, self.type_var, MEAS_TYPES[0], *MEAS_TYPES).grid(row=0, column=1, padx=(2, 14))
+        self.type_var.trace_add('write', self._on_type_change)
+
+        ttk.Label(ctrl, text='Participant:').grid(row=0, column=2, sticky='w')
         self.part_var = tk.StringVar(value=PARTICIPANTS[0])
-        ttk.OptionMenu(ctrl, self.part_var, PARTICIPANTS[0], *PARTICIPANTS).grid(row=0, column=1, padx=(2, 14))
+        ttk.OptionMenu(ctrl, self.part_var, PARTICIPANTS[0], *PARTICIPANTS).grid(row=0, column=3, padx=(2, 14))
 
-        ttk.Label(ctrl, text='Class:').grid(row=0, column=2, sticky='w')
+        ttk.Label(ctrl, text='Class:').grid(row=0, column=4, sticky='w')
         self.class_var = tk.StringVar(value=CLASSES[1])
-        ttk.OptionMenu(ctrl, self.class_var, CLASSES[1], *CLASSES).grid(row=0, column=3, padx=(2, 14))
+        self.class_menu = ttk.OptionMenu(ctrl, self.class_var, CLASSES[1], *CLASSES)
+        self.class_menu.grid(row=0, column=5, padx=(2, 14))
 
-        ttk.Label(ctrl, text='Region:').grid(row=0, column=4, sticky='w')
+        ttk.Label(ctrl, text='Region:').grid(row=0, column=6, sticky='w')
         self.region_var = tk.StringVar(value=REGIONS[0])
-        ttk.OptionMenu(ctrl, self.region_var, REGIONS[0], *REGIONS).grid(row=0, column=5, padx=(2, 14))
+        ttk.OptionMenu(ctrl, self.region_var, REGIONS[0], *REGIONS).grid(row=0, column=7, padx=(2, 14))
 
-        ttk.Label(ctrl, text='Duration in s:').grid(row=0, column=6, sticky='w')
+        ttk.Label(ctrl, text='Duration in s:').grid(row=0, column=8, sticky='w')
         self.dur_var = tk.StringVar(value=str(DEFAULT_DURATION))
-        ttk.Entry(ctrl, textvariable=self.dur_var, width=5).grid(row=0, column=7, padx=(2, 14))
+        ttk.Entry(ctrl, textvariable=self.dur_var, width=5).grid(row=0, column=9, padx=(2, 14))
 
         self.start_btn = ttk.Button(ctrl, text='Start measurement', command=self.start_measurement, state='disabled')
-        self.start_btn.grid(row=0, column=8, padx=(0, 8))
+        self.start_btn.grid(row=0, column=10, padx=(0, 8))
 
         self.abort_btn = ttk.Button(ctrl, text='Abort', command=self.abort_measurement, state='disabled')
-        self.abort_btn.grid(row=0, column=9, padx=(0, 8))
+        self.abort_btn.grid(row=0, column=11, padx=(0, 8))
 
         self.discard_btn = ttk.Button(ctrl, text='Discard last',command=self.discard_last, state='disabled')
-        self.discard_btn.grid(row=0, column=10, padx=(0, 14))
+        self.discard_btn.grid(row=0, column=12, padx=(0, 14))
 
         self.baseline_lbl = ttk.Label(ctrl, text='Baseline: --', width=22)
-        self.baseline_lbl.grid(row=0, column=11, sticky='w')
+        self.baseline_lbl.grid(row=0, column=13, sticky='w')
+
+        # breathing pacing guide (scrolling sine at the class-typical rate)
+        self.met_fig = Figure(figsize=(8, 1.6), dpi=100)
+        self.met_ax = self.met_fig.add_subplot(1, 1, 1)
+        self.met_fig.tight_layout()
+        self.met_canvas = FigureCanvasTkAgg(self.met_fig, master=root)
+        self.met_canvas.get_tk_widget().grid(row=2, column=0, sticky='ew', padx=6, pady=(6, 0))
+        self._met_phase = 0.0          # accumulated breathing phase (rad)
+        self._met_last_t = time.time()
 
         self.status = ttk.Label(root, text='Monitoring...', padding=(8, 0, 8, 6))
-        self.status.grid(row=2, column=0, sticky='w')
+        self.status.grid(row=3, column=0, sticky='w')
 
         # result plot
         self.res_fig = Figure(figsize=(8, 3), dpi=100)
@@ -172,13 +213,19 @@ class CampaignGUI:
         self.res_temp = self.res_fig.add_subplot(1, 2, 2)
         self.res_fig.tight_layout()
         self.res_canvas = FigureCanvasTkAgg(self.res_fig, master=root)
-        self.res_canvas.get_tk_widget().grid(row=3, column=0, sticky='nsew', padx=6, pady=(0, 6))
+        self.res_canvas.get_tk_widget().grid(row=4, column=0, sticky='nsew', padx=6, pady=(0, 6))
 
         root.rowconfigure(0, weight=1)
-        root.rowconfigure(3, weight=1)
+        root.rowconfigure(4, weight=1)
         root.columnconfigure(0, weight=1)
 
         self.update_monitor()
+        self.update_metronome()
+
+    # class only applies to breathing trials; disable it for impulse-response
+    def _on_type_change(self, *_):
+        impulse = self.type_var.get() == 'impulse'
+        self.class_menu.config(state='disabled' if impulse else 'normal')
 
     # baseline stability
     def baseline_state(self, data):
@@ -221,9 +268,9 @@ class CampaignGUI:
 
             stable = self.baseline_state(data)
             if stable is True:
-                self.baseline_lbl.config(text='baseline: STABLE', foreground='green')
+                self.baseline_lbl.config(text='Baseline: Stable', foreground='green')
             elif stable is False:
-                self.baseline_lbl.config(text='Baseline: Settling…', foreground='red')
+                self.baseline_lbl.config(text='Baseline: Unstable', foreground='red')
             else:
                 self.baseline_lbl.config(text='Baseline: --', foreground='black')
 
@@ -233,6 +280,83 @@ class CampaignGUI:
 
         self.root.after(100, self.update_monitor) # refresh 100ms
 
+    # pacing guide (breathing pattern or impulse-response protocol)
+    def update_metronome(self):
+        now = time.time()
+        dt = now - self._met_last_t
+        self._met_last_t = now
+
+        impulse = self.type_var.get() == 'impulse'
+        cls = self.class_var.get()
+        bpm = BREATH_RATES.get(cls, 15)
+        f = bpm / 60.0
+
+        # elapsed within the active measurement (None when idle / not measuring)
+        elapsed = (now - self._measure_start) if (self.measuring and self._measure_start is not None) else None
+
+        self.met_ax.cla()
+        if elapsed is not None and elapsed < BASELINE_SECONDS:
+            # shared baseline hold for both measurement types
+            self._met_phase = 0.0
+            left = int(np.ceil(BASELINE_SECONDS - elapsed))
+            cue = "exhale hard once when it turns red" if impulse else "exhale when it turns green"
+            nxt = "one strong breath" if impulse else f"breathe {cls}"
+            self.met_ax.plot([-2, 10], [-1, -1], color="#e8a33d", lw=2)
+            self.met_ax.plot(0, -1, "o", color="#e8a33d", ms=12, zorder=5)
+            self.met_ax.text(0.5, 0.6, f"Baseline measurement: hold still · {left}s\n({cue})",
+                             transform=self.met_ax.transAxes, ha="center", va="center",
+                             fontsize=13, fontweight="bold", color="#b9791f")
+            self.met_ax.set_title(f"Step 1/2 · Baseline (no breathing) → then {nxt}")
+        elif impulse:
+            self._met_phase = 0.0
+            x = np.linspace(-2.0, 10.0, 400)
+            if elapsed is None:
+                # idle preview of the protocol shape: flat → spike → decay
+                y = np.where(x >= 1.0, -1 + 2 * np.exp(-(np.clip(x - 1.0, 0, None)) / 2.5), -1.0)
+                self.met_ax.plot(x, y, color="#3a7", lw=2)
+                self.met_ax.set_title("Impulse response · baseline → 1 strong breath → settle")
+            elif elapsed < BASELINE_SECONDS + IMPULSE_SECONDS:
+                # the impulse window: one short, strong breath right now
+                y = np.where(x >= 0, -1 + 2 * np.exp(-np.clip(x, 0, None) / 0.6), -1.0)
+                self.met_ax.plot(x, y, color="#c33", lw=2)
+                self.met_ax.plot(0, 1.0, "o", color="#c33", ms=14, zorder=5)
+                self.met_ax.text(0.5, 0.6, "ONE SHORT, STRONG BREATH — NOW!",
+                                 transform=self.met_ax.transAxes, ha="center", va="center",
+                                 fontsize=15, fontweight="bold", color="#c33")
+                self.met_ax.set_title("Step 2/2 · Impulse — exhale hard, once")
+            else:
+                # settle: hold still, let the response decay back to baseline
+                t_set = elapsed - (BASELINE_SECONDS + IMPULSE_SECONDS)
+                y = -1 + 2 * np.exp(-np.clip(t_set + x, 0, None) / 8.0)
+                self.met_ax.plot(x, y, color="#3a7", lw=2)
+                self.met_ax.plot(0, -1 + 2 * np.exp(-t_set / 8.0), "o", color="#3a7", ms=12, zorder=5)
+                left = max(0, int(np.ceil((self._measure_total or 0) - elapsed)))
+                self.met_ax.text(0.5, 0.78, f"Settling — hold still, no breathing · {left}s left",
+                                 transform=self.met_ax.transAxes, ha="center", va="center",
+                                 fontsize=13, fontweight="bold", color="#2a7")
+                self.met_ax.set_title("Step 2/2 · Settling (no breathing)")
+        else:
+            # paced breathing: free-running before Start, the breathing portion after
+            self._met_phase = (self._met_phase + 2 * np.pi * f * dt) % (2 * np.pi)
+            x = np.linspace(-2.0, 10.0, 400)
+            y = -np.cos(self._met_phase + 2 * np.pi * f * x)
+            exhaling = np.sin(self._met_phase) > 0
+            self.met_ax.plot(x, y, color="#3a7", lw=2)
+            self.met_ax.plot(0, -np.cos(self._met_phase), "o", color="#c33", ms=12, zorder=5)
+            phase_txt = "EXHALE ▲" if exhaling else "INHALE ▼"
+            step = "Step 2/2 · " if self.measuring else ""
+            self.met_ax.set_title(f"{step}{cls.capitalize()} · {bpm}/min · {phase_txt}")
+
+        self.met_ax.axvline(0, color="0.4", lw=1)
+        self.met_ax.set_xlim(-2, 10)
+        self.met_ax.set_ylim(-1.25, 1.25)
+        self.met_ax.set_yticks([])
+        self.met_ax.set_xlabel("seconds")
+        self.met_fig.tight_layout()
+        self.met_canvas.draw_idle()
+
+        self.root.after(50, self.update_metronome)
+
     # measurement control
     def start_measurement(self):
         try:
@@ -241,8 +365,18 @@ class CampaignGUI:
         except (ValueError, AssertionError):
             messagebox.showerror('Invalid duration', 'Enter a positive number of seconds.')
             return
+        impulse = self.type_var.get() == 'impulse'
+        min_dur = BASELINE_SECONDS + (IMPULSE_SECONDS if impulse else 0)
+        if duration <= min_dur:
+            tail = 'the impulse + some settle time' if impulse else 'time to breathe the pattern'
+            messagebox.showerror('Duration too short',
+                                 f'Duration must exceed the {min_dur}s baseline/impulse phase '
+                                 f'so there is room left for {tail}.')
+            return
 
         self.measuring = True
+        self._measure_start = time.time()
+        self._measure_total = duration
         self.start_btn.config(state='disabled')
         self.abort_btn.config(state='normal')
         self.discard_btn.config(state='disabled')
@@ -253,7 +387,17 @@ class CampaignGUI:
         if remaining > 0:
             cls = self.class_var.get()
             reg = self.region_var.get()
-            self.status.config(text=f'Recording {cls}/{reg} … {remaining}s left')
+            impulse = self.type_var.get() == 'impulse'
+            elapsed = total - remaining
+            if elapsed < BASELINE_SECONDS:
+                nxt = 'one strong breath' if impulse else f'breathe {cls}'
+                self.status.config(text=f'BASELINE (hold still) … {int(BASELINE_SECONDS - elapsed)}s — then {nxt}')
+            elif impulse and elapsed < BASELINE_SECONDS + IMPULSE_SECONDS:
+                self.status.config(text=f'IMPULSE — one short, strong breath NOW! ({reg})')
+            elif impulse:
+                self.status.config(text=f'Settling (hold still, no breathing) … {remaining}s left')
+            else:
+                self.status.config(text=f'Breathe {cls}/{reg} … {remaining}s left')
             self._countdown_id = self.root.after(1000, lambda: self._countdown(remaining - 1, total))
         else:
             self._countdown_id = None
@@ -279,10 +423,15 @@ class CampaignGUI:
             self.status.config(text='No data captured, check the sensor/connection.')
             return
 
-        cls = self.class_var.get()
         reg = self.region_var.get()
-        part = self.part_var.get()
-        path = save_measurement(rows, cls, reg, part)
+        if self.type_var.get() == 'impulse':
+            path = save_sir(rows, reg)
+            label = f'SIR/{reg.capitalize()}'
+        else:
+            cls = self.class_var.get()
+            part = self.part_var.get()
+            path = save_measurement(rows, cls, reg, part)
+            label = f'{part}/{reg.capitalize()}/{cls.capitalize()}'
         self.last_saved_path = path
         self.discard_btn.config(state='normal')
 
@@ -296,13 +445,13 @@ class CampaignGUI:
         self.res_hum.plot(ts, hum, color='steelblue')
         self.res_hum.set_xlabel('Time in s')
         self.res_hum.set_ylabel('Humidity in %')
-        self.res_hum.set_title(f'{part}/{reg.capitalize()}/{cls.capitalize()}: Humidity')
+        self.res_hum.set_title(f'{label}: Humidity')
         self.res_hum.grid()
         self.res_temp.cla()
         self.res_temp.plot(ts, temp, color='orange')
         self.res_temp.set_xlabel('Time in s')
         self.res_temp.set_ylabel('Temperature in °C')
-        self.res_temp.set_title(f'{part}/{reg.capitalize()}/{cls.capitalize()}: Temperature')
+        self.res_temp.set_title(f'{label}: Temperature')
         self.res_temp.grid()
         self.res_fig.tight_layout()
         self.res_canvas.draw_idle()
