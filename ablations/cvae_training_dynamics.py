@@ -63,13 +63,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--region", default=None)
     # joint architecture x beta sweep
     p.add_argument("--variant", default="conv_baseline", choices=list(VARIANT_MAP))
-    p.add_argument("--beta_max", type=float, default=None,
-                   help="Override config's beta_max for joint architecture x beta sweep.")
+    p.add_argument("--beta_max", type=float, default=None)
     # plural sweep axes (aggregate mode only)
-    p.add_argument("--variants", default=None,
-                   help="Comma-separated variants to aggregate over (defaults to --variant).")
-    p.add_argument("--beta_maxes", default=None,
-                   help="Comma-separated beta_max values to aggregate over (defaults to --beta_max).")
+    p.add_argument("--variants", default=None)
+    p.add_argument("--beta_maxes", default=None)
     # protocol-level constants
     p.add_argument("--split_seed", type=int, default=42)
     p.add_argument("--n_folds", type=int, default=5)
@@ -232,7 +229,7 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    variant = ckpt.get("variant", "conv_baseline")  # backward compat with old ckpts
+    variant = ckpt.get("variant", "conv_baseline") # backward compat with old ckpts
     model_cls = VARIANT_MAP[variant]
     model = model_cls(latent_dim=ckpt["latent_dim"],
                       embed_dim=ckpt["embed_dim"],
