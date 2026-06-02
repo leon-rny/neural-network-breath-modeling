@@ -18,7 +18,6 @@ from core.utils import make_generator, seed_everything, seed_worker
 from models.vae import elbo_loss
 from ablations.cvae_models import VARIANT_MAP
 
-
 MODES: dict[str, dict] = {
     "dynamics": {"results_dir": "results/ablation_cvae_training_dynamics", "ckpt": "f_checkpoint", "family": "ablation"},
     "jittering": {"results_dir": "results/ablation_cvae_jittering", "ckpt": "stem", "family": "ablation"},
