@@ -46,49 +46,47 @@ CONFIGS: dict[str, dict] = {
     # warmup-fraction sweep
     "warmup_0.25": {"beta_max": 1.0, "lag_n": 0, "lag_phase": 0, "warmup_frac": 0.25},
     "warmup_0.75": {"beta_max": 1.0, "lag_n": 0, "lag_phase": 0, "warmup_frac": 0.75},
-    # joint architecture x beta sweep (beta_max overridden by --beta_max)
+    # joint architecture x beta sweep
     "joint": {"beta_max": 0.1, "lag_n": 0, "lag_phase": 0},
-    # free-bits x lagging-inference grid at beta_max=0.03 with jitter a0.05_n10 fixed
-    "fb0_off":        {"beta_max": 0.03, "lag_n": 0, "lag_phase": 0,   "free_bits": 0.0, "alpha": 0.05, "n_copies": 10},
-    "fb0.1_off":      {"beta_max": 0.03, "lag_n": 0, "lag_phase": 0,   "free_bits": 0.1, "alpha": 0.05, "n_copies": 10},
-    "fb0.5_off":      {"beta_max": 0.03, "lag_n": 0, "lag_phase": 0,   "free_bits": 0.5, "alpha": 0.05, "n_copies": 10},
-    "fb0_lag5_250":   {"beta_max": 0.03, "lag_n": 5, "lag_phase": 250, "free_bits": 0.0, "alpha": 0.05, "n_copies": 10},
-    "fb0.1_lag5_250": {"beta_max": 0.03, "lag_n": 5, "lag_phase": 250, "free_bits": 0.1, "alpha": 0.05, "n_copies": 10},
-    "fb0.5_lag5_250": {"beta_max": 0.03, "lag_n": 5, "lag_phase": 250, "free_bits": 0.5, "alpha": 0.05, "n_copies": 10},
-    # --- jittering augmentation (alpha = jitter std, n_copies = augmentation factor) ---
-    "baseline":   {"alpha": 0.0,   "n_copies": 0},
-    "a0.01_n2":   {"alpha": 0.01,  "n_copies": 2},
-    "a0.01_n5":   {"alpha": 0.01,  "n_copies": 5},
-    "a0.01_n10":  {"alpha": 0.01,  "n_copies": 10},
-    "a0.05_n2":   {"alpha": 0.05,  "n_copies": 2},
-    "a0.05_n5":   {"alpha": 0.05,  "n_copies": 5},
-    "a0.05_n10":  {"alpha": 0.05,  "n_copies": 10},
-    "a0.1_n2":    {"alpha": 0.1,   "n_copies": 2},
-    "a0.1_n5":    {"alpha": 0.1,   "n_copies": 5},
-    "a0.1_n10":   {"alpha": 0.1,   "n_copies": 10},
-    "a0.025_n5":  {"alpha": 0.025, "n_copies": 5},
+    # free-bits x lagging-inference grid at fixed beta_max with jitter
+    "fb0_off": {"beta_max": 0.01, "lag_n": 0, "lag_phase": 0, "free_bits": 0.0, "alpha": 0.05, "n_copies": 10},
+    "fb0.1_off": {"beta_max": 0.01, "lag_n": 0, "lag_phase": 0, "free_bits": 0.1, "alpha": 0.05, "n_copies": 10},
+    "fb0.5_off": {"beta_max": 0.01, "lag_n": 0, "lag_phase": 0, "free_bits": 0.5, "alpha": 0.05, "n_copies": 10},
+    "fb0_lag5_250": {"beta_max": 0.01, "lag_n": 5, "lag_phase": 250, "free_bits": 0.0, "alpha": 0.05, "n_copies": 10},
+    "fb0.1_lag5_250": {"beta_max": 0.01, "lag_n": 5, "lag_phase": 250, "free_bits": 0.1, "alpha": 0.05, "n_copies": 10},
+    "fb0.5_lag5_250": {"beta_max": 0.01, "lag_n": 5, "lag_phase": 250, "free_bits": 0.5, "alpha": 0.05, "n_copies": 10},
+    # jittering augmentation
+    "baseline": {"alpha": 0.0, "n_copies": 0},
+    "a0.01_n2": {"alpha": 0.01, "n_copies": 2},
+    "a0.01_n5": {"alpha": 0.01, "n_copies": 5},
+    "a0.01_n10": {"alpha": 0.01, "n_copies": 10},
+    "a0.05_n2": {"alpha": 0.05, "n_copies": 2},
+    "a0.05_n5": {"alpha": 0.05, "n_copies": 5},
+    "a0.05_n10": {"alpha": 0.05, "n_copies": 10},
+    "a0.1_n2": {"alpha": 0.1, "n_copies": 2},
+    "a0.1_n5": {"alpha": 0.1, "n_copies": 5},
+    "a0.1_n10": {"alpha": 0.1, "n_copies": 10},
+    "a0.025_n5": {"alpha": 0.025, "n_copies": 5},
     "a0.025_n10": {"alpha": 0.025, "n_copies": 10},
 }
 
-# region-default beta_max for configs that do not pin one (the jittering configs)
+# region-default beta_max
 BETA_MAX = {"mouth": 0.01, "nose": 0.01}
 
-# fixed parameters (shared)
+# fixed parameters
 LATENT_DIM = 16
 EMBED_DIM = 8
 PART_EMBED_DIM = 8
 BATCH_SIZE = 32
 LOG_EVERY = 25
 
-# architecture-mode fixed recipe
+# architecture-mode
 ARCH_BETA_MAX = 1.0
 ARCH_WARMUP_FRAC = 0.5
-
-# summary dedup keys per flow family
 ABLATION_SUBSET = ["variant", "beta_max", "config", "region", "init_seed", "split_seed", "fold", "n_folds"]
 ARCH_SUBSET = ["variant", "region", "init_seed", "split_seed", "fold", "n_folds", "condition_on_participant"]
 
-# set by main() from --mode
+# modes
 RESULTS_DIR = MODES["dynamics"]["results_dir"]
 CKPT_SCHEME = MODES["dynamics"]["ckpt"]
 FAMILY = MODES["dynamics"]["family"]
@@ -140,13 +138,13 @@ def _parse_bool(s: str) -> bool:
         return False
     raise ValueError(f"Invalid boolean: {s!r}")
 
-# config knob accessor (every knob has a default so configs stay minimal)
+# config knob accessor
 def resolve_beta(cfg: dict, region: str, override: float | None) -> float:
     if override is not None:
         return override
     return cfg.get("beta_max", BETA_MAX[region])
 
-# paths — ablation family (dynamics / jittering)
+## paths
 def _stem(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
     return f"{variant}_b{beta_max}_{config}_{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}"
 
@@ -161,7 +159,6 @@ def hist_path(variant: str, beta_max: float, config: str, region: str, init_seed
 def result_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
     return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)}_result.json"
 
-# paths — architecture family (variant x cond_part, no beta/config)
 def _arch_stem(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool) -> str:
     cp_marker = "" if cond_part else "_nocp"
     return f"{variant}_{region}_is{init_seed}_ss{split_seed}{cp_marker}_fold{fold}of{n_folds}"
@@ -175,7 +172,7 @@ def arch_hist_path(variant: str, region: str, init_seed: int, split_seed: int, f
 def arch_result_path(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool) -> str:
     return f"{RESULTS_DIR}/{_arch_stem(variant, region, init_seed, split_seed, fold, n_folds, cond_part)}_result.json"
 
-# shared TSTR scoring + history readback
+# tstr scoring
 def _tstr_score(model, stats: dict, cache: dict, device: torch.device, n_jobs: int, init_seed: int, label: str) -> dict:
     """Generate synthetic signals from a trained model, extract the cached top-20
     tsfresh features, train a stacking classifier on synthetic, and score on the
@@ -205,7 +202,7 @@ def _final_kl_active(hp: str) -> tuple[float, int]:
         active_dims_final = int(hist_df["active_dims"].iloc[-1])
     return kl_final, active_dims_final
 
-# ============================ ablation family ============================
+## ablation family
 # training
 def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, dataset_dir: str, device: torch.device, epochs: int, lr: float, latent_dim: int, variant: str = "conv_baseline", beta_max_override: float | None = None, verbose: bool = False) -> None:
     cfg = CONFIGS[config]
@@ -314,7 +311,7 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
                         "warmup_frac": warmup_frac},
                        ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds))
 
-        # active dims (always on the clean, un-jittered training set)
+        # active dims
         if epoch % LOG_EVERY == 0 or epoch == 1:
             n_active = active_dims(model, train_ds_clean, device, conditional=True, use_participant=True)
         else:
@@ -369,7 +366,7 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
             "split_seed": split_seed,
             "fold": fold,
             "n_folds": n_folds,
-            # broken-out hyperparameters (varied across these ablations)
+            # broken-out hyperparameters
             "variant": variant,
             "beta_max": beta_max,
             "lag_n": cfg.get("lag_n", 0),
@@ -378,7 +375,7 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
             "alpha": cfg.get("alpha", 0.0),
             "n_copies": cfg.get("n_copies", 1),
             "warmup_frac": cfg.get("warmup_frac", 0.5),
-            # constants for this ablation (logged so columns align across ablations)
+            # constants for this ablation
             "latent_dim": ckpt["latent_dim"],
             "embed_dim": ckpt["embed_dim"],
             "part_embed_dim": ckpt["part_embed_dim"],
@@ -394,7 +391,7 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
             "kl_final": kl_final,
             "active_dims": active_dims_final}
 
-# ============================ architecture family ============================
+## architecture family
 # training
 def train_variant(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool, dataset_dir: str, device: torch.device, epochs: int, lr: float, verbose: bool = False) -> None:
     warmup_epochs = int(epochs * ARCH_WARMUP_FRAC)
@@ -547,14 +544,14 @@ def save_summary(rows: list[dict]) -> None:
     df_new.to_csv(csv_path, index=False)
     print(f"[{TAG}] Saved {len(df_new)} rows → {csv_path}")
 
-# ============================ flow: ablation ============================
+# flow: ablation
 def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
     variant = args.variant if args.variant else "conv_baseline"
     if variant not in VARIANT_MAP:
         print(f'Unknown variant "{variant}". Valid: {list(VARIANT_MAP)}')
         sys.exit(1)
 
-    # resolve config list (--alpha/--n_copies synthesise a jittering config name)
+    # resolve config list
     if args.alpha is not None and args.n_copies is not None:
         if args.alpha == 0:
             configs = ["baseline"]
@@ -588,7 +585,6 @@ def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
             if v not in VARIANT_MAP:
                 print(f'Unknown variant "{v}". Valid: {list(VARIANT_MAP)}')
                 sys.exit(1)
-        # beta axis: explicit list, single override, or None => per-config/region default
         beta_axis = ([float(b) for b in args.beta_maxes.split(",")] if args.beta_maxes
                      else [args.beta_max] if args.beta_max is not None else None)
         rows = []
@@ -642,7 +638,7 @@ def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
     if all_results and not args.no_summary:
         save_summary(all_results)
 
-# ============================ flow: architecture ============================
+## flow: architecture
 def run_architecture(args: argparse.Namespace, device: torch.device) -> None:
     variants = ([args.variant] if args.variant
                 else args.variants.split(",") if args.variants
@@ -715,14 +711,12 @@ def run_architecture(args: argparse.Namespace, device: torch.device) -> None:
 def main() -> None:
     args = parse_args()
 
-    # mode selects the result tree + checkpoint-naming scheme + flow (backward compat)
+    # modes
     global RESULTS_DIR, CKPT_SCHEME, FAMILY, TAG
     RESULTS_DIR = MODES[args.mode]["results_dir"]
     CKPT_SCHEME = MODES[args.mode]["ckpt"]
     FAMILY = MODES[args.mode]["family"]
     TAG = "ARCH" if FAMILY == "architecture" else args.mode.upper()
-    # optional output redirect (e.g. smoke tests into a scratch dir); ckpt-naming
-    # scheme + flow family stay tied to --mode. TRTR caches are unaffected.
     RESULTS_DIR = os.environ.get("CVAE_RESULTS_DIR", RESULTS_DIR)
 
     device = torch.device("cpu")
