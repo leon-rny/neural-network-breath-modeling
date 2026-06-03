@@ -20,12 +20,8 @@ DATASET_ROOT = './dataset/new_measurements'
 
 MONITOR_WINDOW = 70.0
 DEFAULT_DURATION = 70
-# protocol: hold still for the first BASELINE_SECONDS, then breathe the pattern
 BASELINE_SECONDS = 10
-# impulse-response (sir) protocol: baseline, then one short strong breath, then settle
 IMPULSE_SECONDS = 2
-
-# measurement types: 'breathing' = paced pattern, 'impulse' = system impulse response
 MEAS_TYPES = ['breathing', 'impulse']
 
 # baseline-stability
@@ -144,8 +140,8 @@ class CampaignGUI:
         self.last_saved_path = None
         self.measuring = False
         self._countdown_id = None
-        self._measure_start = None  # wall-clock time Start was pressed (for protocol phases)
-        self._measure_total = None  # total duration of the active measurement (s)
+        self._measure_start = None
+        self._measure_total = None
 
         root.title('Breath Measurement Campaign')
 
@@ -163,21 +159,25 @@ class CampaignGUI:
 
         ttk.Label(ctrl, text='Type:').grid(row=0, column=0, sticky='w')
         self.type_var = tk.StringVar(value=MEAS_TYPES[0])
-        ttk.OptionMenu(ctrl, self.type_var, MEAS_TYPES[0], *MEAS_TYPES).grid(row=0, column=1, padx=(2, 14))
+        ttk.Combobox(ctrl, textvariable=self.type_var, values=MEAS_TYPES,
+                     state='readonly', width=10).grid(row=0, column=1, padx=(2, 14))
         self.type_var.trace_add('write', self._on_type_change)
 
         ttk.Label(ctrl, text='Participant:').grid(row=0, column=2, sticky='w')
         self.part_var = tk.StringVar(value=PARTICIPANTS[0])
-        ttk.OptionMenu(ctrl, self.part_var, PARTICIPANTS[0], *PARTICIPANTS).grid(row=0, column=3, padx=(2, 14))
+        ttk.Combobox(ctrl, textvariable=self.part_var, values=PARTICIPANTS,
+                     state='readonly', width=4).grid(row=0, column=3, padx=(2, 14))
 
         ttk.Label(ctrl, text='Class:').grid(row=0, column=4, sticky='w')
         self.class_var = tk.StringVar(value=CLASSES[1])
-        self.class_menu = ttk.OptionMenu(ctrl, self.class_var, CLASSES[1], *CLASSES)
+        self.class_menu = ttk.Combobox(ctrl, textvariable=self.class_var, values=CLASSES,
+                                       state='readonly', width=12)
         self.class_menu.grid(row=0, column=5, padx=(2, 14))
 
         ttk.Label(ctrl, text='Region:').grid(row=0, column=6, sticky='w')
         self.region_var = tk.StringVar(value=REGIONS[0])
-        ttk.OptionMenu(ctrl, self.region_var, REGIONS[0], *REGIONS).grid(row=0, column=7, padx=(2, 14))
+        ttk.Combobox(ctrl, textvariable=self.region_var, values=REGIONS,
+                     state='readonly', width=6).grid(row=0, column=7, padx=(2, 14))
 
         ttk.Label(ctrl, text='Duration in s:').grid(row=0, column=8, sticky='w')
         self.dur_var = tk.StringVar(value=str(DEFAULT_DURATION))
@@ -195,13 +195,9 @@ class CampaignGUI:
         self.baseline_lbl = ttk.Label(ctrl, text='Baseline: --', width=22)
         self.baseline_lbl.grid(row=0, column=13, sticky='w')
 
-        # breathing pacing guide (scrolling sine at the class-typical rate)
-        self.met_fig = Figure(figsize=(8, 1.6), dpi=100)
-        self.met_ax = self.met_fig.add_subplot(1, 1, 1)
-        self.met_fig.tight_layout()
-        self.met_canvas = FigureCanvasTkAgg(self.met_fig, master=root)
-        self.met_canvas.get_tk_widget().grid(row=2, column=0, sticky='ew', padx=6, pady=(6, 0))
-        self._met_phase = 0.0          # accumulated breathing phase (rad)
+        self.met_canvas = tk.Canvas(root, height=160, highlightthickness=0, bg='white')
+        self.met_canvas.grid(row=2, column=0, sticky='ew', padx=6, pady=(6, 0))
+        self._met_phase = 0.0
         self._met_last_t = time.time()
 
         self.status = ttk.Label(root, text='Monitoring...', padding=(8, 0, 8, 6))
@@ -225,7 +221,7 @@ class CampaignGUI:
     # class only applies to breathing trials; disable it for impulse-response
     def _on_type_change(self, *_):
         impulse = self.type_var.get() == 'impulse'
-        self.class_menu.config(state='disabled' if impulse else 'normal')
+        self.class_menu.config(state='disabled' if impulse else 'readonly')
 
     # baseline stability
     def baseline_state(self, data):
@@ -263,7 +259,6 @@ class CampaignGUI:
             self.ax_temp.set_xlim(-MONITOR_WINDOW, 0)
             self.ax_temp.grid()
 
-            self.mon_fig.tight_layout()
             self.mon_canvas.draw_idle()
 
             stable = self.baseline_state(data)
@@ -280,7 +275,6 @@ class CampaignGUI:
 
         self.root.after(100, self.update_monitor) # refresh 100ms
 
-    # pacing guide (breathing pattern or impulse-response protocol)
     def update_metronome(self):
         now = time.time()
         dt = now - self._met_last_t
@@ -294,66 +288,81 @@ class CampaignGUI:
         # elapsed within the active measurement (None when idle / not measuring)
         elapsed = (now - self._measure_start) if (self.measuring and self._measure_start is not None) else None
 
-        self.met_ax.cla()
+        c = self.met_canvas
+        c.delete('all')
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 10 or h < 10:                       # not laid out yet
+            self.root.after(50, self.update_metronome)
+            return
+
+        # data coords: x in [-2, 10] s, y in [-1.25, 1.25]; map to canvas pixels
+        x_min, x_max, y_min, y_max = -2.0, 10.0, -1.25, 1.25
+        pad_l, pad_r, pad_top, pad_bot = 10, 10, 26, 20
+        plot_w, plot_h = w - pad_l - pad_r, h - pad_top - pad_bot
+        px = lambda x: pad_l + (x - x_min) / (x_max - x_min) * plot_w
+        py = lambda y: pad_top + (y_max - y) / (y_max - y_min) * plot_h
+        def curve(xs, ys, color, width=2):
+            pts = []
+            for xv, yv in zip(xs, ys):
+                pts += [px(xv), py(yv)]
+            c.create_line(*pts, fill=color, width=width, smooth=True)
+        def dot(x, y, color, r=6):
+            c.create_oval(px(x) - r, py(y) - r, px(x) + r, py(y) + r, fill=color, outline='')
+
+        title = ''
         if elapsed is not None and elapsed < BASELINE_SECONDS:
             # shared baseline hold for both measurement types
             self._met_phase = 0.0
             left = int(np.ceil(BASELINE_SECONDS - elapsed))
             cue = "exhale hard once when it turns red" if impulse else "exhale when it turns green"
             nxt = "one strong breath" if impulse else f"breathe {cls}"
-            self.met_ax.plot([-2, 10], [-1, -1], color="#e8a33d", lw=2)
-            self.met_ax.plot(0, -1, "o", color="#e8a33d", ms=12, zorder=5)
-            self.met_ax.text(0.5, 0.6, f"Baseline measurement: hold still · {left}s\n({cue})",
-                             transform=self.met_ax.transAxes, ha="center", va="center",
-                             fontsize=13, fontweight="bold", color="#b9791f")
-            self.met_ax.set_title(f"Step 1/2 · Baseline (no breathing) → then {nxt}")
+            curve([-2, 10], [-1, -1], "#e8a33d")
+            dot(0, -1, "#e8a33d")
+            c.create_text(w / 2, h / 2, justify='center', fill="#b9791f",
+                          font=('TkDefaultFont', 13, 'bold'),
+                          text=f"Baseline measurement: hold still · {left}s\n({cue})")
+            title = f"Step 1/2 · Baseline (no breathing) → then {nxt}"
         elif impulse:
             self._met_phase = 0.0
             x = np.linspace(-2.0, 10.0, 400)
             if elapsed is None:
                 # idle preview of the protocol shape: flat → spike → decay
                 y = np.where(x >= 1.0, -1 + 2 * np.exp(-(np.clip(x - 1.0, 0, None)) / 2.5), -1.0)
-                self.met_ax.plot(x, y, color="#3a7", lw=2)
-                self.met_ax.set_title("Impulse response · baseline → 1 strong breath → settle")
+                curve(x, y, "#33aa77")
+                title = "Impulse response · baseline → 1 strong breath → settle"
             elif elapsed < BASELINE_SECONDS + IMPULSE_SECONDS:
                 # the impulse window: one short, strong breath right now
                 y = np.where(x >= 0, -1 + 2 * np.exp(-np.clip(x, 0, None) / 0.6), -1.0)
-                self.met_ax.plot(x, y, color="#c33", lw=2)
-                self.met_ax.plot(0, 1.0, "o", color="#c33", ms=14, zorder=5)
-                self.met_ax.text(0.5, 0.6, "ONE SHORT, STRONG BREATH — NOW!",
-                                 transform=self.met_ax.transAxes, ha="center", va="center",
-                                 fontsize=15, fontweight="bold", color="#c33")
-                self.met_ax.set_title("Step 2/2 · Impulse — exhale hard, once")
+                curve(x, y, "#cc3333")
+                dot(0, 1.0, "#cc3333", r=7)
+                c.create_text(w / 2, h / 2, fill="#cc3333", font=('TkDefaultFont', 15, 'bold'),
+                              text="ONE SHORT, STRONG BREATH — NOW!")
+                title = "Step 2/2 · Impulse — exhale hard, once"
             else:
                 # settle: hold still, let the response decay back to baseline
                 t_set = elapsed - (BASELINE_SECONDS + IMPULSE_SECONDS)
                 y = -1 + 2 * np.exp(-np.clip(t_set + x, 0, None) / 8.0)
-                self.met_ax.plot(x, y, color="#3a7", lw=2)
-                self.met_ax.plot(0, -1 + 2 * np.exp(-t_set / 8.0), "o", color="#3a7", ms=12, zorder=5)
+                curve(x, y, "#33aa77")
+                dot(0, -1 + 2 * np.exp(-t_set / 8.0), "#33aa77")
                 left = max(0, int(np.ceil((self._measure_total or 0) - elapsed)))
-                self.met_ax.text(0.5, 0.78, f"Settling — hold still, no breathing · {left}s left",
-                                 transform=self.met_ax.transAxes, ha="center", va="center",
-                                 fontsize=13, fontweight="bold", color="#2a7")
-                self.met_ax.set_title("Step 2/2 · Settling (no breathing)")
+                c.create_text(w / 2, py(1.0), fill="#22aa77", font=('TkDefaultFont', 13, 'bold'),
+                              text=f"Settling — hold still, no breathing · {left}s left")
+                title = "Step 2/2 · Settling (no breathing)"
         else:
             # paced breathing: free-running before Start, the breathing portion after
             self._met_phase = (self._met_phase + 2 * np.pi * f * dt) % (2 * np.pi)
             x = np.linspace(-2.0, 10.0, 400)
             y = -np.cos(self._met_phase + 2 * np.pi * f * x)
             exhaling = np.sin(self._met_phase) > 0
-            self.met_ax.plot(x, y, color="#3a7", lw=2)
-            self.met_ax.plot(0, -np.cos(self._met_phase), "o", color="#c33", ms=12, zorder=5)
+            curve(x, y, "#33aa77")
+            dot(0, -np.cos(self._met_phase), "#cc3333")
             phase_txt = "EXHALE ▲" if exhaling else "INHALE ▼"
             step = "Step 2/2 · " if self.measuring else ""
-            self.met_ax.set_title(f"{step}{cls.capitalize()} · {bpm}/min · {phase_txt}")
+            title = f"{step}{cls.capitalize()} · {bpm}/min · {phase_txt}"
 
-        self.met_ax.axvline(0, color="0.4", lw=1)
-        self.met_ax.set_xlim(-2, 10)
-        self.met_ax.set_ylim(-1.25, 1.25)
-        self.met_ax.set_yticks([])
-        self.met_ax.set_xlabel("seconds")
-        self.met_fig.tight_layout()
-        self.met_canvas.draw_idle()
+        c.create_line(px(0), pad_top, px(0), h - pad_bot, fill="#666666", width=1)  # x=0
+        c.create_text(w / 2, 13, text=title, font=('TkDefaultFont', 12, 'bold'))
+        c.create_text(w - pad_r, h - 9, text="seconds", anchor='e', font=('TkDefaultFont', 9))
 
         self.root.after(50, self.update_metronome)
 
