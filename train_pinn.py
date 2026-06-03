@@ -1,6 +1,6 @@
 import argparse
 import os
-import json
+import csv
 import math
 
 import numpy as np
@@ -102,7 +102,7 @@ def parse_args():
     p.add_argument("--embed_dim", type=int, default=8)
     p.add_argument("--part_embed_dim", type=int, default=8)
     p.add_argument("--num_epochs", type=int, default=500)
-    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--batch_size", type=int, default=32)   # match core/train.py
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--beta_max", type=float, default=0.1)
     p.add_argument("--tau_s", type=float, default=15.0)
@@ -155,27 +155,32 @@ if __name__ == "__main__":
                                 part_embed_dim=args.part_embed_dim)
     model = model.to(device)
     optimizer = Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)  # match core/train.py
 
     history = {f"{split}_{k}": [] for split in ("train", "val") for k in METRIC_KEYS}
     history["beta"] = []
 
-    best_val_recon = math.inf
+    best_val_loss = math.inf
     best_epoch = -1
 
-    pbar = tqdm(range(args.num_epochs), desc="[TRAIN] PINN", unit="epoch")
+    pbar = tqdm(range(1, args.num_epochs + 1), desc="[TRAIN] PINN", unit="epoch")
     for epoch in pbar:
         beta = beta_capped(epoch, args.num_epochs // 2, args.beta_max)
 
         train_metrics = train_one_epoch(model, train_loader, optimizer, beta=beta, lambda_phys=args.lambda_phys, device=device)
         val_metrics = evaluate(model, val_loader, beta=beta, lambda_phys=args.lambda_phys, device=device)
+        scheduler.step()
 
         for k in METRIC_KEYS:
             history[f"train_{k}"].append(train_metrics[k])
             history[f"val_{k}"].append(val_metrics[k])
         history["beta"].append(beta)
 
-        if val_metrics["recon"] < best_val_recon and beta >= args.beta_max:
-            best_val_recon = val_metrics["recon"]
+        # model selection on the ELBO (recon + beta*KL), excluding the physics penalty:
+        # same criterion as core/train.py's CVAE, and comparable across the lambda_phys sweep.
+        val_loss = val_metrics["recon"] + beta * val_metrics["kl"]
+        if val_loss < best_val_loss and beta >= args.beta_max:
+            best_val_loss = val_loss
             best_epoch = epoch
             torch.save({"model_state": model.state_dict(),
                         "stats": train_ds.stats,
@@ -197,8 +202,14 @@ if __name__ == "__main__":
                         ph=f"{val_metrics["phys"]:.4f}",
                         u=f"{train_metrics["u_norm"]:.3f}")
 
-    print(f"[TRAIN] Best validation recon: {best_val_recon:.4f} at epoch {best_epoch}.")
+    print(f"[TRAIN] Best validation ELBO (recon+beta*KL): {best_val_loss:.4f} at epoch {best_epoch}.")
 
-    history_path = f"results/pinn/{run_id}_history.json"
-    with open(history_path, "w") as f:
-        json.dump({"history": history, "best_epoch": best_epoch, "best_val_recon": best_val_recon}, f)
+    # persist per-epoch training history as CSV (matches core/train.py's history format)
+    history_path = f"results/pinn/{run_id}_train_history.csv"
+    keys = list(history.keys())
+    with open(history_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["epoch"] + keys)
+        writer.writeheader()
+        for i in range(len(history["beta"])):
+            writer.writerow({"epoch": i + 1, **{k: history[k][i] for k in keys}})
+    print(f"[TRAIN] History saved to {history_path}\n[TRAIN] Checkpoint saved to {ckpt_path}")
