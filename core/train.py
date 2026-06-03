@@ -25,8 +25,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--epochs', type=int, default=500)
     p.add_argument('--batch_size', type=int, default=32)
     # model-specific
-    p.add_argument('--latent_dim', type=int, default=32)
-    p.add_argument('--embed_dim', type=int, default=16)
+    p.add_argument('--latent_dim', type=int, default=16)   # ablation default
+    p.add_argument('--embed_dim', type=int, default=8)     # ablation default
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--free_bits', type=float, default=0.0)
     p.add_argument('--lr', type=float, default=1e-3)
@@ -112,15 +112,11 @@ def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_pa
 # main loop
 def main():
     args = parse_args()
-    # warmup defaults to half of total epochs (matches the ablations); an explicit
-    # --beta_warmup_epochs (e.g. from core/tuning.py) still overrides this.
     if args.beta_warmup_epochs is None:
         args.beta_warmup_epochs = args.epochs // 2
     device = torch.device('cpu')
     print(f'[TRAIN] init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold}/{args.n_folds} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
 
-    # paths. run_id mirrors core/tstr.py exactly so the checkpoint is findable
-    # downstream: ..._s{init_seed}_<model-specific>_f{fold}[_a{alpha}_n{n_copies}].
     os.makedirs(f'results/{args.model}', exist_ok=True)
     if args.model == 'vae':
         run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_fb{args.free_bits}'
@@ -134,16 +130,14 @@ def main():
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
     history_path = f'results/{args.model}/{run_id}_train_history.csv'
 
-    # reproducibility. init_seed drives torch / numpy / DataLoader stochasticity;
-    # split_seed only feeds the dataset partition (next step).
+    # reproducibility
     seed_everything(args.init_seed)
     g = make_generator(args.init_seed)
 
-    # dataset. kfold_split_dataset is keyed by (fold, n_folds, split_seed) and
-    # must produce the same partition as core/tstr.py for the same arguments.
+    # dataset
     df = load_dataset(args.dataset_dir)
     df = df[df['region'] == args.region].reset_index(drop=True)
-    # args.fold is 1-indexed; kfold_split_dataset takes 0-indexed.
+    # args.fold is 1-indexed
     df_train, df_val, _ = kfold_split_dataset(df, fold=args.fold - 1, n_folds=args.n_folds, split_seed=args.split_seed)
     train_ds = BreathDataset(df_train, alpha=args.alpha, n_copies=args.n_copies)
     train_ds_clean = BreathDataset(df_train, stats=train_ds.stats) if args.alpha > 0 else train_ds

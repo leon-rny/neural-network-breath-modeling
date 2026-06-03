@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
     p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'pinn'])
-    p.add_argument('--region', required=True, choices=['mouth', 'nose'])
+    p.add_argument('--region', choices=['mouth', 'nose'], default=None) # required except in --aggregate
     p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
     p.add_argument('--channel', choices=['humidity', 'temperature', 'both'], default='both')
     p.add_argument('--n_synthetic', type=int, default=None)
@@ -45,13 +45,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--n_folds', type=int, default=5)
     # model-specific
     p.add_argument('--free_bits', type=float, default=0.0)
-    p.add_argument('--latent_dim', type=int, default=32)
-    p.add_argument('--embed_dim', type=int, default=16)
+    p.add_argument('--latent_dim', type=int, default=16)
+    p.add_argument('--embed_dim', type=int, default=8)
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--lambda_phys', type=float, default=1.0)
-    # jittering augmentation (mirrors core/train.py for checkpoint resolution)
+    # jittering augmentation
     p.add_argument('--alpha', type=float, default=0.0)
     p.add_argument('--n_copies', type=int, default=1)
+    # validation-split sanity eval
+    p.add_argument('--eval_val', action='store_true')
+    # aggregate mode
+    p.add_argument('--aggregate', action='store_true')
+    p.add_argument('--regions', default=None)
+    p.add_argument('--init_seeds', default=None)
+    p.add_argument('--folds', default=None)
     return p.parse_args()
 
 # utils
@@ -176,6 +183,16 @@ def save_summary(result: dict) -> None:
                'n_synthetic': result.get('n_synthetic', result['n_train_real']),
                'n_train_real': result.get('n_train_real'),
                'augmentation_ratio': result.get('augmentation_ratio')}
+    # validation-split
+    mv = result.get('metrics_val')
+    if mv is not None:
+        new_row.update({'val_accuracy': mv['accuracy'],
+                        'val_f1_weighted': mv['f1_weighted'],
+                        'val_roc_auc_ovr': mv['roc_auc_ovr'],
+                        'val_log_loss': mv['log_loss'],
+                        'val_f1_bradypnea': mv['per_class_f1']['bradypnea'],
+                        'val_f1_eupnea': mv['per_class_f1']['eupnea'],
+                        'val_f1_tachypnea': mv['per_class_f1']['tachypnea']})
     df_row = pd.DataFrame([new_row])
     if os.path.exists(csv_path):
         df_old = pd.read_csv(csv_path)
@@ -210,7 +227,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
     # load dataset
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
-    # fold is 1-indexed at the API boundary; kfold_split_dataset takes 0-indexed.
+    # fold is 1-indexed
     df_train, df_val, df_test = kfold_split_dataset(df, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
     stats = BreathDataset(df_train).stats
 
@@ -350,8 +367,6 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
         signals_phys = np.concatenate(all_signals, axis=0)
         labels = np.concatenate(all_labels,  axis=0)
     elif model_name == 'pinn':
-        # PhysicsInformedDataset normalises humidity by h_scale (not z-score)
-        # and temperature by z-score; undo each channel separately
         h_scale = float(stats['h_scale'])
         t_mean  = float(stats['mean'][1])
         t_std   = float(stats['std'][1])
@@ -369,7 +384,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
 
     return signals_phys, labels
 
-def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1) -> dict:
+def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 16, embed_dim: int = 8, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, eval_val: bool = False, dataset_dir: str = 'dataset', n_folds: int = 5) -> dict:
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
@@ -391,9 +406,20 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     stacker_tstr = train_stacking_classifier(X_synth_top, synth_labels, init_seed, n_jobs=n_jobs)
     tstr_metrics = evaluate_classifier(stacker_tstr, cache['X_test_top'], cache['y_test'])
 
-    # feature overlap. After the SMOTE-leakage fix the base estimator is an
-    # ImbPipeline([(smote, ...), (clf, XGBClassifier)]); SHAP's TreeExplainer
-    # doesn't unwrap pipelines, so reach in for the underlying tree model.
+    # validation-split sanity eval
+    metrics_val = None
+    if eval_val:
+        df_val = load_dataset(dataset_dir)
+        df_val = df_val[df_val['region'] == region].reset_index(drop=True)
+        _, df_val, _ = kfold_split_dataset(df_val, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
+        df_long_val, y_val = df_to_df_long(df_val)
+        X_val_raw = extract_fixed_features(df_long_val, cache['top_20_features_raw'], n_jobs)
+        X_val_san = X_val_raw.copy()
+        X_val_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_val_san.columns]
+        X_val_top = X_val_san[cache['top_20_features_sanitized']].values
+        metrics_val = evaluate_classifier(stacker_tstr, X_val_top, y_val.values)
+        print(f"[TSTR] val-split sanity: acc={metrics_val['accuracy']:.3f} f1={metrics_val['f1_weighted']:.3f} (test acc={tstr_metrics['accuracy']:.3f})")
+
     xgb_base = stacker_tstr.estimators_[0]
     xgb_clf = xgb_base.named_steps['clf'] if hasattr(xgb_base, 'named_steps') else xgb_base
     explainer = shap.TreeExplainer(xgb_clf)
@@ -426,6 +452,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
             'n_synthetic': n_synthetic,
             'top_20_features': cache['top_20_features_sanitized'],
             'metrics': tstr_metrics,
+            'metrics_val': metrics_val,
             'feature_overlap': overlap,
             'top_20_synth_features': top_k_synth,
             'trtr_metrics': cache['trtr_metrics']}
@@ -479,30 +506,54 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
             'top_20_synth_features': None,
             'trtr_metrics': cache['trtr_metrics']}
 
+def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0) -> str:
+    base_model = model.removesuffix('_plus')
+    if base_model == 'vae':
+        run_id = f'{region}_s{init_seed}_ld{latent_dim}_fb{free_bits}'
+    elif base_model == 'cvae':
+        run_id = f'{region}_s{init_seed}_ld{latent_dim}_ed{embed_dim}_fb{free_bits}'
+    elif base_model == 'cvae_part':
+        run_id = f'{region}_s{init_seed}_ld{latent_dim}_ed{embed_dim}_pd{part_embed_dim}_fb{free_bits}'
+    elif base_model == 'pinn':
+        run_id = f'{region}_s{init_seed}_ld{latent_dim}_ed{embed_dim}_phys{lambda_phys}'
+    else:
+        run_id = f'{region}_s{init_seed}'
+    run_id += f'_f{fold}'
+    if alpha > 0 and n_copies > 1:
+        run_id += f'_a{alpha}_n{n_copies}'
+    if channel != 'both':
+        run_id += f'_ch{channel}'
+    return run_id
+
 # main
 def main():
     args = parse_args()
     device = torch.device('cpu')
 
-    # run_id for paths. Encodes init_seed and fold (the things that vary across
-    # paired comparisons). split_seed and n_folds are protocol-level constants
-    # and intentionally omitted.
-    base_model = args.model.removesuffix('_plus')
-    if base_model == 'vae':
-        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_fb{args.free_bits}'
-    elif base_model == 'cvae':
-        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
-    elif base_model == 'cvae_part':
-        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
-    elif base_model == 'pinn':
-        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_phys{args.lambda_phys}'
-    else:
-        run_id = f'{args.region}_s{args.init_seed}'
-    run_id += f'_f{args.fold}'
-    if args.alpha > 0 and args.n_copies > 1:
-        run_id += f'_a{args.alpha}_n{args.n_copies}'
-    if args.channel != 'both':
-        run_id += f'_ch{args.channel}'
+    # aggregate mode
+    if args.aggregate:
+        regions = args.regions.split(',') if args.regions else [args.region]
+        init_seeds = [int(s) for s in args.init_seeds.split(',')] if args.init_seeds else [args.init_seed]
+        folds = [int(s) for s in args.folds.split(',')] if args.folds else [args.fold]
+        n_rows = 0
+        for region in regions:
+            for init_seed in init_seeds:
+                for fold in folds:
+                    rid = build_run_id(args.model, region, init_seed, fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys)
+                    path = f'results/{args.model}/{rid}_tstr.json'
+                    if not os.path.exists(path):
+                        print(f'  [AGGREGATE] missing {path}, skipping')
+                        continue
+                    with open(path) as f:
+                        save_summary(json.load(f))
+                    n_rows += 1
+        print(f'[AGGREGATE] merged {n_rows} rows into results/summary.csv')
+        return
+
+    if args.region is None:
+        raise SystemExit('[TSTR] --region is required (except with --aggregate)')
+
+    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys)
 
     # reproducibility
     seed_everything(args.init_seed)
@@ -553,7 +604,7 @@ def main():
             save_summary(result)
     else:
         n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
-        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies)
+        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, eval_val=args.eval_val, dataset_dir=args.dataset_dir, n_folds=args.n_folds)
         save_result(result, args.model, run_id)
         if not args.no_summary:
             save_summary(result)
