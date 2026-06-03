@@ -32,8 +32,8 @@ _PIPELINES = ("replication", "shap_fix", "lgbm_fix", "tsfresh_fix", "smote_fix")
 # cli
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TRTR pipeline ablation")
-    p.add_argument("--region", required=True, choices=["mouth", "nose"])
-    p.add_argument("--pipeline", required=True, choices=list(_PIPELINES), help="Which cumulative pipeline variant to run")
+    p.add_argument("--region", choices=["mouth", "nose"], default=None)  # required except in --aggregate
+    p.add_argument("--pipeline", choices=list(_PIPELINES), default=None, help="Which cumulative pipeline variant to run (required except in --aggregate)")
     p.add_argument("--init_seed", type=int, default=42, help="Classifier-internal randomness; varies across runs.")
     p.add_argument("--split_seed", type=int, default=42, help="Outer/inner data partition; fixed for paired comparisons.")
     p.add_argument("--fold", type=int, default=1, help="1-indexed fold in [1, n_folds].")
@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_jobs", type=int, default=4)
     p.add_argument("--force_rebuild", action="store_true")
     p.add_argument("--no_summary", action="store_true", help="Skip writing to summary.csv. Use during parallel runs to avoid races; a sequential pass can then aggregate.")
+    p.add_argument("--aggregate", action="store_true", help="Merge all results/ablation_trtr/*_trtr.json into results/ablation_trtr/summary.csv and exit.")
     return p.parse_args()
 
 # utils
@@ -321,6 +322,19 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
 # main
 def main():
     args = parse_args()
+
+    # aggregate mode
+    if args.aggregate:
+        import glob
+        paths = sorted(glob.glob("results/ablation_trtr/*_trtr.json"))
+        for path in paths:
+            with open(path) as f:
+                save_summary(json.load(f))
+        print(f"[TRTR-ABLATION] aggregated {len(paths)} results into results/ablation_trtr/summary.csv")
+        return
+    if args.region is None or args.pipeline is None:
+        raise SystemExit("[TRTR-ABLATION] --region and --pipeline are required (except with --aggregate)")
+
     np.random.seed(args.init_seed)
 
     split_tag = _split_tag(args.single_split, args.fold, args.n_folds)
