@@ -1,21 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=cvae_dyn_warm
+#SBATCH --job-name=cvae_dyn_beta
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=4G
 #SBATCH --time=12:00:00
-#SBATCH --output=/home/rane10/logs/cvae_dyn_warm.o%A_%a
-#SBATCH --error=/home/rane10/logs/cvae_dyn_warm.e%A_%a
-#SBATCH --array=0-149%50
+#SBATCH --output=/home/rane10/logs/cvae_dyn_beta.o%A_%a
+#SBATCH --error=/home/rane10/logs/cvae_dyn_beta.e%A_%a
+#SBATCH --array=0-349%50
 set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# 3 configs x 2 regions x 5 seeds x 5 folds = 150 runs
+# 7 configs x 2 regions x 5 seeds x 5 folds = 350 runs
 VARIANT=conv_baseline
-CONFIGS=(beta_cap_1.0 warmup_0.25 warmup_0.75)
+CONFIGS=(beta_cap_0.001 beta_cap_0.01 beta_cap_0.03 beta_cap_0.05 beta_cap_0.1 beta_cap_0.5 beta_cap_1.0)
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
 FOLDS=(1 2 3 4 5)
@@ -37,7 +37,7 @@ export NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
   echo "[DYNAMICS] aggregate-only: building summary.csv"
-  python -m ablations.cvae_ablation --mode dynamics --aggregate \
+  python -m ablations.cvae --mode dynamics --aggregate \
     --variant "$VARIANT" \
     --configs "$(IFS=, ; echo "${CONFIGS[*]}")" \
     --regions "$(IFS=, ; echo "${REGIONS[*]}")" \
@@ -47,7 +47,7 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
   exit 0
 fi
 
-IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..149> for a local run}}
+IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..349> for a local run}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
 SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ));  IDX=$(( IDX / N_REGIONS ))
@@ -65,7 +65,7 @@ if [ ! -f "$CACHE" ]; then
   echo "[DYNAMICS] WARNING: TRTR cache missing ($CACHE); this task will build it (possible parallel race)."
 fi
 
-PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae_ablation --mode dynamics \
+PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae --mode dynamics \
   --variant "$VARIANT" \
   --config "$CONFIG" \
   --region "$REGION" \
@@ -78,4 +78,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae_ablation --mode dynamics \
   --skip_existing \
   --no_summary
 
-# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/ablations_cvae_2_dynamics_warmup.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/ablations_cvae_2_dynamics_beta.sh

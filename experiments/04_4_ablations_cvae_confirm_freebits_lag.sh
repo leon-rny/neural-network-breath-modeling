@@ -1,21 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=cvae_dyn_lag
+#SBATCH --job-name=cvae_confirm_fb_lag
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=4G
 #SBATCH --time=12:00:00
-#SBATCH --output=/home/rane10/logs/cvae_dyn_lag.o%A_%a
-#SBATCH --error=/home/rane10/logs/cvae_dyn_lag.e%A_%a
-#SBATCH --array=0-249%50
+#SBATCH --output=/home/rane10/logs/cvae_confirm_fb_lag.o%A_%a
+#SBATCH --error=/home/rane10/logs/cvae_confirm_fb_lag.e%A_%a
+#SBATCH --array=0-299%50
 set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# 5 configs x 2 regions x 5 seeds x 5 folds = 250 runs
+# 6 configs x 2 regions x 5 seeds x 5 folds = 300 runs
 VARIANT=conv_baseline
-CONFIGS=(beta_cap_1.0 lag_5_100 lag_5_250 lag_10_100 lag_10_250)
+BETA_MAX=0.01
+CONFIGS=(fb0_off fb0.1_off fb0.5_off fb0_lag5_250 fb0.1_lag5_250 fb0.5_lag5_250)
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
 FOLDS=(1 2 3 4 5)
@@ -37,8 +38,9 @@ export NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
   echo "[DYNAMICS] aggregate-only: building summary.csv"
-  python -m ablations.cvae_ablation --mode dynamics --aggregate \
+  python -m ablations.cvae --mode dynamics --aggregate \
     --variant "$VARIANT" \
+    --beta_max "$BETA_MAX" \
     --configs "$(IFS=, ; echo "${CONFIGS[*]}")" \
     --regions "$(IFS=, ; echo "${REGIONS[*]}")" \
     --init_seeds "$(IFS=, ; echo "${INIT_SEEDS[*]}")" \
@@ -47,7 +49,7 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
   exit 0
 fi
 
-IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..249> for a local run}}
+IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..299> for a local run}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
 SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ));  IDX=$(( IDX / N_REGIONS ))
@@ -58,15 +60,16 @@ REGION=${REGIONS[$REGION_IDX]}
 INIT_SEED=${INIT_SEEDS[$SEED_IDX]}
 FOLD=${FOLDS[$FOLD_IDX]}
 
-echo "[DYNAMICS] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} variant=$VARIANT config=$CONFIG region=$REGION init_seed=$INIT_SEED fold=$FOLD"
+echo "[DYNAMICS] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} variant=$VARIANT beta_max=$BETA_MAX config=$CONFIG region=$REGION init_seed=$INIT_SEED fold=$FOLD"
 
 CACHE="results/trtr/${REGION}_is${INIT_SEED}_ss${SPLIT_SEED}_fold${FOLD}of${N_FOLDS}_checkpoint.pkl"
 if [ ! -f "$CACHE" ]; then
   echo "[DYNAMICS] WARNING: TRTR cache missing ($CACHE); this task will build it (possible parallel race)."
 fi
 
-PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae_ablation --mode dynamics \
+PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae --mode dynamics \
   --variant "$VARIANT" \
+  --beta_max "$BETA_MAX" \
   --config "$CONFIG" \
   --region "$REGION" \
   --init_seed "$INIT_SEED" \
@@ -78,4 +81,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae_ablation --mode dynamics \
   --skip_existing \
   --no_summary
 
-# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/ablations_cvae_2_dynamics_lag.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/ablations_cvae_4_confirm_freebits_lag.sh
