@@ -2,19 +2,22 @@ import argparse
 import csv
 import os
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from core.data import BreathDataset, load_dataset, kfold_split_dataset
+from core.data import BreathDataset, PhysicsInformedDataset, load_dataset, kfold_split_dataset
 from core.utils import seed_everything, seed_worker, make_generator
 from models.vae import VAE, CVAE, elbo_loss
+from models.pinn import PhysicsInformedCVAE
 
 # cli arguments
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part'])
+    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part', 'pinn'])
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--log_every', type=int, default=25)
@@ -32,6 +35,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--beta_max', type=float, default=0.1)
     p.add_argument('--beta_warmup_epochs', type=int, default=None, help='Epochs to linearly warm beta 0->beta_max. Defaults to epochs // 2 (matches the ablations).')
+    # pinn-specific (ignored by vae/cvae/cvae_part)
+    p.add_argument('--lambda_phys', type=float, default=0.0, help='Weight of the physics-consistency penalty (pinn only).')
+    p.add_argument('--tau_s', type=float, default=15.0, help='Sensor time constant for the CIR convolution (pinn only).')
+    p.add_argument('--learn_cir_params', action='store_true', help='Learn per-sample CIR params from z (pinn only).')
     # jittering augmentation (training only; defaults = off)
     p.add_argument('--alpha', type=float, default=0.0)
     p.add_argument('--n_copies', type=int, default=1)
@@ -109,6 +116,65 @@ def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_pa
     kl_per_dim = -0.5 * (1 + logvars - mus.pow(2) - logvars.exp()).mean(dim=0)
     return int((kl_per_dim > threshold).sum().item())
 
+# pinn training
+PINN_DIAG_KEYS = ('u_norm', 'logA_mean', 'logA_std', 'logD_mean', 'logD_std', 'logv_mean', 'logv_std')
+
+def pinn_diag_stats(u_post_softplus, cir_params):
+    log_A, log_D, log_v = cir_params
+    return {'u_norm': u_post_softplus.norm(dim=1).mean().item(),
+            'logA_mean': log_A.mean().item(), 'logA_std': log_A.std().item(),
+            'logD_mean': log_D.mean().item(), 'logD_std': log_D.std().item(),
+            'logv_mean': log_v.mean().item(), 'logv_std': log_v.std().item()}
+
+def train_pinn_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, lambda_phys, beta_max=0.1):
+    model.train()
+    beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
+    totals = {k: 0.0 for k in ('total', 'recon', 'kl', 'phys') + PINN_DIAG_KEYS}
+    for signal, _time, label, participant, _onset in loader:
+        signal = signal.to(device)
+        label = label.long().to(device)
+        participant = participant.long().to(device)
+        x_hat, mu, logvar, u_post_softplus, cir_params, humidity_phys = model(signal, label, participant)
+        elbo, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
+        phys = F.mse_loss(humidity_phys, x_hat[:, 0, :])
+        loss = elbo + lambda_phys * phys
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            diag = pinn_diag_stats(u_post_softplus, cir_params)
+        totals['total'] += loss.item()
+        totals['recon'] += recon.item()
+        totals['kl'] += kl.item()
+        totals['phys'] += phys.item()
+        for k in PINN_DIAG_KEYS:
+            totals[k] += diag[k]
+    n = len(loader)
+    return {k: v / n for k, v in totals.items()}
+
+@torch.no_grad()
+def evaluate_pinn(model, loader, epoch, warmup_epochs, device, free_bits, lambda_phys, beta_max=0.1):
+    model.eval()
+    beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
+    totals = {k: 0.0 for k in ('total', 'recon', 'kl', 'phys') + PINN_DIAG_KEYS}
+    for signal, _time, label, participant, _onset in loader:
+        signal = signal.to(device)
+        label = label.long().to(device)
+        participant = participant.long().to(device)
+        x_hat, mu, logvar, u_post_softplus, cir_params, humidity_phys = model(signal, label, participant)
+        elbo, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
+        phys = F.mse_loss(humidity_phys, x_hat[:, 0, :])
+        loss = elbo + lambda_phys * phys
+        diag = pinn_diag_stats(u_post_softplus, cir_params)
+        totals['total'] += loss.item()
+        totals['recon'] += recon.item()
+        totals['kl'] += kl.item()
+        totals['phys'] += phys.item()
+        for k in PINN_DIAG_KEYS:
+            totals[k] += diag[k]
+    n = len(loader)
+    return {k: v / n for k, v in totals.items()}
+
 # main loop
 def main():
     args = parse_args()
@@ -124,6 +190,8 @@ def main():
         run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_fb{args.free_bits}'
     elif args.model == 'cvae_part':
         run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
+    elif args.model == 'pinn':
+        run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_phys{args.lambda_phys}'
     run_id += f'_f{args.fold}'
     if args.alpha > 0 and args.n_copies > 1:
         run_id += f'_a{args.alpha}_n{args.n_copies}'
@@ -139,9 +207,10 @@ def main():
     df = df[df['region'] == args.region].reset_index(drop=True)
     # args.fold is 1-indexed
     df_train, df_val, _ = kfold_split_dataset(df, fold=args.fold - 1, n_folds=args.n_folds, split_seed=args.split_seed)
-    train_ds = BreathDataset(df_train, alpha=args.alpha, n_copies=args.n_copies)
-    train_ds_clean = BreathDataset(df_train, stats=train_ds.stats) if args.alpha > 0 else train_ds
-    val_ds = BreathDataset(df_val, stats=train_ds.stats)
+    DatasetCls = PhysicsInformedDataset if args.model == 'pinn' else BreathDataset
+    train_ds = DatasetCls(df_train, alpha=args.alpha, n_copies=args.n_copies)
+    train_ds_clean = DatasetCls(df_train, stats=train_ds.stats) if args.alpha > 0 else train_ds
+    val_ds = DatasetCls(df_val, stats=train_ds.stats)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     if args.alpha > 0 and args.n_copies > 1:
@@ -190,6 +259,48 @@ def main():
                                    'train': f'{train_loss:.4f}',
                                    'val': f'{val_loss:.4f}',
                                    'active': n_active})
+
+    # pinn branch
+    elif args.model == 'pinn':
+        params_cir = np.load(f'results/pinn/params_{args.region}.npy')
+        t_grid = np.arange(36) * 2.0
+        model = PhysicsInformedCVAE(cir_params_init=params_cir, t_grid=t_grid, tau_s=args.tau_s,
+                                    learn_cir_params=args.learn_cir_params, latent_dim=args.latent_dim,
+                                    num_classes=3, embed_dim=args.embed_dim, condition_on_participant=True,
+                                    num_participants=3, part_embed_dim=args.part_embed_dim).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+        best_val_loss = torch.inf
+        history = []
+
+        epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
+        for epoch in epoch_bar:
+            train_m = train_pinn_one_epoch(model, train_loader, optimizer, epoch, args.beta_warmup_epochs, device, args.free_bits, args.lambda_phys, beta_max=args.beta_max)
+            val_m = evaluate_pinn(model, val_loader, epoch, args.beta_warmup_epochs, device, args.free_bits, args.lambda_phys, beta_max=args.beta_max)
+            scheduler.step()
+
+            beta = beta_capped(epoch, args.beta_warmup_epochs, beta_max=args.beta_max)
+            # select on the ELBO (recon + beta*KL), excluding the physics penalty — comparable across the lambda_phys sweep and to the CVAE
+            val_elbo = val_m['recon'] + beta * val_m['kl']
+            if val_elbo < best_val_loss and beta >= args.beta_max:
+                best_val_loss = val_elbo
+                torch.save({'epoch': epoch, 'model_state': model.state_dict(),
+                            'stats': train_ds.stats, 'latent_dim': args.latent_dim,
+                            'embed_dim': args.embed_dim, 'part_embed_dim': args.part_embed_dim,
+                            'region': args.region, 'cir_params': params_cir, 't_grid': t_grid,
+                            'tau_s': args.tau_s, 'learn_cir_params': args.learn_cir_params,
+                            'condition_on_participant': True, 'num_participants': 3}, ckpt_path)
+
+            history.append({'epoch': epoch, 'beta': beta,
+                            **{f'train_{k}': train_m[k] for k in ('total', 'recon', 'kl', 'phys')},
+                            **{f'val_{k}': val_m[k] for k in ('total', 'recon', 'kl', 'phys')},
+                            **{k: train_m[k] for k in PINN_DIAG_KEYS}})
+            epoch_bar.set_postfix({'beta': f'{beta:.2f}',
+                                   'tr': f'{train_m["recon"]:.4f}',
+                                   'vr': f'{val_m["recon"]:.4f}',
+                                   'kl': f'{val_m["kl"]:.4f}',
+                                   'ph': f'{val_m["phys"]:.4f}'})
 
     # save training history
     with open(history_path, 'w', newline='') as f:

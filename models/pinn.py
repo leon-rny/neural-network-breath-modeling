@@ -74,6 +74,9 @@ class PhysicsInformedCVAE(CVAE):
     def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03,
                  baseline_samples: int = 5, learn_cir_params: bool = True, **cvae_kwargs):
         super().__init__(**cvae_kwargs)
+        # snapshot the RNG state the plain CVAE would leave, so the physics heads below
+        # don't shift the reparameterize noise stream (restored at the end of __init__).
+        rng_state = torch.get_rng_state()
         self.cir_conv = CIRConvolution(t_grid, tau_s=tau_s, d0=d0, baseline_samples=baseline_samples)
         T = len(t_grid)
         self.learn_cir_params = learn_cir_params
@@ -99,6 +102,9 @@ class PhysicsInformedCVAE(CVAE):
             self.register_buffer("log_A_fixed", torch.tensor(log_A_init, dtype=torch.float32))
             self.register_buffer("log_D_fixed", torch.tensor(log_D_init, dtype=torch.float32))
             self.register_buffer("log_v_fixed", torch.tensor(log_v_init, dtype=torch.float32))
+
+        # restore so the global RNG state
+        torch.set_rng_state(rng_state)
 
     def _cir_params(self, z):
         if self.learn_cir_params:

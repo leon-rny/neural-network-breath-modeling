@@ -127,7 +127,7 @@ class BreathDataset(Dataset):
         participant = PARTICIPANT_TO_IDX[r['participant']]
 
         return signal, time, label, participant
-    
+
 class PhysicsInformedDataset(Dataset):
     def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None,
                  alpha: float = 0.0, n_copies: int = 1) -> None:

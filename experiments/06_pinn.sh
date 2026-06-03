@@ -82,13 +82,13 @@ CKPT="results/pinn/${RUN_ID}_checkpoint.pt"
 if [ -f "$CKPT" ]; then
   echo "[PINN] checkpoint exists, skipping training: $CKPT"
 else
-  PYTHONHASHSEED="$INIT_SEED" python train_pinn.py \
-    --region "$REGION" \
+  PYTHONHASHSEED="$INIT_SEED" python -m core.train \
+    --model pinn --region "$REGION" \
     --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" \
     --fold "$FOLD" --n_folds "$N_FOLDS" \
     --lambda_phys "$LAMBDA_PHYS_VAL" \
     --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --part_embed_dim "$PART_EMBED_DIM" \
-    --num_epochs "$EPOCHS" \
+    --epochs "$EPOCHS" \
     --beta_max "$BETA_MAX" --alpha "$ALPHA" --n_copies "$N_COPIES"
 fi
 
