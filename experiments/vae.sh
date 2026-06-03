@@ -46,6 +46,7 @@ else
       --model vae --region "$region" \
       --init_seed "$init_seed" --split_seed "$SPLIT_SEED" \
       --fold "$fold" --n_folds "$N_FOLDS" \
+      --latent_dim 32 \
       --free_bits "$fb"
   ' _ {}
   train_status=$?
@@ -61,6 +62,7 @@ for combo in "${COMBOS[@]}"; do
     --model vae --region "$region" \
     --init_seed "$init_seed" --split_seed "$SPLIT_SEED" \
     --fold "$fold" --n_folds "$N_FOLDS" \
+    --latent_dim 32 \
     --free_bits "$fb"
 done
 
