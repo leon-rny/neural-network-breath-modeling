@@ -13,7 +13,7 @@ set -euo pipefail
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# [0..249] k-fold: 5 pipelines x 2 regions x 5 seeds x 5 folds          = 250
+# [0..249] k-fold: 5 pipelines x 2 regions x 5 seeds x 5 folds = 250
 # [250..259] legacy: replication pipeline, single 80/10/10 split, 2 reg x 5 seeds = 10
 
 PIPELINES=(replication shap_fix lgbm_fix tsfresh_fix smote_fix)

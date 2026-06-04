@@ -273,7 +273,7 @@ def load_trtr_features():
     return feature_counts
 
 def plot_trtr_ablation():
-    df = pd.read_csv("results/ablation_trtr/summary.csv")
+    df = pd.read_csv("results/ablation_trtr.csv")
     if "single_split" not in df.columns:
         df["single_split"] = False
     df["single_split"] = df["single_split"].fillna(False).astype(bool)
