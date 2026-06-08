@@ -20,10 +20,16 @@ from sklearn.ensemble import RandomForestClassifier, StackingClassifier
 from sklearn.metrics import accuracy_score, classification_report, f1_score, log_loss, roc_auc_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 
-from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, kfold_split_dataset
+from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, get_split, loso_path_tag
 from core.utils import seed_everything
 from models.vae import CVAE, VAE
 from models.pinn import PhysicsInformedCVAE
+
+def _cv_marker(cv_mode: str) -> str:
+    return '' if cv_mode == 'kfold' else f'_{cv_mode}'
+
+def _drop_marker(part_dropout: float) -> str:
+    return '' if part_dropout == 0.0 else f'_drop{part_dropout}'
 
 # cli
 def parse_args() -> argparse.Namespace:
@@ -41,8 +47,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--no_summary', action='store_true', help='Skip writing to results/summary.csv. Use during parallel runs to avoid races; a sequential pass can then aggregate.')
     p.add_argument('--init_seed', type=int, default=42) # varies across experiments to characterize sensitivity
     p.add_argument('--split_seed', type=int, default=42) # always fixed!
-    p.add_argument('--fold', type=int, default=1, help='1-indexed fold in [1, n_folds].')
+    p.add_argument('--fold', type=int, default=1, help='1-indexed fold in [1, n_folds] (kfold) or [1, n_subjects] (loso).')
     p.add_argument('--n_folds', type=int, default=5)
+    p.add_argument('--cv_mode', choices=['kfold', 'loso'], default='kfold', help='kfold: split by trial; loso: leave-one-subject-out (generates from the null token).')
+    p.add_argument('--part_dropout', type=float, default=0.0, help='Must match the trained checkpoint (only affects run_id/path lookup here).')
+    p.add_argument('--loso_trial_val', action='store_true', help='Nested-LOSO: trial-level early-stop val + subject excludes (loso_split_final). Used by the part-4 orchestration.')
+    p.add_argument('--loso_exclude', default='', help='Nested-LOSO: comma-separated 1-indexed subject folds to drop from the training pool (e.g. the outer test subject during selection).')
     # model-specific
     p.add_argument('--free_bits', type=float, default=0.0)
     p.add_argument('--latent_dim', type=int, default=16)
@@ -162,6 +172,7 @@ def save_summary(result: dict) -> None:
     new_row = {'model': result['model'],
                'region': result['region'],
                'channel': result.get('channel', 'both'),
+               'cv_mode': result.get('cv_mode', 'kfold'),
                'init_seed': result.get('init_seed'),
                'split_seed': result.get('split_seed'),
                'fold': result.get('fold'),
@@ -196,6 +207,8 @@ def save_summary(result: dict) -> None:
     df_row = pd.DataFrame([new_row])
     if os.path.exists(csv_path):
         df_old = pd.read_csv(csv_path)
+        if 'cv_mode' not in df_old.columns:
+            df_old['cv_mode'] = 'kfold'  # rows predating LOSO are all k-fold
         for col in df_row.columns:
             if col not in df_old.columns:
                 df_old[col] = pd.NA
@@ -206,29 +219,29 @@ def save_summary(result: dict) -> None:
                 df_row[col] = df_row[col].astype(df_old[col].dtype)
             except (ValueError, TypeError):
                 pass
-        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(subset=['model', 'region', 'channel', 'init_seed', 'split_seed', 'fold', 'latent_dim', 'embed_dim', 'part_embed_dim', 'free_bits', 'lambda_phys', 'alpha', 'n_copies', 'augmentation_ratio'], keep='last')
+        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(subset=['model', 'region', 'channel', 'cv_mode', 'init_seed', 'split_seed', 'fold', 'latent_dim', 'embed_dim', 'part_embed_dim', 'free_bits', 'lambda_phys', 'alpha', 'n_copies', 'augmentation_ratio'], keep='last')
     else:
         df_new = df_row
     df_new.to_csv(csv_path, index=False)
 
 # train real test real
-def _cache_path(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both') -> str:
+def _cache_path(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both', cv_mode: str = 'kfold', loso_tag: str = '') -> str:
     suffix = f'_ch{channel}' if channel != 'both' else ''
-    return f'results/trtr/{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}{suffix}_checkpoint.pkl'
+    return f'results/trtr/{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}{_cv_marker(cv_mode)}{loso_tag}{suffix}_checkpoint.pkl'
 
-def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both') -> dict | None:
-    path = _cache_path(region, init_seed, split_seed, fold, n_folds, channel)
+def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both', cv_mode: str = 'kfold', loso_tag: str = '') -> dict | None:
+    path = _cache_path(region, init_seed, split_seed, fold, n_folds, channel, cv_mode, loso_tag)
     if os.path.exists(path):
         with open(path, 'rb') as f:
             return pickle.load(f)
     return None
 
-def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed: int, fold: int, n_folds: int = 5, channel: str = 'both') -> dict:
+def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed: int, fold: int, n_folds: int = 5, channel: str = 'both', cv_mode: str = 'kfold', exclude_subjects: tuple = (), loso_trial_val: bool = False) -> dict:
     # load dataset
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
     # fold is 1-indexed
-    df_train, df_val, df_test = kfold_split_dataset(df, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
+    df_train, df_val, df_test = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed, exclude_subjects=exclude_subjects, loso_trial_val=loso_trial_val)
     stats = BreathDataset(df_train).stats
 
     ## train real
@@ -293,12 +306,13 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
              'n_train': len(df_train),
              'trtr_metrics': trtr_metrics,
              'channel': channel,
+             'cv_mode': cv_mode,
              'init_seed': init_seed,
              'split_seed': split_seed,
              'fold': fold,
              'n_folds': n_folds}
     os.makedirs('results/trtr', exist_ok=True)
-    with open(_cache_path(region, init_seed, split_seed, fold, n_folds, channel), 'wb') as f:
+    with open(_cache_path(region, init_seed, split_seed, fold, n_folds, channel, cv_mode, loso_path_tag(loso_trial_val, exclude_subjects)), 'wb') as f:
         pickle.dump(cache, f)
 
     return cache
@@ -317,7 +331,9 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
     elif model_name == 'cvae':
         model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
     elif model_name == 'cvae_part':
-        model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'], condition_on_participant=True, part_embed_dim=ckpt['part_embed_dim'])
+        model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'], condition_on_participant=True,
+                     num_participants=ckpt.get('num_participants', 3), part_embed_dim=ckpt['part_embed_dim'],
+                     part_dropout=ckpt.get('part_dropout', 0.0))
     elif model_name == 'pinn':
         model = PhysicsInformedCVAE(
             cir_params_init=ckpt['cir_params'],
@@ -330,6 +346,7 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
             condition_on_participant=ckpt.get('condition_on_participant', True),
             num_participants=ckpt.get('num_participants', 3),
             part_embed_dim=ckpt.get('part_embed_dim', 8),
+            part_dropout=ckpt.get('part_dropout', 0.0),
         )
     else:
         raise ValueError(f'Unknown model: {model_name}')
@@ -338,7 +355,7 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
 
     return model, ckpt['stats']
 
-def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: dict, device: 'torch.device', init_seed: int) -> tuple[np.ndarray, np.ndarray]:
+def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: dict, device: 'torch.device', init_seed: int, participant_idx: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     # determine num per class
     n_classes = len(CLASSES)
     n_per_class = n_synthetic // n_classes
@@ -361,7 +378,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
         for cls_idx, count in enumerate(counts):
             y_cls = torch.tensor(cls_idx, dtype=torch.long)
             with torch.no_grad():
-                z_cls = model.sample(count, y_cls, device)
+                z_cls = model.sample(count, y_cls, device, participant=participant_idx)
             all_signals.append((z_cls * std_t + mean_t).cpu().numpy())
             all_labels.append(np.full(count, cls_idx))
         signals_phys = np.concatenate(all_signals, axis=0)
@@ -374,7 +391,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
         for cls_idx, count in enumerate(counts):
             y_cls = torch.tensor(cls_idx, dtype=torch.long)
             with torch.no_grad():
-                z_cls = model.sample(count, y_cls, device).cpu()
+                z_cls = model.sample(count, y_cls, device, participant=participant_idx).cpu()
             h = z_cls[:, 0:1, :] * h_scale
             t = z_cls[:, 1:2, :] * t_std + t_mean
             all_signals.append(torch.cat([h, t], dim=1).numpy())
@@ -384,12 +401,14 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
 
     return signals_phys, labels
 
-def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 16, embed_dim: int = 8, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, eval_val: bool = False, dataset_dir: str = 'dataset', n_folds: int = 5) -> dict:
+def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 16, embed_dim: int = 8, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, eval_val: bool = False, dataset_dir: str = 'dataset', n_folds: int = 5, cv_mode: str = 'kfold') -> dict:
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
-    synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed)
-    print(f'[TSTR] Generated {n_synthetic} synthetic signals')
+    # under LOSO the test subject is unseen → generate from the learned null token (participant-conditioned models only)
+    participant_idx = model.null_part_idx if (cv_mode == 'loso' and getattr(model, '_cond_part', False)) else None
+    synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed, participant_idx=participant_idx)
+    print(f'[TSTR] Generated {n_synthetic} synthetic signals' + (' (null token)' if participant_idx is not None else ''))
 
     n, _C, T = synth_signals.shape
     ids = np.repeat(np.arange(n), T)
@@ -411,7 +430,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     if eval_val:
         df_val = load_dataset(dataset_dir)
         df_val = df_val[df_val['region'] == region].reset_index(drop=True)
-        _, df_val, _ = kfold_split_dataset(df_val, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
+        _, df_val, _ = get_split(df_val, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
         df_long_val, y_val = df_to_df_long(df_val)
         X_val_raw = extract_fixed_features(df_long_val, cache['top_20_features_raw'], n_jobs)
         X_val_san = X_val_raw.copy()
@@ -438,6 +457,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     return {'model': model_name,
             'region': region,
             'channel': cache.get('channel', 'both'),
+            'cv_mode': cv_mode,
             'init_seed': init_seed,
             'split_seed': split_seed,
             'fold': fold,
@@ -458,12 +478,13 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
             'trtr_metrics': cache['trtr_metrics']}
 
 # train synthetic/real test real
-def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1) -> dict:
+def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, cv_mode: str = 'kfold') -> dict:
     n_synthetic = int(cache['n_train'] * augmentation_ratio)
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR+] model={model_name}, n_synthetic={n_synthetic}, n_train_real={cache["n_train"]}')
 
-    synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed)
+    participant_idx = model.null_part_idx if (cv_mode == 'loso' and getattr(model, '_cond_part', False)) else None
+    synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed, participant_idx=participant_idx)
     print(f'[TSTR+] Generated {n_synthetic} synthetic signals')
 
     n, _C, T = synth_signals.shape
@@ -487,6 +508,7 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     return {'model': f'{model_name}_plus',
             'region': region,
             'channel': cache.get('channel', 'both'),
+            'cv_mode': cv_mode,
             'init_seed': init_seed,
             'split_seed': split_seed,
             'fold': fold,
@@ -506,7 +528,7 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
             'top_20_synth_features': None,
             'trtr_metrics': cache['trtr_metrics']}
 
-def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0) -> str:
+def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '') -> str:
     base_model = model.removesuffix('_plus')
     if base_model == 'vae':
         run_id = f'{region}_s{init_seed}_ld{latent_dim}_fb{free_bits}'
@@ -518,7 +540,7 @@ def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim:
         run_id = f'{region}_s{init_seed}_ld{latent_dim}_ed{embed_dim}_phys{lambda_phys}'
     else:
         run_id = f'{region}_s{init_seed}'
-    run_id += f'_f{fold}'
+    run_id += f'_f{fold}{_cv_marker(cv_mode)}{loso_tag}{_drop_marker(part_dropout)}'
     if alpha > 0 and n_copies > 1:
         run_id += f'_a{alpha}_n{n_copies}'
     if channel != 'both':
@@ -530,6 +552,10 @@ def main():
     args = parse_args()
     device = torch.device('cpu')
 
+    # nested-LOSO: 0-indexed excludes from the 1-indexed CLI; path tag namespaces nested artifacts
+    exclude_subjects = tuple(int(x) - 1 for x in args.loso_exclude.split(',') if x.strip()) if args.loso_exclude else ()
+    loso_tag = loso_path_tag(args.loso_trial_val, exclude_subjects)
+
     # aggregate mode
     if args.aggregate:
         regions = args.regions.split(',') if args.regions else [args.region]
@@ -539,7 +565,7 @@ def main():
         for region in regions:
             for init_seed in init_seeds:
                 for fold in folds:
-                    rid = build_run_id(args.model, region, init_seed, fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys)
+                    rid = build_run_id(args.model, region, init_seed, fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag)
                     path = f'results/{args.model}/{rid}_tstr.json'
                     if not os.path.exists(path):
                         print(f'  [AGGREGATE] missing {path}, skipping')
@@ -553,25 +579,25 @@ def main():
     if args.region is None:
         raise SystemExit('[TSTR] --region is required (except with --aggregate)')
 
-    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys)
+    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag)
 
     # reproducibility
     seed_everything(args.init_seed)
     tag = '[TRTR]' if args.model == 'trtr' else '[TSTR]'
-    print(f'{tag} init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold}/{args.n_folds} | Model: {args.model} | Region: {args.region} | Device: {device}')
+    print(f'{tag} init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold} cv={args.cv_mode}{loso_tag} | Model: {args.model} | Region: {args.region} | Device: {device}')
 
     # train-real-test-real
     # build cache
     if args.force_rebuild:
-        path = _cache_path(args.region, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel)
+        path = _cache_path(args.region, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel, args.cv_mode, loso_tag)
         if os.path.exists(path):
             os.remove(path)
             print('[TRTR] Removed cache.')
 
     # load cache
-    cache = load_cache(args.region, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel)
+    cache = load_cache(args.region, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel, args.cv_mode, loso_tag)
     if cache is None:
-        cache = trtr(args.dataset_dir, args.region, args.n_jobs, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel)
+        cache = trtr(args.dataset_dir, args.region, args.n_jobs, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel, args.cv_mode, exclude_subjects, args.loso_trial_val)
         print('[TRTR] Built cache.')
     else:
         print('[TRTR] Loaded cache.')
@@ -581,6 +607,7 @@ def main():
         result = {'model': 'trtr',
                   'region': args.region,
                   'channel': args.channel,
+                  'cv_mode': args.cv_mode,
                   'init_seed': args.init_seed,
                   'split_seed': args.split_seed,
                   'fold': args.fold,
@@ -598,13 +625,13 @@ def main():
 
     # train-synthetic-test-real
     if args.mode == 'tstr_plus':
-        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies)
+        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, cv_mode=args.cv_mode)
         save_result(result, result['model'], run_id)
         if not args.no_summary:
             save_summary(result)
     else:
         n_synthetic = args.n_synthetic if args.n_synthetic is not None else cache['n_train']
-        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, eval_val=args.eval_val, dataset_dir=args.dataset_dir, n_folds=args.n_folds)
+        result = tstr(cache, args.model, args.region, n_synthetic, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, eval_val=args.eval_val, dataset_dir=args.dataset_dir, n_folds=args.n_folds, cv_mode=args.cv_mode)
         save_result(result, args.model, run_id)
         if not args.no_summary:
             save_summary(result)

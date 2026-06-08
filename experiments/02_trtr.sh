@@ -44,8 +44,8 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
 fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..49> for a local run}}
-FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
+FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ))
 
 REGION=${REGIONS[$REGION_IDX]}
@@ -68,4 +68,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr \
   --fold "$FOLD" --n_folds "$N_FOLDS" \
   --n_jobs 1 --no_summary $REBUILD
 
-# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/trtr.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/02_trtr.sh

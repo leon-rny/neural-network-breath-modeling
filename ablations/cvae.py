@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from core.data import BreathDataset, load_dataset, kfold_split_dataset
+from core.data import BreathDataset, load_dataset, get_split, loso_path_tag
 from core.train import active_dims, beta_capped, evaluate, train_vae_one_epoch
 from core.tstr import evaluate_classifier, extract_fixed_features, generate_synthetic_signals, load_cache, train_stacking_classifier, trtr
 from core.utils import make_generator, seed_everything, seed_worker
@@ -82,7 +82,7 @@ LOG_EVERY = 25
 # architecture-mode
 ARCH_BETA_MAX = 1.0
 ARCH_WARMUP_FRAC = 0.5
-ABLATION_SUBSET = ["variant", "beta_max", "config", "region", "init_seed", "split_seed", "fold", "n_folds"]
+ABLATION_SUBSET = ["variant", "beta_max", "config", "region", "cv_mode", "loso_tag", "init_seed", "split_seed", "fold", "n_folds", "part_dropout"]
 ARCH_SUBSET = ["variant", "region", "init_seed", "split_seed", "fold", "n_folds", "condition_on_participant"]
 
 # modes
@@ -124,6 +124,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--latent_dim", type=int, default=16)
     p.add_argument("--n_jobs", type=int, default=4)
+    p.add_argument("--part_dropout", type=float, default=0.0, help="CFG-style participant-dropout prob (conv_baseline only). 0.0 = off, behaviour unchanged.")
+    p.add_argument("--cv_mode", choices=["kfold", "loso"], default="kfold", help="kfold: split by trial; loso: leave-one-subject-out (generates from the null token).")
+    p.add_argument("--loso_trial_val", action="store_true", help="Nested-LOSO: trial-level early-stop val + subject excludes (loso_split_final). Used by the part-4 orchestration.")
+    p.add_argument("--loso_exclude", default="", help="Nested-LOSO: comma-separated 1-indexed subject folds to drop from the training pool (e.g. the outer test subject during selection).")
     p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--no_summary", action="store_true")
@@ -144,19 +148,25 @@ def resolve_beta(cfg: dict, region: str, override: float | None) -> float:
     return cfg.get("beta_max", BETA_MAX[region])
 
 ## paths
-def _stem(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{variant}_b{beta_max}_{config}_{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}"
+def _pd_marker(part_dropout: float) -> str:
+    return "" if part_dropout == 0.0 else f"_pd{part_dropout}"
 
-def ckpt_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
+def _cv_marker(cv_mode: str) -> str:
+    return "" if cv_mode == "kfold" else f"_{cv_mode}"
+
+def _stem(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, part_dropout: float = 0.0, cv_mode: str = "kfold", loso_tag: str = "") -> str:
+    return f"{variant}_b{beta_max}_{config}_{region}_is{init_seed}_ss{split_seed}{_pd_marker(part_dropout)}{_cv_marker(cv_mode)}{loso_tag}_fold{fold}of{n_folds}"
+
+def ckpt_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, part_dropout: float = 0.0, cv_mode: str = "kfold", loso_tag: str = "") -> str:
     if CKPT_SCHEME == "f_checkpoint":
-        return f"{RESULTS_DIR}/{variant}_b{beta_max}_{config}_{region}_is{init_seed}_ss{split_seed}_f{fold}of{n_folds}_checkpoint.pt"
-    return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)}.pt"
+        return f"{RESULTS_DIR}/{variant}_b{beta_max}_{config}_{region}_is{init_seed}_ss{split_seed}{_pd_marker(part_dropout)}{_cv_marker(cv_mode)}{loso_tag}_f{fold}of{n_folds}_checkpoint.pt"
+    return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag)}.pt"
 
-def hist_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)}_history.csv"
+def hist_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, part_dropout: float = 0.0, cv_mode: str = "kfold", loso_tag: str = "") -> str:
+    return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag)}_history.csv"
 
-def result_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int) -> str:
-    return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)}_result.json"
+def result_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, part_dropout: float = 0.0, cv_mode: str = "kfold", loso_tag: str = "") -> str:
+    return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag)}_result.json"
 
 def _arch_stem(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool) -> str:
     cp_marker = "" if cond_part else "_nocp"
@@ -172,12 +182,14 @@ def arch_result_path(variant: str, region: str, init_seed: int, split_seed: int,
     return f"{RESULTS_DIR}/{_arch_stem(variant, region, init_seed, split_seed, fold, n_folds, cond_part)}_result.json"
 
 # tstr scoring
-def _tstr_score(model, stats: dict, cache: dict, device: torch.device, n_jobs: int, init_seed: int, label: str) -> dict:
+def _tstr_score(model, stats: dict, cache: dict, device: torch.device, n_jobs: int, init_seed: int, label: str, cv_mode: str = "kfold") -> dict:
     """Generate synthetic signals from a trained model, extract the cached top-20
     tsfresh features, train a stacking classifier on synthetic, and score on the
     real test set (TSTR). Returns the evaluate_classifier metrics dict."""
     n_synthetic = cache["n_train"]
-    synth_signals, synth_labels = generate_synthetic_signals(model, "cvae_part", n_synthetic, stats, device, init_seed)
+    # under LOSO the test subject is unseen → generate from the learned null token
+    participant_idx = model.null_part_idx if (cv_mode == "loso" and getattr(model, "_cond_part", False)) else None
+    synth_signals, synth_labels = generate_synthetic_signals(model, "cvae_part", n_synthetic, stats, device, init_seed, participant_idx=participant_idx)
     print(f"  [{TAG}] {label} | Generated {n_synthetic} synthetic signals")
 
     n, _C, T = synth_signals.shape
@@ -193,6 +205,18 @@ def _tstr_score(model, stats: dict, cache: dict, device: torch.device, n_jobs: i
     stacker = train_stacking_classifier(X_synth, synth_labels, init_seed, n_jobs=n_jobs)
     return evaluate_classifier(stacker, cache["X_test_top"], cache["y_test"])
 
+def _null_gen_stats(model, device: torch.device, n: int = 60) -> dict:
+    """Sanity check (check 3): decode with the null participant token and confirm the
+    output is finite and not collapsed to a constant."""
+    model.eval()
+    z = torch.randn(n, model.latent_dim, device=device)
+    y = (torch.arange(n, device=device) % model.num_classes).long()
+    p = torch.full((n,), model.null_part_idx, dtype=torch.long, device=device)
+    with torch.no_grad():
+        out = model.decoder(z, y, p)
+    return {"null_gen_finite": bool(torch.isfinite(out).all().item()),
+            "null_gen_std": float(out.std().item())}
+
 def _final_kl_active(hp: str) -> tuple[float, int]:
     kl_final, active_dims_final = float("nan"), 0
     if os.path.exists(hp):
@@ -203,7 +227,8 @@ def _final_kl_active(hp: str) -> tuple[float, int]:
 
 ## ablation family
 # training
-def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, dataset_dir: str, device: torch.device, epochs: int, lr: float, latent_dim: int, variant: str = "conv_baseline", beta_max_override: float | None = None, verbose: bool = False) -> None:
+def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, dataset_dir: str, device: torch.device, epochs: int, lr: float, latent_dim: int, variant: str = "conv_baseline", beta_max_override: float | None = None, part_dropout: float = 0.0, cv_mode: str = "kfold", exclude_subjects: tuple = (), loso_trial_val: bool = False, verbose: bool = False) -> None:
+    loso_tag = loso_path_tag(loso_trial_val, exclude_subjects)
     cfg = CONFIGS[config]
     beta_max = resolve_beta(cfg, region, beta_max_override)
     lag_n = cfg.get("lag_n", 0)
@@ -221,7 +246,8 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
     # data
     df = load_dataset(dataset_dir)
     df = df[df["region"] == region].reset_index(drop=True)
-    df_train, df_val, _ = kfold_split_dataset(df, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
+    num_participants = df["participant"].nunique()  # embedding table covers all subjects; derive before split
+    df_train, df_val, _ = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed, exclude_subjects=exclude_subjects, loso_trial_val=loso_trial_val)
     train_ds = BreathDataset(df_train, alpha=alpha, n_copies=n_copies)
     train_ds_clean = BreathDataset(df_train, stats=train_ds.stats)
     val_ds = BreathDataset(df_val, stats=train_ds.stats)
@@ -234,7 +260,7 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
 
     # model (selected variant)
     model_cls = VARIANT_MAP[variant]
-    model = model_cls(latent_dim=latent_dim, embed_dim=EMBED_DIM, condition_on_participant=True, part_embed_dim=PART_EMBED_DIM).to(device)
+    model = model_cls(latent_dim=latent_dim, embed_dim=EMBED_DIM, condition_on_participant=True, num_participants=num_participants, part_embed_dim=PART_EMBED_DIM, part_dropout=part_dropout).to(device)
 
     opt_full = torch.optim.Adam(model.parameters(), lr=lr)
     opt_enc = torch.optim.Adam(model.encoder.parameters(), lr=lr)
@@ -290,6 +316,7 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
             os.makedirs(RESULTS_DIR, exist_ok=True)
             torch.save({"config": config,
                         "region": region,
+                        "cv_mode": cv_mode,
                         "init_seed": init_seed,
                         "split_seed": split_seed,
                         "fold": fold,
@@ -301,14 +328,17 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
                         "latent_dim": latent_dim,
                         "embed_dim": EMBED_DIM,
                         "part_embed_dim": PART_EMBED_DIM,
+                        "num_participants": num_participants,
                         "beta_max": beta_max,
                         "lag_n": lag_n,
                         "lag_phase": lag_phase,
                         "free_bits": free_bits,
                         "alpha": alpha,
                         "n_copies": n_copies,
-                        "warmup_frac": warmup_frac},
-                       ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds))
+                        "warmup_frac": warmup_frac,
+                        "part_dropout": part_dropout,
+                        "null_fire_frac": model.null_fire_frac()},
+                       ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag))
 
         # active dims
         if epoch % LOG_EVERY == 0 or epoch == 1:
@@ -330,37 +360,46 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
 
     # persist full training history
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(hist_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds), "w", newline="") as f:
+    with open(hist_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=history[0].keys())
         writer.writeheader()
         writer.writerows(history)
 
-    print(f"  [{TAG}] {config}|{region}|is{init_seed}|f{fold} | Done. best_val={best_val_loss:.4f} | ckpt: {ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)}")
+    if part_dropout > 0.0:
+        print(f"  [{TAG}] null-token fired {model._null_steps}/{model._total_steps} steps = {model.null_fire_frac():.3f} (target {part_dropout})")
+    print(f"  [{TAG}] {config}|{region}|is{init_seed}|f{fold}|cv={cv_mode}{loso_tag} | Done. best_val={best_val_loss:.4f} | ckpt: {ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag)}")
 
 # tstr evaluation
-def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cache: dict, device: torch.device, n_jobs: int, variant: str = "conv_baseline", beta_max_override: float | None = None) -> dict:
+def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cache: dict, device: torch.device, n_jobs: int, variant: str = "conv_baseline", beta_max_override: float | None = None, part_dropout: float = 0.0, cv_mode: str = "kfold", exclude_subjects: tuple = (), loso_trial_val: bool = False) -> dict:
+    loso_tag = loso_path_tag(loso_trial_val, exclude_subjects)
     cfg = CONFIGS[config]
     beta_max = resolve_beta(cfg, region, beta_max_override)
-    path = ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds)
+    path = ckpt_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
     variant = ckpt.get("variant", "conv_baseline") # backward compat with old ckpts
+    pd_eff = ckpt.get("part_dropout", 0.0) # rebuild with the same embedding size that was trained
     model_cls = VARIANT_MAP[variant]
     model = model_cls(latent_dim=ckpt["latent_dim"],
                       embed_dim=ckpt["embed_dim"],
                       condition_on_participant=True,
-                      part_embed_dim=ckpt["part_embed_dim"]).to(device)
+                      num_participants=ckpt.get("num_participants", 3),
+                      part_embed_dim=ckpt["part_embed_dim"],
+                      part_dropout=pd_eff).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    label = f"{config}|{region}|is{init_seed}|f{fold}"
-    metrics = _tstr_score(model, ckpt["stats"], cache, device, n_jobs, init_seed, label)
-    kl_final, active_dims_final = _final_kl_active(hist_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds))
+    label = f"{config}|{region}|is{init_seed}|f{fold}|cv={cv_mode}"
+    metrics = _tstr_score(model, ckpt["stats"], cache, device, n_jobs, init_seed, label, cv_mode=cv_mode)
+    null_gen = _null_gen_stats(model, device) if pd_eff > 0.0 else {"null_gen_finite": None, "null_gen_std": None}
+    kl_final, active_dims_final = _final_kl_active(hist_path(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag))
 
     return {"config": config,
             "region": region,
+            "cv_mode": cv_mode,
+            "loso_tag": loso_tag,
             "init_seed": init_seed,
             "split_seed": split_seed,
             "fold": fold,
@@ -379,6 +418,10 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
             "embed_dim": ckpt["embed_dim"],
             "part_embed_dim": ckpt["part_embed_dim"],
             "condition_on_participant": True,
+            "part_dropout": pd_eff,
+            "null_fire_frac": ckpt.get("null_fire_frac"),
+            "null_gen_finite": null_gen["null_gen_finite"],
+            "null_gen_std": null_gen["null_gen_std"],
             "architecture": variant,
             "accuracy": metrics["accuracy"],
             "f1_weighted": metrics["f1_weighted"],
@@ -526,7 +569,7 @@ def save_result(row: dict) -> None:
     if FAMILY == "architecture":
         path = arch_result_path(row["variant"], row["region"], row["init_seed"], row["split_seed"], row["fold"], row["n_folds"], row["condition_on_participant"])
     else:
-        path = result_path(row["variant"], row["beta_max"], row["config"], row["region"], row["init_seed"], row["split_seed"], row["fold"], row["n_folds"])
+        path = result_path(row["variant"], row["beta_max"], row["config"], row["region"], row["init_seed"], row["split_seed"], row["fold"], row["n_folds"], row.get("part_dropout", 0.0), row.get("cv_mode", "kfold"), row.get("loso_tag", ""))
     with open(path, "w") as f:
         json.dump(_json_safe(row), f, indent=2)
 
@@ -539,6 +582,12 @@ def save_summary(rows: list[dict]) -> None:
         df_old = pd.read_csv(csv_path)
         if FAMILY == "architecture" and "condition_on_participant" not in df_old.columns:
             df_old["condition_on_participant"] = True
+        if FAMILY != "architecture" and "part_dropout" not in df_old.columns:
+            df_old["part_dropout"] = 0.0
+        if FAMILY != "architecture" and "cv_mode" not in df_old.columns:
+            df_old["cv_mode"] = "kfold"  # rows predating LOSO are all k-fold
+        if FAMILY != "architecture" and "loso_tag" not in df_old.columns:
+            df_old["loso_tag"] = ""
         df_new = pd.concat([df_old, df_new], ignore_index=True).drop_duplicates(subset=subset, keep="last")
     df_new.to_csv(csv_path, index=False)
     print(f"[{TAG}] Saved {len(df_new)} rows → {csv_path}")
@@ -549,6 +598,10 @@ def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
     if variant not in VARIANT_MAP:
         print(f'Unknown variant "{variant}". Valid: {list(VARIANT_MAP)}')
         sys.exit(1)
+
+    # nested-LOSO: 0-indexed excludes from the 1-indexed CLI; tag namespaces nested artifacts
+    exclude_subjects = tuple(int(x) - 1 for x in args.loso_exclude.split(",") if x.strip()) if args.loso_exclude else ()
+    loso_tag = loso_path_tag(args.loso_trial_val, exclude_subjects)
 
     # resolve config list
     if args.alpha is not None and args.n_copies is not None:
@@ -594,7 +647,7 @@ def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
                     for beta_max in beta_maxes:
                         for init_seed in init_seeds:
                             for fold in folds:
-                                rp = result_path(v, beta_max, config, region, init_seed, args.split_seed, fold, args.n_folds)
+                                rp = result_path(v, beta_max, config, region, init_seed, args.split_seed, fold, args.n_folds, args.part_dropout, args.cv_mode, loso_tag)
                                 if not os.path.exists(rp):
                                     print(f"  [AGGREGATE] missing {rp}, skipping")
                                     continue
@@ -612,24 +665,24 @@ def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
         for config in configs:
             for init_seed in init_seeds:
                 for fold in folds:
-                    cache = load_cache(region, init_seed, args.split_seed, fold, args.n_folds, channel="both")
+                    cache = load_cache(region, init_seed, args.split_seed, fold, args.n_folds, channel="both", cv_mode=args.cv_mode, loso_tag=loso_tag)
                     if cache is None:
-                        print(f"[{TAG}] Building TRTR cache region={region}, init_seed={init_seed}, fold={fold} ...")
-                        cache = trtr(args.dataset_dir, region, args.n_jobs, init_seed, args.split_seed, fold, args.n_folds, channel="both")
+                        print(f"[{TAG}] Building TRTR cache region={region}, init_seed={init_seed}, fold={fold}, cv={args.cv_mode}{loso_tag} ...")
+                        cache = trtr(args.dataset_dir, region, args.n_jobs, init_seed, args.split_seed, fold, args.n_folds, channel="both", cv_mode=args.cv_mode, exclude_subjects=exclude_subjects, loso_trial_val=args.loso_trial_val)
 
                     beta_max = resolve_beta(CONFIGS[config], region, args.beta_max)
-                    print(f"[{TAG}] {config} | {region} | is={init_seed} | f={fold}/{args.n_folds} | beta_max={beta_max}")
+                    print(f"[{TAG}] {config} | {region} | is={init_seed} | f={fold} | cv={args.cv_mode}{loso_tag} | beta_max={beta_max}")
 
-                    path = ckpt_path(variant, beta_max, config, region, init_seed, args.split_seed, fold, args.n_folds)
+                    path = ckpt_path(variant, beta_max, config, region, init_seed, args.split_seed, fold, args.n_folds, args.part_dropout, args.cv_mode, loso_tag)
                     if args.skip_existing and os.path.exists(path):
                         print("  checkpoint exists, skipping training")
                     else:
                         train_config(config, region, init_seed, args.split_seed, fold, args.n_folds,
                                      args.dataset_dir, device, args.epochs, args.lr, args.latent_dim,
-                                     variant=variant, beta_max_override=args.beta_max, verbose=args.verbose)
+                                     variant=variant, beta_max_override=args.beta_max, part_dropout=args.part_dropout, cv_mode=args.cv_mode, exclude_subjects=exclude_subjects, loso_trial_val=args.loso_trial_val, verbose=args.verbose)
 
                     row = eval_config(config, region, init_seed, args.split_seed, fold, args.n_folds, cache, device, args.n_jobs,
-                                      variant=variant, beta_max_override=args.beta_max)
+                                      variant=variant, beta_max_override=args.beta_max, part_dropout=args.part_dropout, cv_mode=args.cv_mode, exclude_subjects=exclude_subjects, loso_trial_val=args.loso_trial_val)
                     save_result(row)
                     all_results.append(row)
                     print(f"  TSTR: acc={row['accuracy']:.3f}, f1={row['f1_weighted']:.3f}, roc={row['roc_auc_ovr']:.3f}, log_loss={row['log_loss']:.3f}, kl={row['kl_final']:.4f}, active_dims={row['active_dims']}")

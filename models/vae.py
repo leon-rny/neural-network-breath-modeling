@@ -1,6 +1,16 @@
 import torch
 import torch.nn as nn
 
+def _expand_embedding_with_null(emb: nn.Embedding) -> nn.Embedding:
+    """Return a copy of `emb` with one extra (null-token) row appended.
+    Existing rows are copied byte-for-byte; only the new row is freshly initialised.
+    The caller must save/restore the global RNG around this so surrounding inits stay unperturbed."""
+    n, d = emb.weight.shape
+    new = nn.Embedding(n + 1, d)
+    with torch.no_grad():
+        new.weight[:n] = emb.weight
+    return new
+
 def elbo_loss(x: torch.Tensor, x_hat: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, beta: float = 1.0, free_bits: float = 0.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     ELBO loss = MSE reconstruction + beta * KL divergence.
@@ -212,20 +222,37 @@ class CVAE(nn.Module):
     at generation time participant is sampled uniformly to marginalise over identity.
     """
     def __init__(self, latent_dim: int = 16, num_classes: int = 3, embed_dim: int = 8,
-                 condition_on_participant: bool = False, num_participants: int = 3, part_embed_dim: int = 8) -> None:
+                 condition_on_participant: bool = False, num_participants: int = 3, part_embed_dim: int = 8,
+                 part_dropout: float = 0.0) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.num_classes = num_classes
         self.num_participants = num_participants
         self._cond_part = condition_on_participant
+        # CFG-style participant dropout: with prob part_dropout swap the batch to a learned null token.
+        # null row sits just past the real participants; only allocated when part_dropout > 0.
+        self.part_dropout = part_dropout
+        self.null_part_idx = num_participants
+        self._null_steps = 0
+        self._total_steps = 0
         self.encoder = ConditionalEncoder(latent_dim, num_classes, embed_dim, condition_on_participant, num_participants, part_embed_dim)
         self.decoder = ConditionalDecoder(latent_dim, num_classes, embed_dim, condition_on_participant, num_participants, part_embed_dim)
+        # append the null-token row last, with RNG save/restore so every other param keeps its exact draw
+        # (part_dropout==0 → no expansion → byte-identical to a model built without this feature)
+        if condition_on_participant and part_dropout > 0.0:
+            rng_state = torch.get_rng_state()
+            self.encoder.part_embed = _expand_embedding_with_null(self.encoder.part_embed)
+            self.decoder.part_embed = _expand_embedding_with_null(self.decoder.part_embed)
+            torch.set_rng_state(rng_state)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         if self.training:
             std = (0.5 * logvar).exp()
             return mu + std * torch.randn_like(std)
         return mu
+
+    def null_fire_frac(self) -> float:
+        return self._null_steps / self._total_steps if self._total_steps else 0.0
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, p: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -234,25 +261,38 @@ class CVAE(nn.Module):
         :param p: (B,) integer participant labels (required when condition_on_participant=True)
         :return: (B, 2, 36) reconstructed signals, (B, latent_dim) mu, (B, latent_dim) logvar
         """
+        # training-only participant dropout; guarded so part_dropout==0 draws no RNG (stays byte-identical)
+        if self.training and self._cond_part and p is not None and self.part_dropout > 0.0:
+            self._total_steps += 1
+            if torch.rand(1).item() < self.part_dropout:
+                p = torch.full_like(p, self.null_part_idx)
+                self._null_steps += 1
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
         x_hat = self.decoder(z, y, p)
         return x_hat, mu, logvar
 
-    def sample(self, n: int, y: torch.Tensor, device: torch.device) -> torch.Tensor:
+    def sample(self, n: int, y: torch.Tensor, device: torch.device, participant: int | None = None) -> torch.Tensor:
         """
         Sample n signals conditioned on class labels y.
-        When condition_on_participant=True, participant is sampled uniformly.
+        When condition_on_participant=True, participant is sampled uniformly over real subjects,
+        unless `participant` is given (e.g. null_part_idx for LOSO generation of an unseen subject).
 
         :param n: number of samples to generate
         :param y: (n,) integer class labels (or scalar broadcast to all n samples)
         :param device: device to perform sampling on
+        :param participant: fixed participant id to condition on (overrides uniform sampling)
         :return: (n, 2, 36) generated signals
         """
         z = torch.randn(n, self.latent_dim, device=device)
         if y.dim() == 0:
             y = y.expand(n)
-        p = torch.randint(0, self.num_participants, (n,), device=device) if self._cond_part else None
+        if not self._cond_part:
+            p = None
+        elif participant is not None:
+            p = torch.full((n,), participant, dtype=torch.long, device=device)
+        else:
+            p = torch.randint(0, self.num_participants, (n,), device=device)
         self.eval()
         with torch.no_grad():
             return self.decoder(z, y.to(device), p)

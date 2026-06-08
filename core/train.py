@@ -8,10 +8,16 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from core.data import BreathDataset, PhysicsInformedDataset, load_dataset, kfold_split_dataset
+from core.data import BreathDataset, PhysicsInformedDataset, load_dataset, get_split
 from core.utils import seed_everything, seed_worker, make_generator
 from models.vae import VAE, CVAE, elbo_loss
 from models.pinn import PhysicsInformedCVAE
+
+def _cv_marker(cv_mode: str) -> str:
+    return '' if cv_mode == 'kfold' else f'_{cv_mode}'
+
+def _drop_marker(part_dropout: float) -> str:
+    return '' if part_dropout == 0.0 else f'_drop{part_dropout}'
 
 # cli arguments
 def parse_args() -> argparse.Namespace:
@@ -23,8 +29,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--log_every', type=int, default=25)
     p.add_argument('--init_seed', type=int, default=42, help='Model-internal randomness; varies across runs to characterize sensitivity.')
     p.add_argument('--split_seed', type=int, default=42, help='Data partition; fixed for paired comparisons.')
-    p.add_argument('--fold', type=int, default=1, help='1-indexed fold in [1, n_folds].')
+    p.add_argument('--fold', type=int, default=1, help='1-indexed fold in [1, n_folds] (kfold) or [1, n_subjects] (loso).')
     p.add_argument('--n_folds', type=int, default=5)
+    p.add_argument('--cv_mode', choices=['kfold', 'loso'], default='kfold', help='kfold: split by trial; loso: leave-one-subject-out (fold count derived from data).')
     p.add_argument('--epochs', type=int, default=500)
     p.add_argument('--batch_size', type=int, default=32)
     # model-specific
@@ -32,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--embed_dim', type=int, default=8)     # ablation default
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--free_bits', type=float, default=0.0)
+    p.add_argument('--part_dropout', type=float, default=0.0, help='CFG-style participant-dropout prob (cvae_part/pinn). Required >0 for LOSO null-token generation.')
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--beta_max', type=float, default=0.1)
     p.add_argument('--beta_warmup_epochs', type=int, default=None, help='Epochs to linearly warm beta 0->beta_max. Defaults to epochs // 2 (matches the ablations).')
@@ -181,7 +189,7 @@ def main():
     if args.beta_warmup_epochs is None:
         args.beta_warmup_epochs = args.epochs // 2
     device = torch.device('cpu')
-    print(f'[TRAIN] init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold}/{args.n_folds} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
+    print(f'[TRAIN] init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold} cv={args.cv_mode} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
 
     os.makedirs(f'results/{args.model}', exist_ok=True)
     if args.model == 'vae':
@@ -192,7 +200,7 @@ def main():
         run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_pd{args.part_embed_dim}_fb{args.free_bits}'
     elif args.model == 'pinn':
         run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_phys{args.lambda_phys}'
-    run_id += f'_f{args.fold}'
+    run_id += f'_f{args.fold}{_cv_marker(args.cv_mode)}{_drop_marker(args.part_dropout)}'
     if args.alpha > 0 and args.n_copies > 1:
         run_id += f'_a{args.alpha}_n{args.n_copies}'
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
@@ -205,8 +213,9 @@ def main():
     # dataset
     df = load_dataset(args.dataset_dir)
     df = df[df['region'] == args.region].reset_index(drop=True)
+    num_participants = df['participant'].nunique()  # embedding table covers all subjects; derive before the split
     # args.fold is 1-indexed
-    df_train, df_val, _ = kfold_split_dataset(df, fold=args.fold - 1, n_folds=args.n_folds, split_seed=args.split_seed)
+    df_train, df_val, _ = get_split(df, cv_mode=args.cv_mode, fold=args.fold - 1, n_folds=args.n_folds, split_seed=args.split_seed)
     DatasetCls = PhysicsInformedDataset if args.model == 'pinn' else BreathDataset
     train_ds = DatasetCls(df_train, alpha=args.alpha, n_copies=args.n_copies)
     train_ds_clean = DatasetCls(df_train, stats=train_ds.stats) if args.alpha > 0 else train_ds
@@ -221,7 +230,7 @@ def main():
         use_participant = args.model == 'cvae_part'
         conditional = args.model in ('cvae', 'cvae_part')
         if args.model == 'cvae_part':
-            model = CVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim, condition_on_participant=True, part_embed_dim=args.part_embed_dim).to(device)
+            model = CVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim, condition_on_participant=True, num_participants=num_participants, part_embed_dim=args.part_embed_dim, part_dropout=args.part_dropout).to(device)
         elif args.model == 'cvae':
             model = CVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim).to(device)
         else:
@@ -242,7 +251,8 @@ def main():
                 best_val_loss = val_loss
                 ckpt = {'epoch': epoch, 'model_state': model.state_dict(),
                         'stats': train_ds.stats, 'latent_dim': args.latent_dim,
-                        'region': args.region}
+                        'region': args.region, 'cv_mode': args.cv_mode,
+                        'num_participants': num_participants, 'part_dropout': args.part_dropout}
                 if args.model in ('cvae', 'cvae_part'):
                     ckpt['embed_dim'] = args.embed_dim
                 if args.model == 'cvae_part':
@@ -267,7 +277,8 @@ def main():
         model = PhysicsInformedCVAE(cir_params_init=params_cir, t_grid=t_grid, tau_s=args.tau_s,
                                     learn_cir_params=args.learn_cir_params, latent_dim=args.latent_dim,
                                     num_classes=3, embed_dim=args.embed_dim, condition_on_participant=True,
-                                    num_participants=3, part_embed_dim=args.part_embed_dim).to(device)
+                                    num_participants=num_participants, part_embed_dim=args.part_embed_dim,
+                                    part_dropout=args.part_dropout).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -290,7 +301,8 @@ def main():
                             'embed_dim': args.embed_dim, 'part_embed_dim': args.part_embed_dim,
                             'region': args.region, 'cir_params': params_cir, 't_grid': t_grid,
                             'tau_s': args.tau_s, 'learn_cir_params': args.learn_cir_params,
-                            'condition_on_participant': True, 'num_participants': 3}, ckpt_path)
+                            'condition_on_participant': True, 'num_participants': num_participants,
+                            'part_dropout': args.part_dropout, 'cv_mode': args.cv_mode}, ckpt_path)
 
             history.append({'epoch': epoch, 'beta': beta,
                             **{f'train_{k}': train_m[k] for k in ('total', 'recon', 'kl', 'phys')},

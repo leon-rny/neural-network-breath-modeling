@@ -127,11 +127,16 @@ class PhysicsInformedCVAE(CVAE):
 
         return x_hat, mu, logvar, u_post_softplus, (log_A, log_D, log_v), humidity_phys
 
-    def sample(self, n, y, device, return_aux: bool = False):
+    def sample(self, n, y, device, return_aux: bool = False, participant: int | None = None):
         z = torch.randn(n, self.latent_dim, device=device)
         if y.dim() == 0:
             y = y.expand(n)
-        p = torch.randint(0, self.num_participants, (n,), device=device) if self._cond_part else None
+        if not self._cond_part:
+            p = None
+        elif participant is not None:  # e.g. null_part_idx for LOSO generation of an unseen subject
+            p = torch.full((n,), participant, dtype=torch.long, device=device)
+        else:
+            p = torch.randint(0, self.num_participants, (n,), device=device)
 
         self.eval()
         with torch.no_grad():
