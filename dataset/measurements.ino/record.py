@@ -25,11 +25,11 @@ IMPULSE_SECONDS = 2
 MEAS_TYPES = ['breathing', 'impulse']
 
 # baseline-stability
-BASE_WINDOW = 10     # number of recent samples to judge stability
-TEMP_TOL = 0.2       # max std of consecutive-sample changes in °C
-HUM_TOL = 1.4        # max std of consecutive-sample changes in %RH
-TEMP_DRIFT_TOL = 0.3 # max |last-third mean − first-third mean| in °C
-HUM_DRIFT_TOL = 1.6  # max |last-third mean − first-third mean| in %RH
+BASE_WINDOW = 20     # number of recent samples to judge stability
+TEMP_TOL = 0.1       # max std of consecutive-sample changes in °C
+HUM_TOL = 0.8        # max std of consecutive-sample changes in %RH
+TEMP_DRIFT_TOL = 0.2 # max |last-third mean − first-third mean| in °C
+HUM_DRIFT_TOL = 1.0  # max |last-third mean − first-third mean| in %RH
 
 CLASSES = ['bradypnea', 'eupnea', 'tachypnea']
 REGIONS = ['mouth', 'nose']
