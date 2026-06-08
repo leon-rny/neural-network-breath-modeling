@@ -53,8 +53,8 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
 fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..49> for a local run}}
-FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
+FOLD_IDX=$(( IDX % N_FOLDS_AX )); nIDX=$(( IDX / N_FOLDS_AX ))
+SEED_IDX=$(( IDX % N_SEEDS )); nIDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ))
 
 REGION=${REGIONS[$REGION_IDX]}
