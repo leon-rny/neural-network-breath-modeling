@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 
 CLASSES = ['bradypnea', 'eupnea', 'tachypnea']
 CLASS_TO_IDX = {cls: i for i, cls in enumerate(CLASSES)}
-PARTICIPANTS = ['a', 'p', 's']
+PARTICIPANTS = ['a', 'e', 'f', 'g', 'p']
 PARTICIPANT_TO_IDX = {p: i for i, p in enumerate(PARTICIPANTS)}
 
 def load_dataset(dataset_dir: str = 'dataset') -> pd.DataFrame:
@@ -25,7 +25,7 @@ def load_dataset(dataset_dir: str = 'dataset') -> pd.DataFrame:
         for fname in sorted(os.listdir(folder)):
             if not fname.endswith('.dat'):
                 continue
-            m = re.match(r'^(([ps])_)?(mouth|nose)_trial_(\d+)\.dat$', fname)
+            m = re.match(r'^(([efgp])_)?(mouth|nose)_trial_(\d+)\.dat$', fname)
             if m is None:
                 continue
             df = pd.read_csv(os.path.join(folder, fname))
@@ -91,6 +91,117 @@ def kfold_split_dataset(df: pd.DataFrame, split_seed: int, fold: int, n_folds: i
     df_train, df_val = train_test_split(df_trainfull, test_size=val_size, stratify=df_trainfull['class'], random_state=split_seed)
 
     return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test
+
+def n_loso_folds(df: pd.DataFrame) -> int:
+    '''Number of LOSO folds = number of distinct subjects. Single source of truth so callers
+    (and the SLURM array) derive the fold count from the data rather than a hardcoded value.'''
+    return df['participant'].nunique()
+
+def loso_split_dataset(df: pd.DataFrame, fold: int, val_fold: int | None = None, val_size: float = 0.15, split_seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    '''
+    Leave-one-subject-out split returning (train, val, test) DataFrames.
+
+    The held-out TEST subject is `subjects[fold]`. The VAL subject is a *different held-out
+    subject* (never trials of the test subject — this is what keeps the split leakage-free):
+    by default the deterministic neighbour `subjects[(fold+1) % n]`, or `subjects[val_fold]`
+    if given (so the nested-LOSO orchestration can sweep it). Train = all remaining subjects.
+
+    With n subjects this yields train=(n-2), val=1, test=1 subjects (n=3 → 1/1/1; n=6 → 4/1/1).
+
+    :param df: DataFrame containing the dataset.
+    :param fold: 0-indexed test-subject position in sorted(participant), in [0, n_subjects).
+    :param val_fold: 0-indexed val-subject position; defaults to the neighbour of `fold`.
+    :param val_size: unused (kept for signature parity with kfold_split_dataset).
+    :param split_seed: unused (subject partition is deterministic); kept for parity.
+    :return: A tuple of (train_df, val_df, test_df) DataFrames.
+    '''
+    subjects = sorted(df['participant'].unique())
+    n = len(subjects)
+    if n < 3:
+        raise ValueError(f'LOSO needs >=3 subjects (train/val/test), got {n}')
+    if not 0 <= fold < n:
+        raise ValueError(f'fold must be in [0, {n}) for {n} subjects, got {fold}')
+    test_subj = subjects[fold]
+    val_subj = subjects[val_fold] if val_fold is not None else subjects[(fold + 1) % n]
+    if val_subj == test_subj:
+        raise ValueError(f'val subject must differ from test subject (both {test_subj!r})')
+
+    df_test = df[df['participant'] == test_subj]
+    df_val = df[df['participant'] == val_subj]
+    df_train = df[~df['participant'].isin([test_subj, val_subj])]
+    return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test.reset_index(drop=True)
+
+def loso_split_final(df: pd.DataFrame, test_subject_idx: int, exclude_subject_idxs: tuple = (), val_size: float = 0.15, split_seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    '''
+    Nested-LOSO building block returning (train, earlystop_val, test) DataFrames.
+
+    `test` is the held-out subject `subjects[test_subject_idx]`. `train`+`earlystop_val` come
+    from the *training pool* = all subjects except the test subject and `exclude_subject_idxs`,
+    split at the TRIAL level (subject-mixed) — the early-stop/checkpoint val is only ever trials
+    from the training pool, never the scored subject and never an excluded subject. This single
+    helper expresses both nested stages:
+      - Stage A (select): exclude={outer test t}, test=val subject v  → train on n-2 subjects.
+      - Stage B (final):  exclude={},            test=t               → train on n-1 subjects.
+
+    :param df: DataFrame containing the dataset.
+    :param test_subject_idx: 0-indexed test-subject position in sorted(participant).
+    :param exclude_subject_idxs: 0-indexed subject positions to drop from the pool entirely.
+    :param val_size: trial-level early-stop val fraction of the training pool.
+    :param split_seed: seed for the trial-level train/val split.
+    :return: (train_df, earlystop_val_df, test_df).
+    '''
+    subjects = sorted(df['participant'].unique())
+    n = len(subjects)
+    if not 0 <= test_subject_idx < n:
+        raise ValueError(f'test_subject_idx must be in [0, {n}) for {n} subjects, got {test_subject_idx}')
+    test_subj = subjects[test_subject_idx]
+    excl = {subjects[i] for i in exclude_subject_idxs}
+    if test_subj in excl:
+        raise ValueError(f'test subject {test_subj!r} cannot also be in exclude {sorted(excl)}')
+    pool_subjects = [s for s in subjects if s != test_subj and s not in excl]
+    if len(pool_subjects) < 2:
+        raise ValueError(f'nested LOSO needs >=2 training-pool subjects (after removing test + exclude), '
+                         f'got {len(pool_subjects)} from {n} total. This is a degenerate run, not a real '
+                         f'result — record more subjects (>=4 total) before trusting nested-LOSO numbers.')
+
+    df_test = df[df['participant'] == test_subj]
+    df_pool = df[df['participant'].isin(pool_subjects)]
+    df_train, df_val = train_test_split(df_pool, test_size=val_size, stratify=df_pool['class'], random_state=split_seed)
+    df_train = df_train.reset_index(drop=True)
+    df_val = df_val.reset_index(drop=True)
+    df_test = df_test.reset_index(drop=True)
+
+    # leakage assertions (the subtle path): early-stop val must be trials from the pool only,
+    # never the scored subject and never an excluded subject — checked on every call.
+    train_subs, val_subs = set(df_train['participant']), set(df_val['participant'])
+    assert val_subs <= set(pool_subjects), f'earlystop_val leaked outside training pool: {val_subs - set(pool_subjects)}'
+    assert test_subj not in train_subs and test_subj not in val_subs, f'test subject {test_subj!r} leaked into train/val'
+    assert not (excl & train_subs) and not (excl & val_subs), f'excluded subject leaked into train/val: {excl & (train_subs | val_subs)}'
+    return df_train, df_val, df_test
+
+def loso_path_tag(loso_trial_val: bool, exclude_subject_idxs: tuple = ()) -> str:
+    '''Path-only marker namespacing nested-LOSO artifacts so they never collide with a plain
+    `_loso` run or with each other (Stage A vs Stage B differ by the exclude set). The reported
+    result row still carries cv_mode='loso' — this only disambiguates filenames.'''
+    if not loso_trial_val:
+        return ''
+    tag = '_nested'
+    if exclude_subject_idxs:
+        tag += '_x' + '-'.join(str(i) for i in sorted(exclude_subject_idxs))
+    return tag
+
+def get_split(df: pd.DataFrame, cv_mode: str, fold: int, n_folds: int, split_seed: int = 42, val_size: float = 0.15, exclude_subjects: tuple = (), loso_trial_val: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    '''Dispatch to the k-fold or LOSO splitter. `fold` is 0-indexed in both modes.
+    Under LOSO the fold count is derived from the data (see `n_loso_folds`), so `n_folds`
+    is ignored there. When `loso_trial_val` is set, routes to the nested `loso_split_final`
+    (trial-level early-stop val + subject excludes); otherwise the plain subject-level-val LOSO.'''
+    if cv_mode == 'loso':
+        if loso_trial_val:
+            return loso_split_final(df, test_subject_idx=fold, exclude_subject_idxs=tuple(exclude_subjects), val_size=val_size, split_seed=split_seed)
+        return loso_split_dataset(df, fold=fold, val_size=val_size, split_seed=split_seed)
+    if cv_mode == 'kfold':
+        return kfold_split_dataset(df, split_seed=split_seed, fold=fold, n_folds=n_folds, val_size=val_size)
+    raise ValueError(f"cv_mode must be 'kfold' or 'loso', got {cv_mode!r}")
 
 class BreathDataset(Dataset):
     def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None,

@@ -7,12 +7,8 @@ import re
 import numpy as np
 import pandas as pd
 
-# the committed generative config (jitter a0.05_n10 x beta 0.01) — must survive into the candidate pool
 COMMITTED_CONFIG = "a0.05_n10"
 COMMITTED_BETA_MAX = 0.01
-
-# default source: the jitter x beta grid summary (NOT training_dynamics) — this is the grid the
-# committed model was selected from. Overridable via --summary.
 DEFAULT_SUMMARY = "results/ablation_cvae_jittering/summary.csv"
 LOSO_DIR = "results/loso"
 

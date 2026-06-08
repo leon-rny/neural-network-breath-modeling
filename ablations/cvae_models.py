@@ -1,13 +1,29 @@
 import torch
 import torch.nn as nn
 
+def _expand_embedding_with_null(emb: nn.Embedding) -> nn.Embedding:
+    """Return a copy of `emb` with one extra (null-token) row appended.
+    Existing rows are copied byte-for-byte; only the new row is freshly initialised.
+    The caller must save/restore the global RNG around this so surrounding inits stay unperturbed."""
+    n, d = emb.weight.shape
+    new = nn.Embedding(n + 1, d)
+    with torch.no_grad():
+        new.weight[:n] = emb.weight
+    return new
+
 class AblationCVAE(nn.Module):
-    def __init__(self, latent_dim: int, num_classes: int, num_participants: int, condition_on_participant: bool) -> None:
+    def __init__(self, latent_dim: int, num_classes: int, num_participants: int, condition_on_participant: bool, part_dropout: float = 0.0) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.num_classes = num_classes
         self.num_participants = num_participants
         self._cond_part = condition_on_participant
+        # CFG-style participant dropout: with prob part_dropout swap the batch to a learned null token.
+        # null row sits just past the real participants; only allocated when part_dropout > 0 (see subclass).
+        self.part_dropout = part_dropout
+        self.null_part_idx = num_participants
+        self._null_steps = 0
+        self._total_steps = 0
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         if self.training:
@@ -15,16 +31,30 @@ class AblationCVAE(nn.Module):
             return mu + std * torch.randn_like(std)
         return mu
 
+    def null_fire_frac(self) -> float:
+        return self._null_steps / self._total_steps if self._total_steps else 0.0
+
     def forward(self, x: torch.Tensor, y: torch.Tensor, p: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # training-only participant dropout; guarded so part_dropout==0 draws no RNG (run A stays byte-identical)
+        if self.training and self._cond_part and p is not None and self.part_dropout > 0.0:
+            self._total_steps += 1
+            if torch.rand(1).item() < self.part_dropout:
+                p = torch.full_like(p, self.null_part_idx)
+                self._null_steps += 1
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
         return self.decoder(z, y, p), mu, logvar
 
-    def sample(self, n: int, y: torch.Tensor, device: torch.device) -> torch.Tensor:
+    def sample(self, n: int, y: torch.Tensor, device: torch.device, participant: int | None = None) -> torch.Tensor:
         z = torch.randn(n, self.latent_dim, device=device)
         if y.dim() == 0:
             y = y.expand(n)
-        p = torch.randint(0, self.num_participants, (n,), device=device) if self._cond_part else None
+        if not self._cond_part:
+            p = None
+        elif participant is not None:  # e.g. null_part_idx for LOSO generation of an unseen subject
+            p = torch.full((n,), participant, dtype=torch.long, device=device)
+        else:
+            p = torch.randint(0, self.num_participants, (n,), device=device)
         self.eval()
         with torch.no_grad():
             return self.decoder(z, y.to(device), p)
@@ -78,11 +108,18 @@ class _Dec_ConvBaseline(nn.Module):
         return self.conv(h)
 
 class ConvBaseline(AblationCVAE):
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvBaseline(**kw)
+        # append the null-token row last, with RNG save/restore so every other param keeps its exact draw
+        # (part_dropout==0 → no expansion → byte-identical to the committed model)
+        if condition_on_participant and part_dropout > 0.0:
+            rng_state = torch.get_rng_state()
+            self.encoder.part_embed = _expand_embedding_with_null(self.encoder.part_embed)
+            self.decoder.part_embed = _expand_embedding_with_null(self.decoder.part_embed)
+            torch.set_rng_state(rng_state)
 
 # conv_large_kernel: same shape as ConvBaseline but kernel=7 throughout
 class _Enc_ConvLargeKernel(nn.Module):

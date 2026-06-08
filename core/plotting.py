@@ -22,13 +22,13 @@ from core.data import BreathDataset, load_dataset, split_dataset
 SEEDS = [0, 1, 7, 42, 123]
 REGIONS = ["mouth", "nose"]
 CLASSES  = ["bradypnea", "eupnea", "tachypnea"]
-PARTICIPANTS = ["a", "p", "s"]
+PARTICIPANTS = ["a", "p", "s", "e", "f", "g"]
 
 # plot settings and colors
 plt.rcParams.update({"legend.fontsize": 9,
                      "axes.titlesize": 10})
 CLASS_COLORS = {"bradypnea": "tab:blue", "eupnea": "tab:green", "tachypnea": "tab:purple"}
-PARTICIPANT_COLORS =  {"a": "tab:red", "p": "tab:orange", "s": "tab:cyan"}
+PARTICIPANT_COLORS =  {"a": "tab:red", "p": "tab:orange", "s": "tab:cyan", "e": "tab:gray", "f": "tab:olive", "g": "tab:pink"}
 WIDTH = 3
 HEIGHT = 2
 
@@ -63,8 +63,9 @@ def load_breath_pattern(classes, dataset_dir="../dataset"):
             if not fname.endswith(".dat"):
                 continue
 
-            # extract metadata
-            m = re.match(r"^(([ps])_)?(mouth|nose)_trial_(\d+)\.dat$", fname)
+            # extract metadata (unprefixed files belong to participant "a";
+            # p_/s_/e_/f_/g_ encode the other participants)
+            m = re.match(r"^(([psefg])_)?(mouth|nose)_trial_(\d+)\.dat$", fname)
             if m is None:
                 continue
         
@@ -183,46 +184,49 @@ def plot_interparticipant_variability(df, t, region):
     for row, measurement in enumerate(["humidity", "temperature"]):
         for col, cls in enumerate(CLASSES):
             ax = axes[row, col]
-            for participant in ["a", "p", "s"]:
+            for participant in PARTICIPANTS:
                 # resample all trials to common time grid
                 trials = df[(df["class"] == cls) & (df["region"] == region) & (df["participant"] == participant)]
+                if len(trials) == 0:
+                    continue
                 mat  = resample_trials(trials, t_common=t, measurement_type=measurement)
-                
+
                 # stats
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", RuntimeWarning)
                     mean = np.nanmean(mat, axis=0)
                     std  = np.nanstd(mat,  axis=0)
-                
+
                 # plot
                 label = f"Participant {participant.upper()}  (n={len(trials)})"
-                ax.plot(t, mean, label=label)
-                ax.fill_between(t, mean-std, mean+std, alpha=0.2)
+                color = PARTICIPANT_COLORS[participant]
+                ax.plot(t, mean, label=label, color=color)
+                ax.fill_between(t, mean-std, mean+std, alpha=0.2, color=color)
             axes[0, col].set_title(f"{cls.capitalize()}")
             axes[-1, col].set_xlabel("Time in s")
             axes[row, 0].set_ylabel(f"{measurement.capitalize()} in {"%" if measurement == "humidity" else "°C"}")
             ax.grid()
-            ax.legend(loc="lower right") if row == 0 else ax.legend(loc="upper left")
+            # ax.legend(loc="lower right") if row == 0 else ax.legend(loc="upper left")
     plt.suptitle(f"Inter-participant variability: {region}")
     plt.tight_layout()
     plt.show()
 
-def plot_correlation(df):
-    fig, axes = plt.subplots(3, 3, figsize=(WIDTH*3, HEIGHT*3), sharex=True, sharey=True)
+def plot_correlation(df, participants=PARTICIPANTS):
+    fig, axes = plt.subplots(len(participants), 3, figsize=(WIDTH*3, HEIGHT*len(participants)), sharex=True, sharey=True)
 
-    for p_idx, participant in enumerate(["a", "p", "s"]):
+    for p_idx, participant in enumerate(participants):
         for col, cls in enumerate(CLASSES):
             ax = axes[p_idx, col]
 
             trials = df[(df["class"] == cls) & (df["participant"] == participant)]
             records = trials.to_dict("records")
 
-            all_h = np.concatenate([r["humidity"] for r in records])
-            all_temp = np.concatenate([r["temperature"] for r in records])
-            corr = np.corrcoef(all_h, all_temp)[0, 1]
-
-            ax.scatter(all_h, all_temp, alpha=0.15, s=5, rasterized=True, label=f"r = {corr:.2f}", color=CLASS_COLORS[cls])
-            ax.legend(loc="upper left")
+            if records:
+                all_h = np.concatenate([r["humidity"] for r in records])
+                all_temp = np.concatenate([r["temperature"] for r in records])
+                corr = np.corrcoef(all_h, all_temp)[0, 1]
+                ax.scatter(all_h, all_temp, alpha=0.15, s=5, rasterized=True, label=f"r = {corr:.2f}", color=CLASS_COLORS[cls])
+                ax.legend(loc="upper left")
             axes[0, col].set_title(f"{cls.capitalize()}")
             axes[-1, col].set_xlabel("Humidity in %")
             axes[p_idx, 0].set_ylabel(f"Participant {participant.upper()}\nTemperature in in °C")
