@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # general
     p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'pinn'])
-    p.add_argument('--region', choices=['mouth', 'nose'], default=None) # required except in --aggregate
+    p.add_argument('--region', choices=['mouth', 'nose'], default=None)
     p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
     p.add_argument('--channel', choices=['humidity', 'temperature', 'both'], default='both')
     p.add_argument('--n_synthetic', type=int, default=None)
