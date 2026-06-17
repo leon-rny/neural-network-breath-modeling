@@ -7,34 +7,30 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=/home/rane10/logs/trtr.o%A_%a
 #SBATCH --error=/home/rane10/logs/trtr.e%A_%a
-#SBATCH --array=0-109%50
+#SBATCH --array=0-129%200
 set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# TRTR (real-data ceiling) under BOTH protocols, in one array:
-#   [0..49]   k-fold CV  : 2 regions x 5 seeds x 5 folds          = 50   -> within-subject ceiling
-#   [50..109] LOSO       : 2 regions x 5 seeds x 6 subjects       = 60   -> cross-subject ceiling
-# LOSO uses --loso_trial_val (train on n-1 subjects, score the held-out one) so it matches the
-# conv_baseline Stage-B split and is apples-to-apples with the LOSO model numbers.
-#
-# NOTE for the 6-subject rerun: the k-fold TRTR cache path does NOT encode subject count, so clear
-# stale caches once before running:  rm -f results/trtr/*.pkl   (or submit with FORCE_REBUILD=1).
+# [0..49] k-fold CV : 2 regions x 5 seeds x 5 folds = 50 -> within-subject ceiling
+# [50..]  LOSO      : 2 regions x 5 seeds x N subjects (N from data) -> cross-subject ceiling
+# default --array sized for N=8 (0-129); if N changes, submit with --array=0-$((50+2*5*N-1))%200
 MODEL=trtr
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
-KFOLDS=(1 2 3 4 5)            # k-fold trial-folds
-N_FOLDS=5                     # k-fold count
-N_SUBJECTS=6                  # LOSO: one fold per subject (asserted against data for LOSO tasks)
+KFOLDS=(1 2 3 4 5)
+N_FOLDS=5
+# subject count is data-driven so the LOSO axis auto-sizes when participants change
+N_SUBJECTS=$(python -c "from core.data import load_dataset, n_loso_folds; print(n_loso_folds(load_dataset('dataset')))")
 SPLIT_SEED=42
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 
 N_REGIONS=${#REGIONS[@]}
 N_SEEDS=${#INIT_SEEDS[@]}
 N_KFOLDS_AX=${#KFOLDS[@]}
-N_KFOLD=$(( N_REGIONS * N_SEEDS * N_KFOLDS_AX ))   # 50
-N_LOSO=$(( N_REGIONS * N_SEEDS * N_SUBJECTS ))     # 60
+N_KFOLD=$(( N_REGIONS * N_SEEDS * N_KFOLDS_AX ))
+N_LOSO=$(( N_REGIONS * N_SEEDS * N_SUBJECTS ))
 
 # single thread per task
 export OMP_NUM_THREADS=1
@@ -65,9 +61,9 @@ REBUILD=""
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..109> for a local run}}
 
 if [ "$IDX" -lt "$N_KFOLD" ]; then
-  # ---- k-fold regime ----
+  # k-fold regime
   FOLD_IDX=$(( IDX % N_KFOLDS_AX )); IDX=$(( IDX / N_KFOLDS_AX ))
-  SEED_IDX=$(( IDX % N_SEEDS ));     IDX=$(( IDX / N_SEEDS ))
+  SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
   REGION_IDX=$(( IDX % N_REGIONS ))
   REGION=${REGIONS[$REGION_IDX]}
   INIT_SEED=${INIT_SEEDS[$SEED_IDX]}
@@ -80,18 +76,14 @@ if [ "$IDX" -lt "$N_KFOLD" ]; then
     --fold "$FOLD" --n_folds "$N_FOLDS" \
     --n_jobs 1 --no_summary $REBUILD
 else
-  # ---- LOSO regime ----
-  N_DATA=$(python -c "from core.data import load_dataset, n_loso_folds; print(n_loso_folds(load_dataset('dataset')))")
-  if [ "$N_DATA" != "$N_SUBJECTS" ]; then
-    echo "[TRTR] ERROR: dataset has $N_DATA subjects but LOSO sized for N_SUBJECTS=$N_SUBJECTS. Fix N_SUBJECTS and --array (=N_KFOLD + 2*N*5 - 1)."; exit 1
-  fi
+  # LOSO regime (N_SUBJECTS is data-driven, set at top)
   LIDX=$(( IDX - N_KFOLD ))
   FOLD_IDX=$(( LIDX % N_SUBJECTS )); LIDX=$(( LIDX / N_SUBJECTS ))
-  SEED_IDX=$(( LIDX % N_SEEDS ));    LIDX=$(( LIDX / N_SEEDS ))
+  SEED_IDX=$(( LIDX % N_SEEDS )); LIDX=$(( LIDX / N_SEEDS ))
   REGION_IDX=$(( LIDX % N_REGIONS ))
   REGION=${REGIONS[$REGION_IDX]}
   INIT_SEED=${INIT_SEEDS[$SEED_IDX]}
-  T=$(( FOLD_IDX + 1 ))            # held-out test subject (1-indexed)
+  T=$(( FOLD_IDX + 1 ))
 
   echo "[TRTR] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} loso region=$REGION init_seed=$INIT_SEED test_subj=$T force_rebuild=$FORCE_REBUILD"
   PYTHONHASHSEED="$INIT_SEED" python -m core.tstr \
@@ -102,5 +94,4 @@ else
     --n_jobs 1 --no_summary $REBUILD
 fi
 
-# Aggregate after the array finishes (merges both protocols into results/summary.csv, cv_mode column):
-#   AGGREGATE=1 sbatch --array=0 experiments/02_trtr.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/02_trtr.sh

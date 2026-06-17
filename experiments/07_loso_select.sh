@@ -7,7 +7,7 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=/home/rane10/logs/loso_select.o%A_%a
 #SBATCH --error=/home/rane10/logs/loso_select.e%A_%a
-#SBATCH --array=0-59%50
+#SBATCH --array=0-79%200
 set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
@@ -22,13 +22,14 @@ conda activate nnbm
 # THEN: sbatch experiments/07_loso_select.sh
 # THEN: python -m core.loso select   (picks best config per outer fold)
 #
-# Array size = REGIONS(2) x N_SUBJECTS(6) x SEEDS(5) = 60  -> --array=0-59
+# Array size = REGIONS(2) x N_SUBJECTS(N from data) x SEEDS(5); default sized for N=8 -> --array=0-79
+# if N changes, submit with --array=0-$((2*N*5-1))%200
 VARIANT=conv_baseline
 PART_DROPOUT=0.1                 # null-token required for LOSO generation
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
 SPLIT_SEED=42
-N_SUBJECTS=6                     # must equal the number of recorded subjects (asserted below)
+# N_SUBJECTS is data-driven (set below from n_loso_folds)
 EPOCHS="${EPOCHS:-500}"
 
 N_REGIONS=${#REGIONS[@]}
@@ -36,11 +37,9 @@ N_SEEDS=${#INIT_SEEDS[@]}
 
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# derive the real subject count from the data and refuse to run if the array was sized wrong
+# derive the real subject count from the data (LOSO axis auto-sizes)
 N_DATA=$(python -c "from core.data import load_dataset, n_loso_folds; print(n_loso_folds(load_dataset('dataset')))")
-if [ "$N_DATA" != "$N_SUBJECTS" ]; then
-  echo "[LOSO-A] ERROR: dataset has $N_DATA subjects but script sized for N_SUBJECTS=$N_SUBJECTS. Fix N_SUBJECTS and --array (=2*N*${N_SEEDS}-1)."; exit 1
-fi
+N_SUBJECTS="$N_DATA"
 if [ "$N_DATA" -lt 4 ]; then
   echo "[LOSO-A] ERROR: nested LOSO needs >=4 subjects (got $N_DATA); Stage A would train on <2. Record more subjects."; exit 1
 fi

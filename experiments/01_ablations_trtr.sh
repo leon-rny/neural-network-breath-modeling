@@ -50,9 +50,9 @@ REBUILD=""
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..259> for a local run}}
 
 if [ "$IDX" -lt "$N_KFOLD" ]; then
-  FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
-  SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
-  REGION_IDX=$(( IDX % N_REGIONS ));  IDX=$(( IDX / N_REGIONS ))
+  FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
+  SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
+  REGION_IDX=$(( IDX % N_REGIONS )); IDX=$(( IDX / N_REGIONS ))
   PIPELINE_IDX=$(( IDX % N_PIPELINES ))
 
   PIPELINE=${PIPELINES[$PIPELINE_IDX]}
@@ -68,7 +68,7 @@ if [ "$IDX" -lt "$N_KFOLD" ]; then
     --n_jobs 1 --no_summary $REBUILD
 else
   LIDX=$(( IDX - N_KFOLD ))
-  SEED_IDX=$(( LIDX % N_SEEDS ));   LIDX=$(( LIDX / N_SEEDS ))
+  SEED_IDX=$(( LIDX % N_SEEDS )); LIDX=$(( LIDX / N_SEEDS ))
   REGION_IDX=$(( LIDX % N_REGIONS ))
 
   REGION=${REGIONS[$REGION_IDX]}

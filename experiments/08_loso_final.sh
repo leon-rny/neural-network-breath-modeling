@@ -7,7 +7,7 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=/home/rane10/logs/loso_final.o%A_%a
 #SBATCH --error=/home/rane10/logs/loso_final.e%A_%a
-#SBATCH --array=0-59%50
+#SBATCH --array=0-79%200
 set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
@@ -22,13 +22,14 @@ conda activate nnbm
 # RUN: sbatch --dependency=afterok:<07-jobid> experiments/08_loso_final.sh
 # THEN: AGGREGATE=1 sbatch --array=0 experiments/08_loso_final.sh   (or: python -m core.loso aggregate)
 #
-# Array size = REGIONS(2) x N_SUBJECTS(6) x SEEDS(5) = 60  -> --array=0-59
+# Array size = REGIONS(2) x N_SUBJECTS(N from data) x SEEDS(5); default sized for N=8 -> --array=0-79
+# if N changes, submit with --array=0-$((2*N*5-1))%200
 VARIANT=conv_baseline
 PART_DROPOUT=0.1
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
 SPLIT_SEED=42
-N_SUBJECTS=6
+# N_SUBJECTS is data-driven (set below from n_loso_folds)
 EPOCHS="${EPOCHS:-500}"
 
 N_REGIONS=${#REGIONS[@]}
@@ -43,8 +44,9 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
 fi
 
 N_DATA=$(python -c "from core.data import load_dataset, n_loso_folds; print(n_loso_folds(load_dataset('dataset')))")
-if [ "$N_DATA" != "$N_SUBJECTS" ]; then
-  echo "[LOSO-B] ERROR: dataset has $N_DATA subjects but script sized for N_SUBJECTS=$N_SUBJECTS."; exit 1
+N_SUBJECTS="$N_DATA"
+if [ "$N_DATA" -lt 4 ]; then
+  echo "[LOSO-B] ERROR: nested LOSO needs >=4 subjects (got $N_DATA)."; exit 1
 fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (sbatch) or TASK_ID for a local run}}
