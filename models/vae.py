@@ -215,6 +215,22 @@ class ConditionalDecoder(nn.Module):
         h = h.view(h.size(0), 64, 36)
         return self.conv(h)
 
+class _GradReverse(torch.autograd.Function):
+    """Gradient Reversal Layer: identity forward, negated (×lambda) gradient backward (DANN)."""
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+
+def grad_reverse(x, lambd: float):
+    return _GradReverse.apply(x, lambd)
+
+
 class CVAE(nn.Module):
     """
     Conditional VAE conditioning on class label.
@@ -223,7 +239,7 @@ class CVAE(nn.Module):
     """
     def __init__(self, latent_dim: int = 16, num_classes: int = 3, embed_dim: int = 8,
                  condition_on_participant: bool = False, num_participants: int = 3, part_embed_dim: int = 8,
-                 part_dropout: float = 0.0) -> None:
+                 part_dropout: float = 0.0, subj_adv: bool = False) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.num_classes = num_classes
@@ -244,6 +260,14 @@ class CVAE(nn.Module):
             self.encoder.part_embed = _expand_embedding_with_null(self.encoder.part_embed)
             self.decoder.part_embed = _expand_embedding_with_null(self.decoder.part_embed)
             torch.set_rng_state(rng_state)
+        # subject-adversarial head: predict participant from z through a GRL so the encoder is pushed
+        # to NOT encode subject identity (targets LOSO subject-overfitting). Unused at generation time.
+        self.subj_adv = subj_adv
+        if subj_adv:
+            self.subj_clf = nn.Sequential(nn.Linear(latent_dim, 64), nn.ReLU(), nn.Linear(64, num_participants))
+
+    def adv_logits(self, z: torch.Tensor, lambd: float) -> torch.Tensor:
+        return self.subj_clf(grad_reverse(z, lambd))
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         if self.training:

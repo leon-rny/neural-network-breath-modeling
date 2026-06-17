@@ -22,7 +22,7 @@ from core.data import BreathDataset, load_dataset, split_dataset
 SEEDS = [0, 1, 7, 42, 123]
 REGIONS = ["mouth", "nose"]
 CLASSES  = ["bradypnea", "eupnea", "tachypnea"]
-PARTICIPANTS = ["a", "p", "s", "e", "f", "g"]
+PARTICIPANTS = ["a", "b", "c", "d", "e", "f", "g", "p", "s"]
 
 # plot settings and colors
 plt.rcParams.update({"legend.fontsize": 9,
@@ -65,7 +65,7 @@ def load_breath_pattern(classes, dataset_dir="../dataset"):
 
             # extract metadata (unprefixed files belong to participant "a";
             # p_/s_/e_/f_/g_ encode the other participants)
-            m = re.match(r"^(([psefg])_)?(mouth|nose)_trial_(\d+)\.dat$", fname)
+            m = re.match(r"^(([bcdpsefg])_)?(mouth|nose)_trial_(\d+)\.dat$", fname)
             if m is None:
                 continue
         

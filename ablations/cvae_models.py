@@ -278,11 +278,17 @@ class _Dec_MLP(nn.Module):
         return self.fc(_gather_parts(z, y, p, self.label_embed, self.part_embed)).view(-1, 2, 36)
 
 class MLP(AblationCVAE):
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
         self.encoder = _Enc_MLP(**kw)
         self.decoder = _Dec_MLP(**kw)
+        # match ConvBaseline: append null-token row only when part_dropout>0 (no-op for the grid, which uses 0)
+        if condition_on_participant and part_dropout > 0.0:
+            rng_state = torch.get_rng_state()
+            self.encoder.part_embed = _expand_embedding_with_null(self.encoder.part_embed)
+            self.decoder.part_embed = _expand_embedding_with_null(self.decoder.part_embed)
+            torch.set_rng_state(rng_state)
 
 # mlp_small: 72->64->32->μ/σ
 class _Enc_MLPSmall(nn.Module):

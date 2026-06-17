@@ -9,8 +9,18 @@ from torch.utils.data import Dataset
 
 CLASSES = ['bradypnea', 'eupnea', 'tachypnea']
 CLASS_TO_IDX = {cls: i for i, cls in enumerate(CLASSES)}
-PARTICIPANTS = ['a', 'e', 'f', 'g', 'p']
+PARTICIPANTS = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'p']
 PARTICIPANT_TO_IDX = {p: i for i, p in enumerate(PARTICIPANTS)}
+
+TARGET_LEN = 36  # canonical trial length; some summer mouth recordings are 35 samples, so off-length
+                 # trials are resampled to this to keep np.stack / fixed-T decoders / the physics t_grid valid.
+
+def _to_target_len(t: np.ndarray, h: np.ndarray, temp: np.ndarray, n: int = TARGET_LEN):
+    '''Resample a single trial to n points over its own time span (identity when already n samples).'''
+    if len(h) == n:
+        return t, h, temp
+    tg = np.linspace(t[0], t[-1], n)
+    return tg, np.interp(tg, t, h), np.interp(tg, t, temp)
 
 def load_dataset(dataset_dir: str = 'dataset') -> pd.DataFrame:
     '''
@@ -25,13 +35,14 @@ def load_dataset(dataset_dir: str = 'dataset') -> pd.DataFrame:
         for fname in sorted(os.listdir(folder)):
             if not fname.endswith('.dat'):
                 continue
-            m = re.match(r'^(([efgp])_)?(mouth|nose)_trial_(\d+)\.dat$', fname)
+            m = re.match(r'^(([bcdefgp])_)?(mouth|nose)_trial_(\d+)\.dat$', fname)
             if m is None:
                 continue
             df = pd.read_csv(os.path.join(folder, fname))
-            records.append({'time': df['Time'].values/1000,
-                            'humidity': df['Humidity'].values,
-                            'temperature': df['Temperature'].values,
+            t, h, temp = _to_target_len(df['Time'].values/1000, df['Humidity'].values, df['Temperature'].values)
+            records.append({'time': t,
+                            'humidity': h,
+                            'temperature': temp,
                             'class': cls,
                             'participant': m.group(2) if m.group(2) else 'a',
                             'region':  m.group(3),
@@ -190,11 +201,33 @@ def loso_path_tag(loso_trial_val: bool, exclude_subject_idxs: tuple = ()) -> str
         tag += '_x' + '-'.join(str(i) for i in sorted(exclude_subject_idxs))
     return tag
 
-def get_split(df: pd.DataFrame, cv_mode: str, fold: int, n_folds: int, split_seed: int = 42, val_size: float = 0.15, exclude_subjects: tuple = (), loso_trial_val: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def subset_tag(include_subjects: tuple = ()) -> str:
+    '''Path/dedup marker for a participant-subset run; empty -> '' so full-pool runs stay byte-identical.'''
+    if not include_subjects:
+        return ''
+    return '_sub' + ''.join(sorted(str(s) for s in include_subjects))
+
+def cir_marker(cir_tag: str = '') -> str:
+    '''run_id/summary marker for an alternate fitted CIR channel (e.g. '300s'); empty = active default channel.'''
+    return '' if not cir_tag else f'_cir{cir_tag}'
+
+def prep_marker(preprocessing: str = 'raw') -> str:
+    '''run_id/summary marker for a signal-preprocessing variant before feature extraction; raw = current default.'''
+    return '' if preprocessing in ('', 'raw') else f'_prep{preprocessing}'
+
+def phys_prep_marker(phys_prep: str = 'peakscale') -> str:
+    '''run_id/summary marker for the physics-generator input normalization (PhysicsInformedDataset); peakscale = current default.'''
+    return '' if phys_prep in ('', 'peakscale') else f'_pp{phys_prep}'
+
+def get_split(df: pd.DataFrame, cv_mode: str, fold: int, n_folds: int, split_seed: int = 42, val_size: float = 0.15, exclude_subjects: tuple = (), loso_trial_val: bool = False, include_subjects: tuple = ()) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     '''Dispatch to the k-fold or LOSO splitter. `fold` is 0-indexed in both modes.
     Under LOSO the fold count is derived from the data (see `n_loso_folds`), so `n_folds`
     is ignored there. When `loso_trial_val` is set, routes to the nested `loso_split_final`
-    (trial-level early-stop val + subject excludes); otherwise the plain subject-level-val LOSO.'''
+    (trial-level early-stop val + subject excludes); otherwise the plain subject-level-val LOSO.
+    `include_subjects` (participant letters) restricts the whole split to a participant subset
+    (empty = full pool); LOSO auto-resizes its fold count to the subset.'''
+    if include_subjects:
+        df = df[df['participant'].isin(include_subjects)].reset_index(drop=True)
     if cv_mode == 'loso':
         if loso_trial_val:
             return loso_split_final(df, test_subject_idx=fold, exclude_subject_idxs=tuple(exclude_subjects), val_size=val_size, split_seed=split_seed)
@@ -241,24 +274,35 @@ class BreathDataset(Dataset):
 
 class PhysicsInformedDataset(Dataset):
     def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None,
-                 alpha: float = 0.0, n_copies: int = 1) -> None:
+                 alpha: float = 0.0, n_copies: int = 1, phys_prep: str = 'peakscale') -> None:
         self.records = dataframe.to_dict('records')
+        self.phys_prep = phys_prep   # input-normalization mode; overridden by stats['phys_prep'] when stats are passed
         self.stats = stats if stats is not None else self._compute_stats()
         self.alpha = alpha
         self.n_copies = max(n_copies, 1)
 
     def _compute_stats(self) -> dict:
-        peak_devs = []
+        h_peak_devs, t_peak_devs, h_bc, t_bc = [], [], [], []
         for r in self.records:
-            baseline = np.mean(r['humidity'][:5])
-            peak_devs.append((r['humidity'] - baseline).max())
-        h_scale = float(np.max(peak_devs) * 1.2)
+            hc = r['humidity'] - np.mean(r['humidity'][:5])
+            tc = r['temperature'] - np.mean(r['temperature'][:5])
+            h_peak_devs.append(hc.max()); t_peak_devs.append(tc.max())
+            h_bc.append(hc); t_bc.append(tc)
+        h_scale = float(np.max(h_peak_devs) * 1.2)
+        # t_scale mirrors h_scale so temperature is baseline-corrected & rise-from-zero like humidity
+        # (matches the non-negative physics transient and balances the per-channel recon loss)
+        t_scale = float(np.max(t_peak_devs) * 1.2)
+        # extra scales for the --phys_prep ablation (unused by the default 'peakscale' path)
+        shared_scale = float(max(h_scale, t_scale))                       # one Lewis-coupled scale for both channels
+        h_bcstd = float(np.concatenate(h_bc).std()); t_bcstd = float(np.concatenate(t_bc).std())
 
         h_all = np.concatenate([r['humidity'] for r in self.records])
         t_all = np.concatenate([r['temperature'] for r in self.records])
         return {'mean': np.array([h_all.mean(), t_all.mean()], dtype=np.float32),
                 'std': np.array([h_all.std(), t_all.std()], dtype=np.float32),
-                'h_scale': h_scale}
+                'h_scale': h_scale, 't_scale': t_scale,
+                'shared_scale': shared_scale, 'h_bcstd': h_bcstd, 't_bcstd': t_bcstd,
+                'phys_prep': self.phys_prep}
 
     def __len__(self) -> int:
         return len(self.records) * self.n_copies
@@ -279,9 +323,17 @@ class PhysicsInformedDataset(Dataset):
                 onset_idx = i
                 break
         
-        # normalize
-        h = h / self.stats['h_scale']
-        t = (r['temperature'] - self.stats['mean'][1]) / self.stats['std'][1]
+        # normalize — both channels baseline-corrected; scaling depends on the phys_prep mode
+        mode = self.stats.get('phys_prep', 'peakscale')
+        t_bc = r['temperature'] - np.mean(r['temperature'][:5])
+        if mode == 'shared':                         # one Lewis-coupled scale for both channels
+            sc = self.stats['shared_scale']; h = h / sc; t = t_bc / sc
+        elif mode == 'stdscale':                     # per-channel baseline-corrected std
+            h = h / self.stats['h_bcstd']; t = t_bc / self.stats['t_bcstd']
+        elif 't_scale' in self.stats:                # peakscale (default): per-channel peak-dev scale
+            h = h / self.stats['h_scale']; t = t_bc / self.stats['t_scale']
+        else:                                        # backward-compat: pre-t_scale checkpoint
+            h = h / self.stats['h_scale']; t = (r['temperature'] - self.stats['mean'][1]) / self.stats['std'][1]
         
         # get all infos
         signal = torch.tensor(np.stack([h, t], axis=0), dtype=torch.float32)
