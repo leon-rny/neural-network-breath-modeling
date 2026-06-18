@@ -3,7 +3,7 @@ import torch.nn as nn
 
 def _expand_embedding_with_null(emb: nn.Embedding) -> nn.Embedding:
     """Return a copy of `emb` with one extra (null-token) row appended.
-    Existing rows are copied byte-for-byte; only the new row is freshly initialised.
+    Existing rows are copied byte-for-byte, only the new row is freshly initialised.
     The caller must save/restore the global RNG around this so surrounding inits stay unperturbed."""
     n, d = emb.weight.shape
     new = nn.Embedding(n + 1, d)
@@ -12,8 +12,7 @@ def _expand_embedding_with_null(emb: nn.Embedding) -> nn.Embedding:
     return new
 
 def elbo_loss(x: torch.Tensor, x_hat: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, beta: float = 1.0, free_bits: float = 0.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    ELBO loss = MSE reconstruction + beta * KL divergence.
+    """ELBO loss = MSE reconstruction + beta * KL divergence.
 
     :param x: (B, 2, 36) original signals
     :param x_hat: (B, 2, 36) reconstructed signals
@@ -23,7 +22,7 @@ def elbo_loss(x: torch.Tensor, x_hat: torch.Tensor, mu: torch.Tensor, logvar: to
     :param free_bits: minimum KL per dimension to prevent posterior collapse
     :return: total loss, reconstruction loss, KL divergence
     """
-    recon = nn.functional.mse_loss(x_hat, x, reduction="mean")
+    recon = nn.functional.mse_loss(x_hat, x, reduction='mean')
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, latent_dim)
     kl_per_dim = kl_per_dim.mean(dim=0) # (latent_dim,)
     kl = torch.clamp(kl_per_dim, min=free_bits).mean()
@@ -31,12 +30,14 @@ def elbo_loss(x: torch.Tensor, x_hat: torch.Tensor, mu: torch.Tensor, logvar: to
 
 # vae
 class Encoder(nn.Module):
-    """
-    Compress a raw signal (B, 2, 36) into a compact description of its distribution in latent space.
+    """Compress a raw signal (B, 2, 36) into a compact description of its distribution in latent space.
     Convolutional layers: first layer extracts simple features, later layers combine those into more complex patterns.
     Fully connected bottleneck: maps the extracted features into a latent distribution (mu, logvar).
     """
     def __init__(self, latent_dim: int = 16) -> None:
+        """
+        :param latent_dim: Dimension of the latent space (default 16).
+        """
         super().__init__()
         # define convolutional layers to extract features from the input signal
         self.conv = nn.Sequential(nn.Conv1d(2, 16, kernel_size=3, padding=1),
@@ -45,7 +46,7 @@ class Encoder(nn.Module):
                                   nn.ReLU(),
                                   nn.Conv1d(32, 64, kernel_size=3, padding=1),
                                   nn.ReLU())
-        
+
         # define fully connected bottleneck
         self.fc = nn.Sequential(nn.Linear(64*36, 128),
                                 nn.ReLU())
@@ -53,8 +54,7 @@ class Encoder(nn.Module):
         self.logvar_head = nn.Linear(128, latent_dim)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Defines forward pass through encoder
+        """Defines forward pass through encoder
 
         :param x: (B, 2, 36) input signals
         :return: (B, latent_dim) mean and log-variance of latent distribution
@@ -65,15 +65,17 @@ class Encoder(nn.Module):
         return self.mu_head(h), self.logvar_head(h)
 
 class Decoder(nn.Module):
-    """
-    Mirror of the encoder that maps a latent vector back to the original signal space.
+    """Mirror of the encoder that maps a latent vector back to the original signal space.
     """
     def __init__(self, latent_dim: int = 16) -> None:
+        """
+        :param latent_dim: Dimension of the latent space (default 16).
+        """
         super().__init__()
         self.fc = nn.Sequential(nn.Linear(latent_dim, 128),
                                 nn.ReLU(),
                                 nn.Linear(128, 64 * 36))
-        
+
         # use transposed convolutions to "deconvolve"
         self.conv = nn.Sequential(nn.ConvTranspose1d(64, 32, kernel_size=3, padding=1),
                                   nn.ReLU(),
@@ -82,8 +84,7 @@ class Decoder(nn.Module):
                                   nn.ConvTranspose1d(16, 2, kernel_size=3, padding=1)) # no activation on final layer
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Defines forward pass through decoder
+        """Defines forward pass through decoder
 
         :param z: (B, latent_dim) latent vectors
         :return: (B, 2, 36) reconstructed signals
@@ -95,15 +96,17 @@ class Decoder(nn.Module):
 class VAE(nn.Module):
     """Combines the encoder and decoder, implements the reparameterization trick and defines a sampling method."""
     def __init__(self, latent_dim: int = 16) -> None:
+        """
+        :param latent_dim: Dimension of the latent space (default 16).
+        """
         super().__init__()
         self.latent_dim = latent_dim
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """
-        Reparameterization trick: during training, sample from the latent distribution using mu and logvar.
-        
+        """Reparameterization trick: during training, sample from the latent distribution using mu and logvar.
+
         :param mu: (B, latent_dim) mean of the latent distribution
         :param logvar: (B, latent_dim) log-variance of the latent distribution
         :return: (B, latent_dim) sampled latent vector
@@ -114,8 +117,7 @@ class VAE(nn.Module):
         return mu
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass through the VAE: encode input, sample from latent distribution, decode to reconstruct.
+        """Forward pass through the VAE: encode input, sample from latent distribution, decode to reconstruct.
 
         :param x: (B, 2, 36) input signals
         :return: (B, 2, 36) reconstructed signals, (B, latent_dim) mean, (B, latent_dim) log-variance
@@ -126,9 +128,8 @@ class VAE(nn.Module):
         return x_hat, mu, logvar
 
     def sample(self, n: int, device: torch.device) -> torch.Tensor:
-        """
-        Sample n signals from the prior N(0, I).
-        
+        """Sample n signals from the prior N(0, I).
+
         :param n: number of samples to generate
         :param device: device to perform sampling on
         :return: (n, 2, 36) generated signals
@@ -140,13 +141,19 @@ class VAE(nn.Module):
 
 # cvae
 class ConditionalEncoder(nn.Module):
-    """
-    Conditional variant of Encoder: conditions the latent distribution on a class label.
+    """Conditional variant of Encoder: conditions the latent distribution on a class label.
     Optionally also conditions on a participant label (condition_on_participant=True).
     The embeddings are concatenated to the flattened conv features before the FC bottleneck.
     """
-    def __init__(self, latent_dim: int = 16, num_classes: int = 3, embed_dim: int = 8,
-                 condition_on_participant: bool = False, num_participants: int = 3, part_embed_dim: int = 8) -> None:
+    def __init__(self, latent_dim: int = 16, num_classes: int = 3, embed_dim: int = 8, condition_on_participant: bool = False, num_participants: int = 3, part_embed_dim: int = 8) -> None:
+        """
+        :param latent_dim: Dimension of the latent space (default 16).
+        :param num_classes: Number of breath classes to condition on (default 3).
+        :param embed_dim: Dimension of the class embedding (default 8).
+        :param condition_on_participant: Whether to also condition on participant id (default False).
+        :param num_participants: Number of participants (default 3).
+        :param part_embed_dim: Dimension of the participant embedding (default 8).
+        """
         super().__init__()
         self._cond_part = condition_on_participant
         self.conv = nn.Sequential(nn.Conv1d(2, 16, kernel_size=3, padding=1),
@@ -179,12 +186,18 @@ class ConditionalEncoder(nn.Module):
         return self.mu_head(h), self.logvar_head(h)
 
 class ConditionalDecoder(nn.Module):
-    """
-    Conditional variant of Decoder: the latent vector is concatenated with a class embedding before reconstruction.
+    """Conditional variant of Decoder: the latent vector is concatenated with a class embedding before reconstruction.
     Optionally also conditions on a participant label (condition_on_participant=True).
     """
-    def __init__(self, latent_dim: int = 16, num_classes: int = 3, embed_dim: int = 8,
-                 condition_on_participant: bool = False, num_participants: int = 3, part_embed_dim: int = 8) -> None:
+    def __init__(self, latent_dim: int = 16, num_classes: int = 3, embed_dim: int = 8, condition_on_participant: bool = False, num_participants: int = 3, part_embed_dim: int = 8) -> None:
+        """
+        :param latent_dim: Dimension of the latent space (default 16).
+        :param num_classes: Number of breath classes to condition on (default 3).
+        :param embed_dim: Dimension of the class embedding (default 8).
+        :param condition_on_participant: Whether to also condition on participant id (default False).
+        :param num_participants: Number of participants (default 3).
+        :param part_embed_dim: Dimension of the participant embedding (default 8).
+        """
         super().__init__()
         self._cond_part = condition_on_participant
         self.label_embed = nn.Embedding(num_classes, embed_dim)
@@ -216,66 +229,73 @@ class ConditionalDecoder(nn.Module):
         return self.conv(h)
 
 class _GradReverse(torch.autograd.Function):
-    """Gradient Reversal Layer: identity forward, negated (×lambda) gradient backward (DANN)."""
+    """Gradient Reversal Layer: identity forward, negated (*lambda) gradient backward (DANN)."""
     @staticmethod
     def forward(ctx, x, lambd):
+        """Identity forward pass; stash lambda for the backward negation."""
         ctx.lambd = lambd
         return x.view_as(x)
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Negate and scale the incoming gradient by lambda (gradient reversal)."""
         return -ctx.lambd * grad_output, None
 
 
 def grad_reverse(x, lambd: float):
+    """Apply the gradient reversal layer to `x` with reversal strength `lambd`."""
     return _GradReverse.apply(x, lambd)
 
-
 class CVAE(nn.Module):
-    """
-    Conditional VAE conditioning on class label.
+    """Conditional VAE conditioning on class label.
     Set condition_on_participant=True to also condition on participant during training;
     at generation time participant is sampled uniformly to marginalise over identity.
     """
-    def __init__(self, latent_dim: int = 16, num_classes: int = 3, embed_dim: int = 8,
-                 condition_on_participant: bool = False, num_participants: int = 3, part_embed_dim: int = 8,
-                 part_dropout: float = 0.0, subj_adv: bool = False) -> None:
+    def __init__(self, latent_dim: int = 16, num_classes: int = 3, embed_dim: int = 8, condition_on_participant: bool = False, num_participants: int = 3, part_embed_dim: int = 8, part_dropout: float = 0.0, subj_adv: bool = False) -> None:
+        """
+        :param latent_dim: Dimension of the latent space (default 16).
+        :param num_classes: Number of breath classes to condition on (default 3).
+        :param embed_dim: Dimension of the class embedding (default 8).
+        :param condition_on_participant: Whether to also condition on participant id (default False).
+        :param num_participants: Number of participants (default 3).
+        :param part_embed_dim: Dimension of the participant embedding (default 8).
+        :param part_dropout: Probability of dropping participant conditioning to the null token during training (default 0.0).
+        :param subj_adv: Whether to add a gradient-reversal subject-adversary head on the latent (default False).
+        """
         super().__init__()
         self.latent_dim = latent_dim
         self.num_classes = num_classes
         self.num_participants = num_participants
         self._cond_part = condition_on_participant
-        # CFG-style participant dropout: with prob part_dropout swap the batch to a learned null token.
-        # null row sits just past the real participants; only allocated when part_dropout > 0.
+        # participant dropout
         self.part_dropout = part_dropout
         self.null_part_idx = num_participants
         self._null_steps = 0
         self._total_steps = 0
         self.encoder = ConditionalEncoder(latent_dim, num_classes, embed_dim, condition_on_participant, num_participants, part_embed_dim)
         self.decoder = ConditionalDecoder(latent_dim, num_classes, embed_dim, condition_on_participant, num_participants, part_embed_dim)
-        # append the null-token row last, with RNG save/restore so every other param keeps its exact draw
-        # (part_dropout==0 → no expansion → byte-identical to a model built without this feature)
         if condition_on_participant and part_dropout > 0.0:
             rng_state = torch.get_rng_state()
             self.encoder.part_embed = _expand_embedding_with_null(self.encoder.part_embed)
             self.decoder.part_embed = _expand_embedding_with_null(self.decoder.part_embed)
             torch.set_rng_state(rng_state)
-        # subject-adversarial head: predict participant from z through a GRL so the encoder is pushed
-        # to NOT encode subject identity (targets LOSO subject-overfitting). Unused at generation time.
         self.subj_adv = subj_adv
         if subj_adv:
             self.subj_clf = nn.Sequential(nn.Linear(latent_dim, 64), nn.ReLU(), nn.Linear(64, num_participants))
 
     def adv_logits(self, z: torch.Tensor, lambd: float) -> torch.Tensor:
+        """Subject-classifier logits from z through the gradient reversal layer (DANN adversary)."""
         return self.subj_clf(grad_reverse(z, lambd))
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Reparameterization trick: sample z ~ N(mu, sigma) while training, return mu at eval."""
         if self.training:
             std = (0.5 * logvar).exp()
             return mu + std * torch.randn_like(std)
         return mu
 
     def null_fire_frac(self) -> float:
+        """Fraction of training steps that fired the participant null token (dropout monitor)."""
         return self._null_steps / self._total_steps if self._total_steps else 0.0
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, p: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -285,7 +305,7 @@ class CVAE(nn.Module):
         :param p: (B,) integer participant labels (required when condition_on_participant=True)
         :return: (B, 2, 36) reconstructed signals, (B, latent_dim) mu, (B, latent_dim) logvar
         """
-        # training-only participant dropout; guarded so part_dropout==0 draws no RNG (stays byte-identical)
+        # training-only participant dropout
         if self.training and self._cond_part and p is not None and self.part_dropout > 0.0:
             self._total_steps += 1
             if torch.rand(1).item() < self.part_dropout:
@@ -297,8 +317,7 @@ class CVAE(nn.Module):
         return x_hat, mu, logvar
 
     def sample(self, n: int, y: torch.Tensor, device: torch.device, participant: int | None = None) -> torch.Tensor:
-        """
-        Sample n signals conditioned on class labels y.
+        """Sample n signals conditioned on class labels y.
         When condition_on_participant=True, participant is sampled uniformly over real subjects,
         unless `participant` is given (e.g. null_part_idx for LOSO generation of an unseen subject).
 

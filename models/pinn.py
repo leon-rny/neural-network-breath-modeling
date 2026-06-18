@@ -7,25 +7,34 @@ from models.vae import CVAE
 
 # physics cvae
 class CIRConvolution(nn.Module):
+    """Differentiable advection-diffusion channel plus sensor-lag convolution. Maps a per-sample
+    source u(t) to the observed signal y = u conv (h_channel * s), where h(D, v) is the channel
+    kernel and s(tau_s) the first-order sensor kernel; kernels are unit-integral normalised."""
     def __init__(self, t_grid: np.ndarray, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5):
+        """
+        :param t_grid: 1D array of sample times (seconds) defining the kernel grid.
+        :param tau_s: Sensor lag time constant in seconds (default 15.0).
+        :param d0: Source-to-sensor distance in metres (default 0.03).
+        :param baseline_samples: Number of leading samples held at zero for the pre-onset baseline (default 5).
+        """
         super().__init__()
         self.d0 = d0
         self.tau_s = tau_s
 
         # time grid
         t = torch.tensor(t_grid, dtype=torch.float32)
-        self.register_buffer("t", t)
+        self.register_buffer('t', t)
         self.dt = float(t[1] - t[0])
         self.T = len(t_grid)
 
         # fixed sensor kernel
         s = torch.where(t > 0, (1.0 / tau_s) * torch.exp(-t / tau_s), torch.zeros_like(t))
-        self.register_buffer("s", s)
+        self.register_buffer('s', s)
 
         # baseline mask
         mask = torch.ones(self.T)
         mask[:baseline_samples] = 0.0
-        self.register_buffer("baseline_mask", mask)
+        self.register_buffer('baseline_mask', mask)
 
     def _sensor_kernel(self, log_tau_s=None):
         """Fixed sensor kernel (buffer) unless a learnable log_tau_s is supplied, in which case
@@ -36,6 +45,14 @@ class CIRConvolution(nn.Module):
         return torch.where(self.t > 0, (1.0 / tau_s) * torch.exp(-self.t / tau_s), torch.zeros_like(self.t))
 
     def compute_kernels(self, log_A, log_D, log_v, log_tau_s=None):
+        """Build per-sample advection-diffusion channel kernels, convolved with the sensor kernel.
+
+        :param log_A: (B,) log amplitude (normalised out by the unit-integral rescaling).
+        :param log_D: (B,) log diffusion coefficient.
+        :param log_v: (B,) log advection velocity.
+        :param log_tau_s: Optional scalar log sensor lag; if None the fixed sensor buffer is used.
+        :return: (B, T) unit-integral channel-plus-sensor kernels.
+        """
         A = torch.exp(log_A).unsqueeze(1)
         D = torch.exp(log_D).unsqueeze(1)
         v = torch.exp(log_v).unsqueeze(1)
@@ -64,11 +81,21 @@ class CIRConvolution(nn.Module):
         return h_full
 
     def forward(self, u, log_A, log_D, log_v, log_tau_s=None, apply_softplus=True):
+        """Convolve a per-sample source with its channel kernel to get the observed signal.
+
+        :param u: (B, T) raw source, softplus'd into a non-negative source unless apply_softplus is False.
+        :param log_A: (B,) log amplitude.
+        :param log_D: (B,) log diffusion coefficient.
+        :param log_v: (B,) log advection velocity.
+        :param log_tau_s: Optional scalar log sensor lag (None uses the fixed sensor kernel).
+        :param apply_softplus: Whether to softplus `u` into a non-negative source (default True).
+        :return: (B, T) observed signal and the (B, T) baseline-masked source.
+        """
         # apply softplus (free source) or pass through (already-non-negative parametric source) + baseline mask
         u_clean = (F.softplus(u) if apply_softplus else u) * self.baseline_mask
 
         # per-sample kernels
-        kernels = self.compute_kernels(log_A, log_D, log_v, log_tau_s)   # (B, T)
+        kernels = self.compute_kernels(log_A, log_D, log_v, log_tau_s)  # (B, T)
 
         # per-sample convolution (channels-as-batch trick for groups=B)
         B, T = u_clean.shape
@@ -80,8 +107,20 @@ class CIRConvolution(nn.Module):
         return y, u_clean
 
 class PhysicsInformedCVAE(CVAE):
-    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03,
-                 baseline_samples: int = 5, learn_cir_params: bool = True, **cvae_kwargs):
+    """CVAE with a physics side-head: a latent-driven source u(t) is pushed through the CIR channel
+    to give a physics humidity estimate used as a training penalty. The conv decoder still produces
+    x_hat (what the sampler emits) and the physics output is auxiliary - superseded by
+    SharedTransportPINN, where physics IS the generative output."""
+    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, learn_cir_params: bool = True, **cvae_kwargs):
+        """
+        :param cir_params_init: (A, D, v, ...) initial channel parameters from the SIR fit.
+        :param t_grid: 1D array of sample times (seconds) for the channel kernel.
+        :param tau_s: Sensor lag time constant in seconds (default 15.0).
+        :param d0: Source-to-sensor distance in metres (default 0.03).
+        :param baseline_samples: Number of leading samples held at the pre-onset baseline (default 5).
+        :param learn_cir_params: Whether to predict per-sample (A, D, v) from z instead of fixing them (default True).
+        :param cvae_kwargs: Forwarded to the base CVAE (latent_dim, num_classes, conditioning, ...).
+        """
         super().__init__(**cvae_kwargs)
         # snapshot the RNG state the plain CVAE would leave, so the physics heads below
         # don't shift the reparameterize noise stream (restored at the end of __init__).
@@ -108,14 +147,15 @@ class PhysicsInformedCVAE(CVAE):
                 self.cir_param_head[-1].bias.copy_(torch.tensor([log_A_init, log_D_init, log_v_init], dtype=torch.float32))
                 self.cir_param_head[-1].weight.data *= 0.01
         else:
-            self.register_buffer("log_A_fixed", torch.tensor(log_A_init, dtype=torch.float32))
-            self.register_buffer("log_D_fixed", torch.tensor(log_D_init, dtype=torch.float32))
-            self.register_buffer("log_v_fixed", torch.tensor(log_v_init, dtype=torch.float32))
+            self.register_buffer('log_A_fixed', torch.tensor(log_A_init, dtype=torch.float32))
+            self.register_buffer('log_D_fixed', torch.tensor(log_D_init, dtype=torch.float32))
+            self.register_buffer('log_v_fixed', torch.tensor(log_v_init, dtype=torch.float32))
 
         # restore so the global RNG state
         torch.set_rng_state(rng_state)
 
     def _cir_params(self, z):
+        """Per-sample log (A, D, v): predicted from z when learnable, else the fixed buffers broadcast over the batch."""
         if self.learn_cir_params:
             log_A, log_D, log_v = self.cir_param_head(z).unbind(dim=1)
         else:
@@ -126,6 +166,13 @@ class PhysicsInformedCVAE(CVAE):
         return log_A, log_D, log_v
 
     def forward(self, x, y, p=None):
+        """Encode -> sample z -> decode x_hat, plus the auxiliary physics humidity from the CIR head.
+
+        :param x: (B, 2, 36) input signals.
+        :param y: (B,) integer class labels.
+        :param p: Optional (B,) participant labels (required when conditioning on participant).
+        :return: x_hat, mu, logvar, softplus source, (log_A, log_D, log_v), physics humidity.
+        """
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
         x_hat = self.decoder(z, y, p)
@@ -137,6 +184,15 @@ class PhysicsInformedCVAE(CVAE):
         return x_hat, mu, logvar, u_post_softplus, (log_A, log_D, log_v), humidity_phys
 
     def sample(self, n, y, device, return_aux: bool = False, participant: int | None = None):
+        """Sample n signals from the conv decoder; optionally also return the physics aux outputs.
+
+        :param n: Number of samples to generate.
+        :param y: (n,) class labels (or scalar broadcast to n).
+        :param device: Device to generate on.
+        :param return_aux: Whether to also return the source, (log_A, log_D, log_v) and physics humidity (default False).
+        :param participant: Fixed participant id (e.g. null_part_idx for LOSO); None samples uniformly.
+        :return: x_hat, or (x_hat, source, (log_A, log_D, log_v), physics humidity) when return_aux is True.
+        """
         z = torch.randn(n, self.latent_dim, device=device)
         if y.dim() == 0:
             y = y.expand(n)
@@ -162,46 +218,35 @@ class PhysicsInformedCVAE(CVAE):
 class SharedTransportPINN(CVAE):
     """Physics-AS-decoder generative model with a shared advection-diffusion transport for BOTH
     channels (heat-mass / Lewis analogy: exhaled heat and water-vapour ride the same turbulent
-    airflow, so they share the transport (D, v) and differ only in their per-channel source u).
+    airflow, so they share the transport (D, v) and differ only in their per-channel source u)."""
 
-    Unlike `PhysicsInformedCVAE` (where physics was a side-penalty that the sampler *discarded*),
-    here the physics IS the generative output: x_hat = [u_H * h(D,v), u_T * h(D,v)]. The transport
-    kernel is unit-integral normalised so amplitude lives entirely in the (non-negative, rise-from-0)
-    sources u_H, u_T; the shared, subject-invariant (D, v) is the regulariser that should transfer
-    across unseen subjects (LOSO). The conv decoder of the base CVAE is inherited (encoder + the
-    null-token machinery come with it) but its conv stack is unused — only its label/part embeddings
-    are reused to condition the sources."""
-
-    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03,
-                 baseline_samples: int = 5, learn_transport: bool = False, residual: bool = False,
-                 class_transport: bool = False, parametric_source: bool = False, **cvae_kwargs):
+    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, learn_transport: bool = False, residual: bool = False, class_transport: bool = False, parametric_source: bool = False, **cvae_kwargs):
+        """
+        :param cir_params_init: (A, D, v, ...) initial transport parameters from the SIR fit (A is unused; the kernel is unit-integral).
+        :param t_grid: 1D array of sample times (seconds) for the transport kernel.
+        :param tau_s: Sensor lag time constant in seconds (default 15.0).
+        :param d0: Source-to-sensor distance in metres (default 0.03).
+        :param baseline_samples: Number of leading samples held at the pre-onset baseline (default 5).
+        :param learn_transport: Whether to learn a single global (D, v) instead of fixing them (default False).
+        :param residual: Whether to add the conv decoder output as a class-discriminative residual on the physics envelope (default False).
+        :param class_transport: Whether to learn per-class (D, v) plus a global learnable sensor lag (default False).
+        :param parametric_source: Whether to replace the learned source heads with an analytic per-class sigmoid injection (default False).
+        :param cvae_kwargs: Forwarded to the base CVAE (latent_dim, num_classes, conditioning, ...).
+        """
         super().__init__(**cvae_kwargs)
         rng_state = torch.get_rng_state()
         self.cir_conv = CIRConvolution(t_grid, tau_s=tau_s, d0=d0, baseline_samples=baseline_samples)
         T = len(t_grid)
         self.learn_transport = learn_transport
-        # class_transport: per-class learnable (D,v) + a learnable global sensor lag tau_s, so the
-        # physics expresses the breath class through interpretable transport AND can correct the
-        # diagnosed over-smoothing (fixed tau_s=15s is ~2.5x too sluggish for the data's transient).
         self.class_transport = class_transport
-        # parametric_source: replace the free 36-dim source MLPs with an interpretable analytic
-        # injection u(t)=A*sigmoid((t-t0)/rate) whose params (onset t0, ramp rate, per-channel
-        # amplitude) are PER-CLASS (deterministic base, indexed by y) + a small z perturbation. This
-        # removes the free-source degeneracy (which made transport unidentifiable) so the class flows
-        # through identifiable physics and prior-sampling is class-faithful. Transport is global+learnable.
         self.parametric_source = parametric_source
         if parametric_source:
-            self.src_base = nn.Embedding(self.num_classes, 4)   # [t0_raw, rate_raw, A_H_raw, A_T_raw] per class
-            self.src_pert = nn.Linear(self.latent_dim, 4)       # within-class variation from z
+            self.src_base = nn.Embedding(self.num_classes, 4)  # [t0_raw, rate_raw, A_H_raw, A_T_raw] per class
+            self.src_pert = nn.Linear(self.latent_dim, 4)  # within-class variation from z
             nn.init.zeros_(self.src_base.weight)
-            nn.init.zeros_(self.src_pert.weight); nn.init.zeros_(self.src_pert.bias)
-        # residual=True: add the inherited conv decoder as a learned residual on top of the physics
-        # envelope (x_hat = physics + decoder), to recover the class-discriminative capacity the
-        # pure-physics decoder lacks while keeping the shared-transport physics as the base.
+            nn.init.zeros_(self.src_pert.weight)
+            nn.init.zeros_(self.src_pert.bias)
         self.residual = residual
-
-        # sources conditioned on [z, class_embed, participant_embed] (reuse the decoder's embeddings
-        # so the null-token expansion done in CVAE.__init__ is shared for LOSO generation)
         emb = self.decoder.label_embed.embedding_dim
         cond_dim = self.latent_dim + emb + (self.decoder.part_embed.embedding_dim if self._cond_part else 0)
         self.uH_head = nn.Sequential(nn.Linear(cond_dim, 64), nn.ReLU(), nn.Linear(64, T))
@@ -224,24 +269,32 @@ class SharedTransportPINN(CVAE):
             self.log_D = nn.Parameter(torch.tensor(log_D_init, dtype=torch.float32))
             self.log_v = nn.Parameter(torch.tensor(log_v_init, dtype=torch.float32))
         else:
-            self.register_buffer("log_D", torch.tensor(log_D_init, dtype=torch.float32))
-            self.register_buffer("log_v", torch.tensor(log_v_init, dtype=torch.float32))
+            self.register_buffer('log_D', torch.tensor(log_D_init, dtype=torch.float32))
+            self.register_buffer('log_v', torch.tensor(log_v_init, dtype=torch.float32))
         torch.set_rng_state(rng_state)
 
     def _cond(self, z, y, p):
+        """Concatenate z with the class (and optional participant) embedding into the source-head conditioning vector."""
         parts = [z, self.decoder.label_embed(y)]
         if self._cond_part and p is not None:
             parts.append(self.decoder.part_embed(p))
         return torch.cat(parts, dim=1)
 
     def _physics(self, z, y, p):
+        """Run the shared-transport physics decoder: build sources u_H, u_T and push them through the shared kernel.
+
+        :param z: (B, latent_dim) latent vectors.
+        :param y: (B,) integer class labels.
+        :param p: Optional (B,) participant labels.
+        :return: x_hat (B, 2, 36), the humidity/temperature sources u_H and u_T, and (zero_A, log_D, log_v).
+        """
         B = z.shape[0]
-        zero_A = torch.zeros(B, device=z.device)          # A is normalised out of the unit-integral kernel
-        # --- transport params ---
+        zero_A = torch.zeros(B, device=z.device)  # A is normalised out of the unit-integral kernel
+        # transport params
         if self.class_transport:
-            log_D = self.log_D[y]                          # per-class transport, indexed by breath class
+            log_D = self.log_D[y]  # per-class transport, indexed by breath class
             log_v = self.log_v[y]
-            log_tau_s = self.log_tau_s                     # learnable global sensor lag
+            log_tau_s = self.log_tau_s  # learnable global sensor lag
         elif self.parametric_source:
             log_D = self.log_D.expand(B)
             log_v = self.log_v.expand(B)
@@ -250,15 +303,16 @@ class SharedTransportPINN(CVAE):
             log_D = self.log_D.expand(B)
             log_v = self.log_v.expand(B)
             log_tau_s = None
-        # --- sources ---
+        # sources
         if self.parametric_source:
-            raw = self.src_base(y) + 0.1 * self.src_pert(z)            # per-class base + small z variation
+            raw = self.src_base(y) + 0.1 * self.src_pert(z)  # per-class base + small z variation
             T = self.cir_conv.T
-            idx = torch.arange(T, device=z.device, dtype=torch.float32).unsqueeze(0)   # (1,T) sample index
-            t0 = torch.sigmoid(raw[:, 0:1]) * T                        # onset in [0,T] samples
-            rate = F.softplus(raw[:, 1:2]) + 0.5                       # ramp width
-            A_H = F.softplus(raw[:, 2:3]); A_T = F.softplus(raw[:, 3:4])
-            uH_src = A_H * torch.sigmoid((idx - t0) / rate)            # interpretable analytic injection
+            idx = torch.arange(T, device=z.device, dtype=torch.float32).unsqueeze(0)  # (1,T) sample index
+            t0 = torch.sigmoid(raw[:, 0:1]) * T  # onset in [0,T] samples
+            rate = F.softplus(raw[:, 1:2]) + 0.5  # ramp width
+            A_H = F.softplus(raw[:, 2:3])
+            A_T = F.softplus(raw[:, 3:4])
+            uH_src = A_H * torch.sigmoid((idx - t0) / rate)  # interpretable analytic injection
             uT_src = A_T * torch.sigmoid((idx - t0) / rate)
             humidity_phys, uH = self.cir_conv(uH_src, zero_A, log_D, log_v, log_tau_s, apply_softplus=False)
             temperature_phys, uT = self.cir_conv(uT_src, zero_A, log_D, log_v, log_tau_s, apply_softplus=False)
@@ -268,11 +322,18 @@ class SharedTransportPINN(CVAE):
             temperature_phys, uT = self.cir_conv(self.uT_head(c), zero_A, log_D, log_v, log_tau_s)
         x_hat = torch.stack([humidity_phys, temperature_phys], dim=1)
         if self.residual:
-            x_hat = x_hat + self.decoder(z, y, p)   # class-discriminative residual on the physics envelope
+            x_hat = x_hat + self.decoder(z, y, p)  # class-discriminative residual on the physics envelope
         return x_hat, uH, uT, (zero_A, log_D, log_v)
 
     def forward(self, x, y, p=None):
-        # CFG-style participant dropout (reuse CVAE's null-token logic), then encode → z → physics
+        """Encode -> sample z -> emit physics x_hat (both channels share the transport kernel).
+
+        :param x: (B, 2, 36) input signals.
+        :param y: (B,) integer class labels.
+        :param p: Optional (B,) participant labels (required when conditioning on participant).
+        :return: x_hat, mu, logvar, humidity source u_H, (zero_A, log_D, log_v), physics humidity channel.
+        """
+        # CFG-style participant dropout (reuse CVAE's null-token logic), then encode -> z -> physics
         if self.training and self._cond_part and p is not None and self.part_dropout > 0.0:
             self._total_steps += 1
             if torch.rand(1).item() < self.part_dropout:
@@ -281,11 +342,19 @@ class SharedTransportPINN(CVAE):
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
         x_hat, uH, _uT, cir = self._physics(z, y, p)
-        # 6-tuple matching PhysicsInformedCVAE so the existing pinn train loop is reused (lambda_phys=0):
-        # (x_hat, mu, logvar, u_post_softplus, cir_params, humidity_phys)
+
         return x_hat, mu, logvar, uH, cir, x_hat[:, 0, :]
 
     def sample(self, n, y, device, return_aux: bool = False, participant: int | None = None):
+        """Generate n signals by emitting the physics decoder output; optionally also return the sources.
+
+        :param n: Number of samples to generate.
+        :param y: (n,) class labels (or scalar broadcast to n).
+        :param device: Device to generate on.
+        :param return_aux: Whether to also return u_H, u_T and (zero_A, log_D, log_v) (default False).
+        :param participant: Fixed participant id (e.g. null_part_idx for LOSO); None samples uniformly.
+        :return: x_hat, or (x_hat, u_H, u_T, (zero_A, log_D, log_v)) when return_aux is True.
+        """
         z = torch.randn(n, self.latent_dim, device=device)
         if y.dim() == 0:
             y = y.expand(n)
@@ -297,7 +366,7 @@ class SharedTransportPINN(CVAE):
             p = torch.randint(0, self.num_participants, (n,), device=device)
         self.eval()
         with torch.no_grad():
-            x_hat, uH, uT, cir = self._physics(z, y.to(device), p)   # generation EMITS physics
+            x_hat, uH, uT, cir = self._physics(z, y.to(device), p)  # generation EMITS physics
         if return_aux:
             return x_hat, uH, uT, cir
         return x_hat
