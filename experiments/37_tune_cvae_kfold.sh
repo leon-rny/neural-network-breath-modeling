@@ -17,7 +17,7 @@ conda activate nnbm
 # via the JournalFile backend (results/tuning/<model>_<region>_v4.log, load_if_exists), so they
 # explore concurrently. 8 workers/region x N_TRIALS_PER_WORKER trials. SEARCH fidelity: 200 epochs,
 # folds {1,3} x seeds {0,42} (whose trtr caches already exist -> no rebuild). Validate the winner
-# afterwards at full 500ep x 5fold x 5seed (experiments/19_tune_validate.sh, generated from best.json).
+# afterwards at full 500ep x 5fold x 5seed (experiments/38_tune_cvae_validate.sh, generated from best.json).
 MODEL="${MODEL:-cvae}"            # cvae | cvae_part | vae
 REGIONS=(mouth nose)
 WORKERS_PER_REGION=8
@@ -31,7 +31,7 @@ REGION=${REGIONS[$(( IDX / WORKERS_PER_REGION ))]}
 SAMPLER_SEED=$(( IDX ))           # distinct TPE seed per worker -> diverse proposals
 
 echo "[TUNE] worker=$IDX model=$MODEL region=$REGION sampler_seed=$SAMPLER_SEED trials=$N_TRIALS_PER_WORKER epochs=$SEARCH_EPOCHS"
-python -m core.tuning --model "$MODEL" --region "$REGION" \
+python -m ablations.tuning optuna --model "$MODEL" --region "$REGION" \
   --n_trials "$N_TRIALS_PER_WORKER" --epochs "$SEARCH_EPOCHS" \
   --folds 1 3 --seeds 0 42 --split_seed 42 --n_folds 5 \
   --n_jobs 1 --sampler_seed "$SAMPLER_SEED"

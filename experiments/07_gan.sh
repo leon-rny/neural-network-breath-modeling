@@ -63,4 +63,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr --model gan --region "$REGION" $
   --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --alpha "$ALPHA" --n_copies "$N_COPIES" \
   --n_jobs 1 --eval_val --no_summary
 
-# Aggregate: AGGREGATE=1 [CV_MODE=loso] sbatch --array=0 experiments/23_gan.sh
+# Aggregate: AGGREGATE=1 [CV_MODE=loso] sbatch --array=0 experiments/07_gan.sh

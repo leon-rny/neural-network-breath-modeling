@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=tpinnres_loso
+#SBATCH --job-name=tpinnps_loso
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=4G
 #SBATCH --time=12:00:00
-#SBATCH --output=/home/rane10/logs/tpinnres_loso.o%A_%a
-#SBATCH --error=/home/rane10/logs/tpinnres_loso.e%A_%a
+#SBATCH --output=/home/rane10/logs/tpinnps_loso.o%A_%a
+#SBATCH --error=/home/rane10/logs/tpinnps_loso.e%A_%a
 #SBATCH --array=0-79%200
 set -euo pipefail
 
@@ -38,8 +38,8 @@ N_FOLDS_AX=${#FOLDS[@]}
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
-  echo "[TPINNRES-LOSO] aggregate-only: merging per-combo LOSO TSTR results into results/summary.csv"
-  python -m core.tstr --aggregate --model tpinn --cv_mode loso --phys_residual \
+  echo "[TPINNPS-LOSO] aggregate-only: merging per-combo LOSO TSTR results into results/summary.csv"
+  python -m core.tstr --aggregate --model tpinn --cv_mode loso --parametric_source \
     --regions "$(IFS=, ; echo "${REGIONS[*]}")" \
     --init_seeds "$(IFS=, ; echo "${INIT_SEEDS[*]}")" \
     --folds "$(IFS=, ; echo "${FOLDS[*]}")" \
@@ -57,18 +57,18 @@ REGION=${REGIONS[$REGION_IDX]}
 INIT_SEED=${INIT_SEEDS[$SEED_IDX]}
 FOLD=${FOLDS[$FOLD_IDX]}
 
-echo "[TPINNRES-LOSO] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} region=$REGION init_seed=$INIT_SEED held_out_subject=$FOLD"
+echo "[TPINNPS-LOSO] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} region=$REGION init_seed=$INIT_SEED held_out_subject=$FOLD"
 
 PARAMS="results/pinn/params_${REGION}.npy"
-[ -f "$PARAMS" ] || { echo "[TPINNRES-LOSO] ERROR: missing CIR params ($PARAMS)."; exit 1; }
+[ -f "$PARAMS" ] || { echo "[TPINNPS-LOSO] ERROR: missing CIR params ($PARAMS)."; exit 1; }
 
-RUN_ID="${REGION}_s${INIT_SEED}_ld${LATENT_DIM}_ed${EMBED_DIM}_tphys_res_f${FOLD}_loso_drop${PART_DROPOUT}_a${ALPHA}_n${N_COPIES}"
+RUN_ID="${REGION}_s${INIT_SEED}_ld${LATENT_DIM}_ed${EMBED_DIM}_tphys_ps_f${FOLD}_loso_drop${PART_DROPOUT}_a${ALPHA}_n${N_COPIES}"
 CKPT="results/tpinn/${RUN_ID}_checkpoint.pt"
 if [ -f "$CKPT" ]; then
-  echo "[TPINNRES-LOSO] checkpoint exists, skipping training: $CKPT"
+  echo "[TPINNPS-LOSO] checkpoint exists, skipping training: $CKPT"
 else
   PYTHONHASHSEED="$INIT_SEED" python -m core.train \
-    --model tpinn --region "$REGION" --cv_mode loso --phys_residual \
+    --model tpinn --region "$REGION" --cv_mode loso --parametric_source --tau_s 5 \
     --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" \
     --fold "$FOLD" --n_folds "$N_FOLDS" --epochs "$EPOCHS" \
     --part_dropout "$PART_DROPOUT" \
@@ -77,11 +77,11 @@ else
 fi
 
 PYTHONHASHSEED="$INIT_SEED" python -m core.tstr \
-  --model tpinn --region "$REGION" --cv_mode loso --phys_residual \
+  --model tpinn --region "$REGION" --cv_mode loso --parametric_source --tau_s 5 \
   --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" \
   --fold "$FOLD" --n_folds "$N_FOLDS" \
   --part_dropout "$PART_DROPOUT" \
   --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --alpha "$ALPHA" --n_copies "$N_COPIES" \
   --n_jobs 1 --eval_val --no_summary
 
-# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/11_tpinnres_loso.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/28_tpinn_parametric_source_loso.sh

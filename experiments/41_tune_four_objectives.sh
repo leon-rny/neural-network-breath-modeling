@@ -14,9 +14,9 @@ conda activate nnbm
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 # PHASE 4d — tune cvae_part + tpinn-res for 4 objectives (tstr/loso/tstr+/loso+). One array task = one
-# manifest row (see core/gen_tune4_manifest.py). Set MANIFEST=<tsv> and EPOCHS, submit with the row count:
-#   MANIFEST=results/tuning4/search.tsv   EPOCHS=200 sbatch --array=0-$((N-1))%200 experiments/35_tune4obj.sh
-#   MANIFEST=results/tuning4/validate.tsv EPOCHS=500 sbatch --array=0-$((N-1))%200 experiments/35_tune4obj.sh
+# manifest row (see ablations/tuning.py). Set MANIFEST=<tsv> and EPOCHS, submit with the row count:
+#   MANIFEST=results/tuning4/search.tsv   EPOCHS=200 sbatch --array=0-$((N-1))%200 experiments/41_tune_four_objectives.sh
+#   MANIFEST=results/tuning4/validate.tsv EPOCHS=500 sbatch --array=0-$((N-1))%200 experiments/41_tune_four_objectives.sh
 # (N = data rows = lines-in-tsv minus the header.) hp_tag namespaces every run -> no summary writes (jsons only).
 MANIFEST="${MANIFEST:?set MANIFEST=path to manifest tsv}"
 EPOCHS="${EPOCHS:?set EPOCHS}"

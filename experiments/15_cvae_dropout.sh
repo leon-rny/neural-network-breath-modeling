@@ -89,4 +89,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae --mode dynamics \
   --skip_existing \
   --no_summary
 
-# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/07_ablation_part_dropout.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/15_cvae_dropout.sh

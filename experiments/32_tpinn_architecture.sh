@@ -22,7 +22,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM
 # ALL on stdscale + the ACTIVE (legacy-76s) channel. Compare to tpinn-res-stdscale (0.787/0.651 KF; 0.535/0.606 LOSO).
 # Launch one CONFIG per array job (chain them); kfold -> --array=0-49%200, loso -> --array=0-79%200:
 #   CONFIG=ctres_kfold|ctres_loso|learnres_kfold|learnres_loso
-# Aggregate: CONFIG=<cfg> AGGREGATE=1 sbatch --array=0 experiments/32_tpinn_arch.sh
+# Aggregate: CONFIG=<cfg> AGGREGATE=1 sbatch --array=0 experiments/32_tpinn_architecture.sh
 PHYS_PREP="${PHYS_PREP:-stdscale}"
 LATENT_DIM=16; EMBED_DIM=8; PART_EMBED_DIM=8; BETA_MAX=0.01; ALPHA=0.05; N_COPIES=10
 REGIONS=(mouth nose); SEEDS=(0 1 7 42 123); SPLIT_SEED=42; EPOCHS="${EPOCHS:-500}"

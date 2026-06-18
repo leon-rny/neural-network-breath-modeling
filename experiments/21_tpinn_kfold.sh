@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=tpinnct_kfold
+#SBATCH --job-name=tpinn_kfold
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=4G
 #SBATCH --time=12:00:00
-#SBATCH --output=/home/rane10/logs/tpinnct_kfold.o%A_%a
-#SBATCH --error=/home/rane10/logs/tpinnct_kfold.e%A_%a
+#SBATCH --output=/home/rane10/logs/tpinn_kfold.o%A_%a
+#SBATCH --error=/home/rane10/logs/tpinn_kfold.e%A_%a
 #SBATCH --array=0-49%50
 set -euo pipefail
 
@@ -36,8 +36,8 @@ N_FOLDS_AX=${#FOLDS[@]}
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
-  echo "[TPINNCT-KFOLD] aggregate-only: merging per-combo TSTR results into results/summary.csv"
-  python -m core.tstr --aggregate --model tpinn --class_transport \
+  echo "[TPINN-KFOLD] aggregate-only: merging per-combo TSTR results into results/summary.csv"
+  python -m core.tstr --aggregate --model tpinn \
     --regions "$(IFS=, ; echo "${REGIONS[*]}")" \
     --init_seeds "$(IFS=, ; echo "${INIT_SEEDS[*]}")" \
     --folds "$(IFS=, ; echo "${FOLDS[*]}")" \
@@ -55,18 +55,18 @@ REGION=${REGIONS[$REGION_IDX]}
 INIT_SEED=${INIT_SEEDS[$SEED_IDX]}
 FOLD=${FOLDS[$FOLD_IDX]}
 
-echo "[TPINNCT-KFOLD] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} region=$REGION init_seed=$INIT_SEED fold=$FOLD"
+echo "[TPINN-KFOLD] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} region=$REGION init_seed=$INIT_SEED fold=$FOLD"
 
 PARAMS="results/pinn/params_${REGION}.npy"
-[ -f "$PARAMS" ] || { echo "[TPINNCT-KFOLD] ERROR: missing CIR params ($PARAMS)."; exit 1; }
+[ -f "$PARAMS" ] || { echo "[TPINN-KFOLD] ERROR: missing CIR params ($PARAMS)."; exit 1; }
 
-RUN_ID="${REGION}_s${INIT_SEED}_ld${LATENT_DIM}_ed${EMBED_DIM}_tphys_ct_f${FOLD}_a${ALPHA}_n${N_COPIES}"
+RUN_ID="${REGION}_s${INIT_SEED}_ld${LATENT_DIM}_ed${EMBED_DIM}_tphys_f${FOLD}_a${ALPHA}_n${N_COPIES}"
 CKPT="results/tpinn/${RUN_ID}_checkpoint.pt"
 if [ -f "$CKPT" ]; then
-  echo "[TPINNCT-KFOLD] checkpoint exists, skipping training: $CKPT"
+  echo "[TPINN-KFOLD] checkpoint exists, skipping training: $CKPT"
 else
   PYTHONHASHSEED="$INIT_SEED" python -m core.train \
-    --model tpinn --region "$REGION" --class_transport --tau_s 5 \
+    --model tpinn --region "$REGION" \
     --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" \
     --fold "$FOLD" --n_folds "$N_FOLDS" --epochs "$EPOCHS" \
     --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --part_embed_dim "$PART_EMBED_DIM" \
@@ -74,10 +74,10 @@ else
 fi
 
 PYTHONHASHSEED="$INIT_SEED" python -m core.tstr \
-  --model tpinn --region "$REGION" --class_transport --tau_s 5 \
+  --model tpinn --region "$REGION" \
   --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" \
   --fold "$FOLD" --n_folds "$N_FOLDS" \
   --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --alpha "$ALPHA" --n_copies "$N_COPIES" \
   --n_jobs 1 --eval_val --no_summary
 
-# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/10_tpinnct_kfold.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/21_tpinn_kfold.sh

@@ -74,4 +74,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr --model diffusion --region "$REG
   --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" --fold "$FOLD" --n_folds "$N_FOLDS" \
   --embed_dim "$EMBED_DIM" --alpha "$ALPHA" --n_copies "$N_COPIES" --n_jobs 1 --eval_val --no_summary
 
-# Aggregate: AGGREGATE=1 [CV_MODE=loso] sbatch --array=0 experiments/21_diffusion.sh
+# Aggregate: AGGREGATE=1 [CV_MODE=loso] sbatch --array=0 experiments/06_diffusion.sh

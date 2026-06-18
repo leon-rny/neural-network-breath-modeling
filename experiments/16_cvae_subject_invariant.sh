@@ -67,4 +67,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr --model cvae_part --region "$REG
   --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --part_embed_dim "$PART_EMBED_DIM" \
   --free_bits "$FREE_BITS" --alpha "$ALPHA" --n_copies "$N_COPIES" --n_jobs 1 --no_summary
 
-# Aggregate: AGGREGATE=1 [CV_MODE=loso] [SUBJ_LAMBDA=1.0] sbatch --array=0 experiments/22_subjinv.sh
+# Aggregate: AGGREGATE=1 [CV_MODE=loso] [SUBJ_LAMBDA=1.0] sbatch --array=0 experiments/16_cvae_subject_invariant.sh

@@ -17,10 +17,10 @@ conda activate nnbm
 # on all non-test subjects (train n-1) and TSTR-score on held-out t. The trtr real-data baseline runs
 # on the BYTE-IDENTICAL Stage-B split so model and baseline score the same held-out subject.
 #
-# PREREQUISITE: experiments/07_loso_select.sh finished AND `python -m core.loso select` ran
+# PREREQUISITE: experiments/35_nested_loso_select.sh finished AND `python -m ablations.loso select` ran
 #   (writes results/loso/selected_{region}.csv : outer_fold,config,beta_max,accuracy).
-# RUN: sbatch --dependency=afterok:<07-jobid> experiments/08_loso_final.sh
-# THEN: AGGREGATE=1 sbatch --array=0 experiments/08_loso_final.sh   (or: python -m core.loso aggregate)
+# RUN: sbatch --dependency=afterok:<07-jobid> experiments/36_nested_loso_final.sh
+# THEN: AGGREGATE=1 sbatch --array=0 experiments/36_nested_loso_final.sh   (or: python -m ablations.loso aggregate)
 #
 # Array size = REGIONS(2) x N_SUBJECTS(N from data) x SEEDS(5); default sized for N=8 -> --array=0-79
 # if N changes, submit with --array=0-$((2*N*5-1))%200
@@ -39,7 +39,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
   echo "[LOSO-B] aggregate-only: consolidating Stage-B conv_baseline + trtr rows"
-  python -m core.loso aggregate
+  python -m ablations.loso aggregate
   exit 0
 fi
 
@@ -59,7 +59,7 @@ INIT_SEED=${INIT_SEEDS[$SEED_IDX]}
 T=$(( FOLD_IDX + 1 ))
 
 SELECTED="results/loso/selected_${REGION}.csv"
-[ -f "$SELECTED" ] || { echo "[LOSO-B] ERROR: $SELECTED missing — run 'python -m core.loso select' first."; exit 1; }
+[ -f "$SELECTED" ] || { echo "[LOSO-B] ERROR: $SELECTED missing — run 'python -m ablations.loso select' first."; exit 1; }
 # selected rows: outer_fold,config,beta_max,accuracy
 LINE=$(awk -F, -v t="$T" 'NR>1 && $1==t {print $2","$3}' "$SELECTED")
 [ -n "$LINE" ] || { echo "[LOSO-B] ERROR: no selected config for outer_fold=$T in $SELECTED"; exit 1; }
@@ -84,4 +84,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr --model trtr \
   --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" --n_folds "$N_SUBJECTS" \
   --n_jobs 1 --no_summary
 
-# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/08_loso_final.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/36_nested_loso_final.sh

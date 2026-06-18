@@ -15,8 +15,8 @@ conda activate nnbm
 
 # Validate the Optuna-tuned config at FULL fidelity (5 folds x 5 seeds, 500 epochs) and compare to the
 # committed CVAE baseline (mouth .798 / nose .664). Best params read LIVE from the study journal
-# (best.json can be stale). Usage: MODEL=cvae_part REGION=mouth sbatch experiments/19_tune_validate.sh
-#        then  AGGREGATE=1 MODEL=cvae_part REGION=mouth sbatch --array=0 experiments/19_tune_validate.sh
+# (best.json can be stale). Usage: MODEL=cvae_part REGION=mouth sbatch experiments/38_tune_cvae_validate.sh
+#        then  AGGREGATE=1 MODEL=cvae_part REGION=mouth sbatch --array=0 experiments/38_tune_cvae_validate.sh
 MODEL="${MODEL:?set MODEL=cvae|cvae_part}"
 REGION="${REGION:?set REGION=mouth|nose}"
 EPOCHS="${EPOCHS:-500}"
@@ -74,4 +74,4 @@ PYTHONHASHSEED="$SEED" python -m core.tstr --model "$MODEL" --region "$REGION" $
   --latent_dim "$LD" --embed_dim "$ED" $PART_FLAG --free_bits "$FB" \
   --alpha "$ALPHA" --n_copies "$NC" --n_jobs 1 --no_summary
 
-# Aggregate after the array: AGGREGATE=1 MODEL=$MODEL REGION=$REGION sbatch --array=0 experiments/19_tune_validate.sh
+# Aggregate after the array: AGGREGATE=1 MODEL=$MODEL REGION=$REGION sbatch --array=0 experiments/38_tune_cvae_validate.sh

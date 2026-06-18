@@ -18,9 +18,9 @@ conda activate nnbm
 # HP selection (t never seen during selection). Each task loops the per-region shortlist.
 #
 # PREREQUISITE: build the shortlist first (reads the jitter x beta k-fold grid summary):
-#   python -m core.loso shortlist --k 3
-# THEN: sbatch experiments/07_loso_select.sh
-# THEN: python -m core.loso select   (picks best config per outer fold)
+#   python -m ablations.loso shortlist --k 3
+# THEN: sbatch experiments/35_nested_loso_select.sh
+# THEN: python -m ablations.loso select   (picks best config per outer fold)
 #
 # Array size = REGIONS(2) x N_SUBJECTS(N from data) x SEEDS(5); default sized for N=8 -> --array=0-79
 # if N changes, submit with --array=0-$((2*N*5-1))%200
@@ -55,7 +55,7 @@ T=$(( FOLD_IDX + 1 ))                 # outer test subject (1-indexed)
 V=$(( (T % N_SUBJECTS) + 1 ))         # val subject = deterministic neighbour of t
 
 SHORTLIST="results/loso/shortlist_${REGION}.csv"
-[ -f "$SHORTLIST" ] || { echo "[LOSO-A] ERROR: $SHORTLIST missing — run 'python -m core.loso shortlist' first."; exit 1; }
+[ -f "$SHORTLIST" ] || { echo "[LOSO-A] ERROR: $SHORTLIST missing — run 'python -m ablations.loso shortlist' first."; exit 1; }
 
 echo "[LOSO-A] region=$REGION outer_t=$T val_v=$V seed=$INIT_SEED | candidates from $SHORTLIST"
 # shortlist rows: config,beta_max,accuracy  (skip header)
@@ -71,4 +71,4 @@ tail -n +2 "$SHORTLIST" | while IFS=, read -r CONFIG BETA_MAX _REST; do
     --epochs "$EPOCHS" --n_jobs 1 --skip_existing --no_summary
 done
 
-# next: python -m core.loso select   then   sbatch --dependency=afterok:<thisjob> experiments/08_loso_final.sh
+# next: python -m ablations.loso select   then   sbatch --dependency=afterok:<thisjob> experiments/36_nested_loso_final.sh

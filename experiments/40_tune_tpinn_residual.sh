@@ -22,9 +22,9 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM
 # never collide; results read back from results/tpinn/{run_id}_tstr.json. Search on a CHEAP kfold proxy
 # (seeds 0,42 x folds 1,3), then VALIDATE the winner at the full protocol (kf 5x5 + loso 5x8) to avoid
 # proxy-overfit (tuning-results memory: prior Optuna tuning did NOT beat the committed config).
-#   CONFIG=search                              sbatch --array=0-143%200 experiments/34_tune_tpinnres.sh
-#   LD=.. BM=.. FB=.. CONFIG=val_kfold         sbatch --array=0-49%200  experiments/34_tune_tpinnres.sh
-#   LD=.. BM=.. FB=.. CONFIG=val_loso          sbatch --array=0-79%200  experiments/34_tune_tpinnres.sh
+#   CONFIG=search                              sbatch --array=0-143%200 experiments/40_tune_tpinn_residual.sh
+#   LD=.. BM=.. FB=.. CONFIG=val_kfold         sbatch --array=0-49%200  experiments/40_tune_tpinn_residual.sh
+#   LD=.. BM=.. FB=.. CONFIG=val_loso          sbatch --array=0-79%200  experiments/40_tune_tpinn_residual.sh
 PHYS_PREP=stdscale; EMBED_DIM=8; PART_EMBED_DIM=8; ALPHA=0.05; N_COPIES=10
 SPLIT_SEED=42; EPOCHS="${EPOCHS:-500}"; MFLAGS="--phys_residual"
 LDS=(8 16 32); BMS=(0.003 0.01 0.03); FBS=(0.0 0.5)

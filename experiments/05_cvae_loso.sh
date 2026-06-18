@@ -17,7 +17,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM
 # cvae_part under LEAVE-ONE-SUBJECT-OUT at the COMMITTED config (plain, non-nested) — the headline
 # cvae_part LOSO row, matching the pinn/tpinn LOSO protocol (fixed config, null-token generation of the
 # unseen subject). 2 regions x N SUBJECTS (from data) x 5 seeds; default N=8 -> 80 -> --array=0-79.
-# Aggregate after:  AGGREGATE=1 sbatch --array=0 experiments/29_cvae_loso.sh
+# Aggregate after:  AGGREGATE=1 sbatch --array=0 experiments/05_cvae_loso.sh
 LATENT_DIM=16; EMBED_DIM=8; PART_EMBED_DIM=8; FREE_BITS=0.0
 BETA_MAX=0.01; ALPHA=0.05; N_COPIES=10; PART_DROPOUT=0.1   # null-token required for LOSO generation
 REGIONS=(mouth nose); INIT_SEEDS=(0 1 7 42 123); SPLIT_SEED=42

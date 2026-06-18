@@ -16,7 +16,7 @@ conda activate nnbm
 # NESTED LOSO hyperparameter search (cross-subject TSTR). Tunes on a DEV subset of held-out subjects
 # (folds {2,4} = subjects e,g) — each trains on the other 4 subjects and generates the held-out one
 # via the null token (part_dropout=0.1). The disjoint subjects {a,f,p} (folds 1,3,5) are NEVER scored
-# during the search, so validating the winner on them (19_tune_validate.sh CV_MODE=loso) is an unbiased
+# during the search, so validating the winner on them (38_tune_cvae_validate.sh CV_MODE=loso) is an unbiased
 # cross-subject estimate. cvae_part only (needs the participant null token).
 MODEL="${MODEL:-cvae_part}"
 REGIONS=(mouth nose)
@@ -31,11 +31,11 @@ REGION=${REGIONS[$(( IDX / WORKERS_PER_REGION ))]}
 SAMPLER_SEED=$(( IDX ))
 
 echo "[TUNE-LOSO] worker=$IDX model=$MODEL region=$REGION sampler_seed=$SAMPLER_SEED dev_folds={2,4}=e,g"
-python -m core.tuning --model "$MODEL" --region "$REGION" \
+python -m ablations.tuning optuna --model "$MODEL" --region "$REGION" \
   --cv_mode loso --part_dropout 0.1 \
   --n_trials "$N_TRIALS_PER_WORKER" --epochs "$SEARCH_EPOCHS" \
   --folds 2 4 --seeds 0 42 --split_seed 42 --n_folds 5 \
   --n_jobs 1 --sampler_seed "$SAMPLER_SEED"
 
 # best params -> results/tuning/<model>_<region>_loso_best.json ; validate on honest holdout {a,f,p}
-# (folds 1,3,5) via: CV_MODE=loso MODEL=<m> REGION=<r> sbatch experiments/19_tune_validate.sh
+# (folds 1,3,5) via: CV_MODE=loso MODEL=<m> REGION=<r> sbatch experiments/38_tune_cvae_validate.sh

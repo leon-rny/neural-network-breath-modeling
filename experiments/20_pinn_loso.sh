@@ -103,4 +103,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr \
   --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --alpha "$ALPHA" --n_copies "$N_COPIES" \
   --n_jobs 1 --eval_val --no_summary
 
-# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/09_loso_pinn.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/20_pinn_loso.sh
