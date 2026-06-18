@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from core.data import BreathDataset, load_dataset, get_split, loso_path_tag
+from core.data import BreathDataset, load_dataset, get_split, loso_path_tag, kfold_split_dataset
 from core.train import active_dims, beta_capped, evaluate, train_vae_one_epoch
 from core.tstr import evaluate_classifier, extract_fixed_features, generate_synthetic_signals, load_cache, train_stacking_classifier, trtr
 from core.utils import make_generator, seed_everything, seed_worker

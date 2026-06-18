@@ -20,7 +20,7 @@ Differences vs. the notebook (deliberate):
     averaging, instead of `np.stack`-ing raw arrays (trial lengths differ).
 
 Usage:
-    python -m core.fit_sir [--dataset_dir dataset] [--per_class] [--region mouth]
+    python -m ablations.fit_sir [--dataset_dir dataset] [--per_class] [--region mouth]
 """
 import os
 import re

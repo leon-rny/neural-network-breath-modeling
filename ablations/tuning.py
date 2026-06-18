@@ -1,34 +1,65 @@
+"""Hyperparameter tuning for the (c)VAE / PINN generators — two tools under one CLI.
+
+Subcommands:
+  optuna    -> Optuna TPE TSTR search for the (c)VAE generators.
+               IMPORTANT (leakage): the model is trained on the SAME k-fold split that the trtr cache
+               scores against (get_split with fold-1, matching core.tstr.trtr), so synthetic-train /
+               real-test never overlap. We tune over a SUBSET of (fold, seed) whose trtr caches already
+               exist (results/trtr/*.pkl), then validate the winner at the full 5-fold x 5-seed protocol
+               via experiments/38_tune_cvae_validate.sh.
+
+  manifest  -> Phase-4d: generate a TSV manifest for tuning cvae_part + tpinn-res across 4 objectives
+               (tstr / loso / tstr+ / loso+). Each manifest ROW = one SLURM array task = one
+               (model, objective, region, hp-config, init_seed, fold). experiments/41_tune_four_objectives.sh reads a
+               row and runs core.train + core.tstr with those args. Every run is namespaced by --hp_tag
+               "t4<obj><model0>c<cfg>" so tstr vs tstr+ (same cv_mode) never collide on {run_id}_tstr.json,
+               and nothing touches the committed result namespace.
+
+               Modes:
+                 search   -> 16 hp-configs/model/objective on the cheap proxy (seeds 0,42 x folds 1,3), 200 ep.
+                 validate -> best config per (model,objective,region) [read from a winners JSON] at the FULL
+                             protocol (seeds 0,1,7,42,123 x all folds), 500 ep.
+
+               HP search spaces (config 0 = committed anchor, always included):
+                 cvae_part: latent_dim, embed_dim, part_embed_dim, free_bits, beta_max, alpha, n_copies
+                 tpinn-res: latent_dim, free_bits, beta_max, alpha, n_copies (embed/ped fixed 8; always
+                            --phys_residual --phys_prep stdscale; lambda_phys moot)
+                 + objectives also tune augmentation_ratio (ignored by non-plus objectives).
+
+Heavy deps (optuna, torch, models.vae, core.train/tstr/utils) are imported lazily inside the optuna
+code path so that `python -m ablations.tuning manifest ...` runs without optuna/torch installed.
+"""
 import argparse
-import gc
 import json
 import os
+import random
 import re
 
 import numpy as np
-import optuna
 import pandas as pd
-import torch
-from torch.utils.data import DataLoader
 
-from core.data import BreathDataset, load_dataset, get_split
-from core.train import evaluate, train_vae_one_epoch
-from core.tstr import evaluate_classifier, extract_fixed_features, generate_synthetic_signals, load_cache, train_stacking_classifier, trtr
-from core.utils import make_generator, seed_everything, seed_worker
-from models.vae import CVAE, VAE
+from core.data import load_dataset, n_loso_folds
 
-# Optuna TSTR tuning for the (c)VAE generators.
-# IMPORTANT (leakage): the model is trained on the SAME k-fold split that the trtr cache scores
-# against (get_split with fold-1, matching core.tstr.trtr), so synthetic-train / real-test never
-# overlap. We tune over a SUBSET of (fold, seed) whose trtr caches already exist (results/trtr/*.pkl),
-# then validate the winner at the full 5-fold x 5-seed protocol via experiments/18_tune_validate.sh.
 
-def _empty_device_cache(device: torch.device) -> None:
+# ---------------------------------------------------------------------------
+# Optuna TSTR search for the (c)VAE generators
+# ---------------------------------------------------------------------------
+
+def _empty_device_cache(device) -> None:
+    import torch
     if device.type == 'cuda':
         torch.cuda.empty_cache()
     elif device.type == 'mps':
         torch.mps.empty_cache()
 
-def _train_model(model_name: str, params: dict, region: str, dataset_dir: str, epochs: int, seed: int, fold: int, split_seed: int, n_folds: int, device: torch.device, cv_mode: str = 'kfold', part_dropout: float = 0.0) -> tuple[torch.nn.Module, dict]:
+def _train_model(model_name: str, params: dict, region: str, dataset_dir: str, epochs: int, seed: int, fold: int, split_seed: int, n_folds: int, device, cv_mode: str = 'kfold', part_dropout: float = 0.0):
+    import torch
+    from torch.utils.data import DataLoader
+    from core.data import BreathDataset, get_split
+    from core.train import evaluate, train_vae_one_epoch
+    from core.utils import make_generator, seed_everything, seed_worker
+    from models.vae import CVAE, VAE
+
     seed_everything(seed)
     g = make_generator(seed)
 
@@ -66,9 +97,11 @@ def _train_model(model_name: str, params: dict, region: str, dataset_dir: str, e
 
     return model, train_ds.stats
 
-def _tstr_accuracy(model: torch.nn.Module, model_name: str, region: str, dataset_dir: str, n_jobs: int,
-                   seed: int, fold: int, split_seed: int, n_folds: int, n_synthetic: int | None, device: torch.device,
+def _tstr_accuracy(model, model_name: str, region: str, dataset_dir: str, n_jobs: int,
+                   seed: int, fold: int, split_seed: int, n_folds: int, n_synthetic, device,
                    cv_mode: str = 'kfold') -> float:
+    from core.tstr import evaluate_classifier, extract_fixed_features, generate_synthetic_signals, load_cache, train_stacking_classifier, trtr
+
     cache = load_cache(region, seed, split_seed, fold, n_folds, cv_mode=cv_mode)
     if cache is None:  # standard caches usually exist (results/trtr/*.pkl); build if missing
         cache = trtr(dataset_dir, region, n_jobs, seed, split_seed, fold, n_folds=n_folds, cv_mode=cv_mode)
@@ -95,13 +128,18 @@ def _tstr_accuracy(model: torch.nn.Module, model_name: str, region: str, dataset
     return float(metrics['accuracy'])
 
 def make_objective(model_name: str, region: str, dataset_dir: str = 'dataset', epochs: int = 200,
-                   seeds: tuple[int, ...] = (0, 42), folds: tuple[int, ...] = (1, 3), split_seed: int = 42,
-                   n_folds: int = 5, n_synthetic: int | None = None, n_jobs: int = 4, device: torch.device | None = None,
+                   seeds: tuple = (0, 42), folds: tuple = (1, 3), split_seed: int = 42,
+                   n_folds: int = 5, n_synthetic=None, n_jobs: int = 4, device=None,
                    cv_mode: str = 'kfold', part_dropout: float = 0.0):
+    import gc
+
+    import optuna
+    import torch
+
     device = device or torch.device('cpu')
     evals = [(f, s) for f in folds for s in seeds]   # (fold, seed) grid, matched train/test splits
 
-    def objective(trial: optuna.Trial) -> float:
+    def objective(trial) -> float:
         params = {'latent_dim': trial.suggest_categorical('latent_dim', [8, 16, 32, 64]),
                   'free_bits': trial.suggest_float('free_bits', 0.0, 1.0),
                   'beta_max': trial.suggest_float('beta_max', 1e-3, 1e-1, log=True),
@@ -145,7 +183,8 @@ def make_objective(model_name: str, region: str, dataset_dir: str = 'dataset', e
 
     return objective
 
-def _log_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+def _log_callback(study, trial) -> None:
+    import optuna
     try:
         best = f'{study.best_value:.4f}'
         best_params = study.best_params
@@ -158,10 +197,12 @@ def _log_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
     else:
         print(f'[TUNE] trial {trial.number} done | acc={trial.value:.4f} | params={trial.params} | best so far: {best} | best_params: {best_params}', flush=True)
 
-def run_search(model_name: str, region: str, n_trials: int = 60, epochs: int = 200, seeds: tuple[int, ...] = (0, 42),
-               folds: tuple[int, ...] = (1, 3), split_seed: int = 42, n_folds: int = 5, n_synthetic: int | None = None,
-               dataset_dir: str = 'dataset', n_jobs: int = 4, sampler_seed: int = 42, device: torch.device | None = None,
-               cv_mode: str = 'kfold', part_dropout: float = 0.0) -> optuna.Study:
+def run_search(model_name: str, region: str, n_trials: int = 60, epochs: int = 200, seeds: tuple = (0, 42),
+               folds: tuple = (1, 3), split_seed: int = 42, n_folds: int = 5, n_synthetic=None,
+               dataset_dir: str = 'dataset', n_jobs: int = 4, sampler_seed: int = 42, device=None,
+               cv_mode: str = 'kfold', part_dropout: float = 0.0):
+    import optuna
+
     os.makedirs('results/tuning', exist_ok=True)
     sfx = '' if cv_mode == 'kfold' else f'_{cv_mode}'   # keep kfold paths back-compatible; loso gets its own study
     # JournalFileBackend supports concurrent workers -> a SLURM array can share one study
@@ -186,27 +227,9 @@ def run_search(model_name: str, region: str, n_trials: int = 60, epochs: int = 2
     print(f'[TUNE] Trials saved to {trials_path}\n[TUNE] Best params saved to {best_path}')
     return study
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part'])
-    p.add_argument('--region', required=True, choices=['mouth', 'nose'])
-    p.add_argument('--n_trials', type=int, default=60)
-    p.add_argument('--epochs', type=int, default=200, help='reduced epochs for the SEARCH phase (validate winner at 500)')
-    p.add_argument('--seeds', type=int, nargs='+', default=[0, 42], help='search subset of init seeds (caches reused)')
-    p.add_argument('--folds', type=int, nargs='+', default=[1, 3], help='search subset of k-folds (caches reused)')
-    p.add_argument('--split_seed', type=int, default=42)
-    p.add_argument('--n_folds', type=int, default=5)
-    p.add_argument('--cv_mode', choices=['kfold', 'loso'], default='kfold', help='kfold = in-distribution TSTR; loso = cross-subject TSTR (use --part_dropout 0.1 + --folds over dev subjects)')
-    p.add_argument('--part_dropout', type=float, default=0.0, help='cvae_part null-token dropout; set 0.1 for loso so unseen-subject generation works')
-    p.add_argument('--n_synthetic', type=int, default=None)
-    p.add_argument('--n_jobs', type=int, default=4)
-    p.add_argument('--dataset_dir', default='dataset')
-    p.add_argument('--sampler_seed', type=int, default=42)
-    p.add_argument('--torch_threads', type=int, default=0, help='cap PyTorch CPU threads (0 = leave default)')
-    return p.parse_args()
+def run_optuna(args) -> None:
+    import torch
 
-def main() -> None:
-    args = parse_args()
     device = torch.device('cpu')
     if args.torch_threads > 0:
         torch.set_num_threads(args.torch_threads)
@@ -217,6 +240,150 @@ def main() -> None:
                seeds=tuple(args.seeds), folds=tuple(args.folds), split_seed=args.split_seed, n_folds=args.n_folds,
                n_synthetic=args.n_synthetic, dataset_dir=args.dataset_dir, n_jobs=args.n_jobs,
                sampler_seed=args.sampler_seed, device=device, cv_mode=args.cv_mode, part_dropout=args.part_dropout)
+
+
+# ---------------------------------------------------------------------------
+# Phase-4d 4-objective sweep manifest generation
+# ---------------------------------------------------------------------------
+
+# objective -> (mode, cv_mode, part_dropout)
+OBJECTIVES = {
+    'tstr':  ('tstr',      'kfold', 0.0),
+    'loso':  ('tstr',      'loso',  0.1),
+    'tstrp': ('tstr_plus', 'kfold', 0.0),
+    'losop': ('tstr_plus', 'loso',  0.1),
+}
+MODELS = ['cvae_part', 'tpinn']
+MODEL0 = {'cvae_part': 'c', 'tpinn': 't'}
+REGIONS = ['mouth', 'nose']
+SEARCH_SEEDS = [0, 42]
+SEARCH_FOLDS = [1, 3]
+FULL_SEEDS = [0, 1, 7, 42, 123]
+COLS = ['model', 'objective', 'mode', 'cv', 'pd', 'region', 'hptag', 'ld', 'ed', 'ped',
+        'fb', 'bm', 'alpha', 'ncop', 'augr', 'seed', 'fold', 'nf']
+
+# committed anchors (config 0)
+ANCHOR = {
+    'cvae_part': dict(ld=16, ed=8, ped=8, fb=0.0, bm=0.01, alpha=0.05, ncop=10),
+    'tpinn':     dict(ld=16, ed=8, ped=8, fb=0.0, bm=0.01, alpha=0.05, ncop=10),
+}
+SPACE = {
+    'cvae_part': dict(ld=[8, 16, 32], ed=[4, 8, 16], ped=[4, 8, 16], fb=[0.0, 0.1, 0.5],
+                      bm=[0.003, 0.01, 0.03, 0.1], alpha=[0.0, 0.05, 0.1], ncop=[1, 5, 10, 20]),
+    'tpinn':     dict(ld=[8, 16, 32], ed=[8], ped=[8], fb=[0.0, 0.5],
+                      bm=[0.003, 0.01, 0.03], alpha=[0.0, 0.05, 0.1], ncop=[1, 5, 10, 20]),
+}
+AUGR = [0.5, 1.0, 2.0, 3.0]
+N_CONFIGS = 16
+
+
+def sample_configs(model, objective, mi, oi):
+    """Deterministic per (model,objective): config 0 = anchor, rest = seeded random samples."""
+    rng = random.Random(1000 * mi + oi)
+    sp = SPACE[model]
+    plus = objective in ('tstrp', 'losop')
+    cfgs = []
+    anchor = dict(ANCHOR[model]); anchor['augr'] = 1.0
+    cfgs.append(anchor)
+    seen = {tuple(sorted(anchor.items()))}
+    tries = 0
+    while len(cfgs) < N_CONFIGS and tries < 5000:
+        tries += 1
+        c = {k: rng.choice(v) for k, v in sp.items()}
+        c['augr'] = rng.choice(AUGR) if plus else 1.0
+        if c['alpha'] == 0.0:
+            c['ncop'] = 1  # n_copies only matters when alpha>0; canonicalize to avoid dup configs
+        key = tuple(sorted(c.items()))
+        if key in seen:
+            continue
+        seen.add(key); cfgs.append(c)
+    return cfgs
+
+
+def row(model, objective, region, cfg, cfg_id, seed, fold, nf):
+    mode, cv, pd = OBJECTIVES[objective]
+    hptag = f"t4{objective}{MODEL0[model]}c{cfg_id:02d}"
+    return [model, objective, mode, cv, pd, region, hptag, cfg['ld'], cfg['ed'], cfg['ped'],
+            cfg['fb'], cfg['bm'], cfg['alpha'], cfg['ncop'], cfg['augr'], seed, fold, nf]
+
+
+def run_manifest(args) -> None:
+    nloso = n_loso_folds(load_dataset('dataset'))
+    rows = []
+    if args.mode == 'search':
+        for mi, model in enumerate(MODELS):
+            for oi, objective in enumerate(OBJECTIVES):
+                _, cv, _ = OBJECTIVES[objective]
+                nf = nloso if cv == 'loso' else 5
+                cfgs = sample_configs(model, objective, mi, oi)
+                for region in REGIONS:
+                    for cfg_id, cfg in enumerate(cfgs):
+                        for seed in SEARCH_SEEDS:
+                            for fold in SEARCH_FOLDS:
+                                rows.append(row(model, objective, region, cfg, cfg_id, seed, fold, nf))
+    else:
+        winners = json.load(open(args.winners))
+        for key, cfgs in winners.items():
+            model, objective, region = key.split('|')
+            _, cv, _ = OBJECTIVES[objective]
+            nf = nloso if cv == 'loso' else 5
+            folds = list(range(1, nf + 1))
+            cfg_list = cfgs if isinstance(cfgs, list) else [cfgs]   # value may be a single cfg or a list (winner + anchor)
+            seen_ids = set()
+            for cfg in cfg_list:
+                cfg_id = cfg['cfg_id']
+                if cfg_id in seen_ids:
+                    continue   # dedup: winner may equal anchor
+                seen_ids.add(cfg_id)
+                for seed in FULL_SEEDS:
+                    for fold in folds:
+                        rows.append(row(model, objective, region, cfg, cfg_id, seed, fold, nf))
+
+    with open(args.out, 'w') as f:
+        f.write('\t'.join(COLS) + '\n')
+        for r in rows:
+            f.write('\t'.join(str(x) for x in r) + '\n')
+    print(f'[MANIFEST] {args.mode}: wrote {len(rows)} rows to {args.out} (nloso={nloso})')
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    o = sub.add_parser('optuna', help='Optuna TPE TSTR search for the (c)VAE generators')
+    o.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part'])
+    o.add_argument('--region', required=True, choices=['mouth', 'nose'])
+    o.add_argument('--n_trials', type=int, default=60)
+    o.add_argument('--epochs', type=int, default=200, help='reduced epochs for the SEARCH phase (validate winner at 500)')
+    o.add_argument('--seeds', type=int, nargs='+', default=[0, 42], help='search subset of init seeds (caches reused)')
+    o.add_argument('--folds', type=int, nargs='+', default=[1, 3], help='search subset of k-folds (caches reused)')
+    o.add_argument('--split_seed', type=int, default=42)
+    o.add_argument('--n_folds', type=int, default=5)
+    o.add_argument('--cv_mode', choices=['kfold', 'loso'], default='kfold', help='kfold = in-distribution TSTR; loso = cross-subject TSTR (use --part_dropout 0.1 + --folds over dev subjects)')
+    o.add_argument('--part_dropout', type=float, default=0.0, help='cvae_part null-token dropout; set 0.1 for loso so unseen-subject generation works')
+    o.add_argument('--n_synthetic', type=int, default=None)
+    o.add_argument('--n_jobs', type=int, default=4)
+    o.add_argument('--dataset_dir', default='dataset')
+    o.add_argument('--sampler_seed', type=int, default=42)
+    o.add_argument('--torch_threads', type=int, default=0, help='cap PyTorch CPU threads (0 = leave default)')
+
+    m = sub.add_parser('manifest', help='Phase-4d 4-objective sweep manifest (TSV)')
+    m.add_argument('--mode', required=True, choices=['search', 'validate'])
+    m.add_argument('--winners', default='', help='validate: JSON {model|objective|region: cfg dict} of best configs')
+    m.add_argument('--out', required=True)
+
+    return p.parse_args()
+
+def main() -> None:
+    args = parse_args()
+    if args.cmd == 'optuna':
+        run_optuna(args)
+    else:
+        run_manifest(args)
 
 if __name__ == '__main__':
     main()
