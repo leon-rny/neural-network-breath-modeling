@@ -30,11 +30,7 @@ N_SEEDS=${#INIT_SEEDS[@]}
 N_FOLDS_AX=${#FOLDS[@]}
 
 # single thread per task
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
   echo "[ARCH] aggregate-only: building summary.csv"
@@ -49,10 +45,10 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
 fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..1099> for a local run}}
-FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
-REGION_IDX=$(( IDX % N_REGIONS ));  IDX=$(( IDX / N_REGIONS ))
-COND_IDX=$(( IDX % N_CONDS ));      IDX=$(( IDX / N_CONDS ))
+FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
+REGION_IDX=$(( IDX % N_REGIONS )); IDX=$(( IDX / N_REGIONS ))
+COND_IDX=$(( IDX % N_CONDS )); IDX=$(( IDX / N_CONDS ))
 VARIANT_IDX=$(( IDX % N_VARIANTS ))
 
 VARIANT=${VARIANTS[$VARIANT_IDX]}
@@ -81,4 +77,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae --mode architecture \
   --skip_existing \
   --no_summary
 
-# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/ablations_cvae_1_architecture.sh
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/08_cvae_architecture.sh

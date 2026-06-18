@@ -12,27 +12,27 @@ set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
+
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# PHASE 4 "apply stdscale broadly" — re-run the rest of the physics models under --phys_prep stdscale
-# (the winning normalization from 4a) on the ACTIVE (legacy-76s) channel, so the whole physics-vs-cvae
-# table is on the better normalization. tpinn-res @ stdscale is already done (skip). Compare to peakscale.
-# Launch one CONFIG per array job (chain them); kfold -> --array=0-49%200, loso -> --array=0-79%200:
-#   CONFIG=pinn_kfold|pinn_loso|tbase_kfold|tbase_loso|tct_kfold|tct_loso|tps_kfold|tps_loso
-# Aggregate: CONFIG=<cfg> AGGREGATE=1 sbatch --array=0 experiments/31_physics_stdscale_sweep.sh
+# launch one config per array job:
+#   CONFIG=pinn_kfold|pinn_loso|tbase_kfold|tbase_loso|tct_kfold|tct_loso|tps_kfold|tps_loso sbatch experiments/31_physics_stdscale_sweep.sh
+#   kfold -> --array=0-49%200, loso -> --array=0-79%200
+# kfold: 2 regions x 5 seeds x 5 folds = 50; loso: 2 regions x 5 seeds x N subjects (data-driven)
 PHYS_PREP="${PHYS_PREP:-stdscale}"
 LATENT_DIM=16; EMBED_DIM=8; PART_EMBED_DIM=8; BETA_MAX=0.01; ALPHA=0.05; N_COPIES=10
 REGIONS=(mouth nose); SEEDS=(0 1 7 42 123); SPLIT_SEED=42; EPOCHS="${EPOCHS:-500}"
 CONFIG="${CONFIG:?set CONFIG=pinn_kfold|pinn_loso|tbase_kfold|tbase_loso|tct_kfold|tct_loso|tps_kfold|tps_loso}"
 case "$CONFIG" in
-  pinn_kfold)  MODEL=pinn;  CV=kfold; PD=0.0; MFLAGS="--lambda_phys 0.01" ;;
-  pinn_loso)   MODEL=pinn;  CV=loso;  PD=0.1; MFLAGS="--lambda_phys 0.01" ;;
+  pinn_kfold) MODEL=pinn; CV=kfold; PD=0.0; MFLAGS="--lambda_phys 0.01" ;;
+  pinn_loso) MODEL=pinn; CV=loso; PD=0.1; MFLAGS="--lambda_phys 0.01" ;;
   tbase_kfold) MODEL=tpinn; CV=kfold; PD=0.0; MFLAGS="" ;;
-  tbase_loso)  MODEL=tpinn; CV=loso;  PD=0.1; MFLAGS="" ;;
-  tct_kfold)   MODEL=tpinn; CV=kfold; PD=0.0; MFLAGS="--class_transport" ;;
-  tct_loso)    MODEL=tpinn; CV=loso;  PD=0.1; MFLAGS="--class_transport" ;;
-  tps_kfold)   MODEL=tpinn; CV=kfold; PD=0.0; MFLAGS="--parametric_source" ;;
-  tps_loso)    MODEL=tpinn; CV=loso;  PD=0.1; MFLAGS="--parametric_source" ;;
+  tbase_loso) MODEL=tpinn; CV=loso; PD=0.1; MFLAGS="" ;;
+  tct_kfold) MODEL=tpinn; CV=kfold; PD=0.0; MFLAGS="--class_transport" ;;
+  tct_loso) MODEL=tpinn; CV=loso; PD=0.1; MFLAGS="--class_transport" ;;
+  tps_kfold) MODEL=tpinn; CV=kfold; PD=0.0; MFLAGS="--parametric_source" ;;
+  tps_loso) MODEL=tpinn; CV=loso; PD=0.1; MFLAGS="--parametric_source" ;;
   *) echo "bad CONFIG=$CONFIG"; exit 1 ;;
 esac
 if [ "$CV" = loso ]; then
@@ -53,7 +53,7 @@ fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID or TASK_ID}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));    IDX=$(( IDX / N_SEEDS ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ))
 REGION=${REGIONS[$REGION_IDX]}; INIT_SEED=${SEEDS[$SEED_IDX]}; FOLD=${FOLDS[$FOLD_IDX]}
 
@@ -72,3 +72,5 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr --model "$MODEL" --region "$REGI
   --phys_prep "$PHYS_PREP" --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" --fold "$FOLD" --n_folds "$NF" \
   --part_dropout "$PD" --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --part_embed_dim "$PART_EMBED_DIM" \
   --alpha "$ALPHA" --n_copies "$N_COPIES" $MFLAGS --n_jobs 1 --eval_val --no_summary
+
+# Aggregate after the array finishes: CONFIG=<cfg> AGGREGATE=1 sbatch --array=0 experiments/31_physics_stdscale_sweep.sh

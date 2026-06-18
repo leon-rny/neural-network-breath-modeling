@@ -11,11 +11,11 @@ set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
+
+# single sequential task: 3 folds x 3 augmentation ratios = 9 tstr_plus runs
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# TSTR+ augmentation value: does synthetic+real beat real-only? Train the committed cvae_part, then
-# tstr_plus (real+synthetic classifier) at several augmentation ratios; compare to trtr (real-only).
-# Single sequential task (folds x ratios) to avoid summary.csv write races.
 COMMON="--model cvae_part --region mouth --init_seed 0 --split_seed 42 --n_folds 5 --latent_dim 16 --embed_dim 8 --part_embed_dim 8 --free_bits 0.0 --alpha 0.05 --n_copies 10"
 for F in 1 2 3; do
   PYTHONHASHSEED=0 python -m core.train $COMMON --fold "$F" --epochs 500 --beta_max 0.01

@@ -11,18 +11,16 @@ set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
+
+# single sequential task: 5 loso subjects x 3 augmentation ratios = 15 tstr_plus runs
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# LOSO+ : does synthetic augmentation help CROSS-SUBJECT generalization? For each held-out subject,
-# train the committed cvae_part under LOSO (part_dropout 0.1 -> learned null token), generate synthetic
-# from the null token (= an unseen subject), mix into the real n-1-subject training set, and score the
-# held-out subject. Compare to trtr real-only LOSO (mouth ceiling ~0.782, CVAE-TSTR ~0.666).
-# Single sequential task (subjects x ratios) to avoid summary.csv write races.
 REGION=mouth
 COMMON="--model cvae_part --region $REGION --cv_mode loso --part_dropout 0.1 --init_seed 0 --split_seed 42 \
   --n_folds 5 --latent_dim 16 --embed_dim 8 --part_embed_dim 8 --free_bits 0.0 --alpha 0.05 --n_copies 10"
 
-# guard: data must have exactly 5 LOSO subjects
+# guard: data must have exactly 5 loso subjects
 N_DATA=$(python -c "from core.data import load_dataset, n_loso_folds; print(n_loso_folds(load_dataset('dataset')))")
 [ "$N_DATA" = "5" ] || { echo "[LOSO+] ERROR: $N_DATA subjects != 5"; exit 1; }
 

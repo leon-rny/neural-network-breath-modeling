@@ -13,9 +13,8 @@ set -euo pipefail
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# Conditional 1D DDPM generator. CV_MODE=kfold (in-distribution) or loso (cross-subject; part_dropout
-# 0.1 so unseen-subject generation uses the null token). 2 regions x 5 seeds x 5 folds = 50 -> 0-49.
-# Compare to CVAE: kfold mouth .798/nose .664 ; loso mouth .666/nose .483.
+# 2 regions x 5 seeds x 5 folds = 50 runs
+# CV_MODE=kfold|loso (loso uses part_dropout 0.1 null token)
 CV_MODE="${CV_MODE:-kfold}"
 EMBED_DIM=32
 PART_EMBED_DIM=8
@@ -33,6 +32,7 @@ PART_DROPOUT=0.0; CV_FLAGS="--cv_mode kfold"; CVM=""; DRP=""
 if [ "$CV_MODE" = "loso" ]; then PART_DROPOUT=0.1; CV_FLAGS="--cv_mode loso --part_dropout 0.1"; CVM="_loso"; DRP="_drop0.1"; fi
 
 N_REGIONS=${#REGIONS[@]}; N_SEEDS=${#INIT_SEEDS[@]}; N_FOLDS_AX=${#FOLDS[@]}
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
@@ -53,7 +53,7 @@ fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID or TASK_ID=<0..49>}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));    IDX=$(( IDX / N_SEEDS ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ))
 REGION=${REGIONS[$REGION_IDX]}; INIT_SEED=${INIT_SEEDS[$SEED_IDX]}; FOLD=${FOLDS[$FOLD_IDX]}
 
@@ -74,4 +74,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr --model diffusion --region "$REG
   --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" --fold "$FOLD" --n_folds "$N_FOLDS" \
   --embed_dim "$EMBED_DIM" --alpha "$ALPHA" --n_copies "$N_COPIES" --n_jobs 1 --eval_val --no_summary
 
-# Aggregate: AGGREGATE=1 [CV_MODE=loso] sbatch --array=0 experiments/06_diffusion.sh
+# Aggregate after the array finishes: AGGREGATE=1 [CV_MODE=loso] sbatch --array=0 experiments/06_diffusion.sh

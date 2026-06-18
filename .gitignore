@@ -4,18 +4,13 @@ __pycache__/
 *.pyo
 
 # environment
+.DS_Store
 .python-version
 .vscode/
-.DS_Store
 .claude/
-CLAUDE.md
 
 # results
 results/
 test.*
 *.pdf
-
-# others
-OSL-SingleSource/
-new_measurements/
-loop_journal.md
+*.md

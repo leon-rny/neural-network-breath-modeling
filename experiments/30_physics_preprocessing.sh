@@ -12,25 +12,23 @@ set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
+
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# PHASE 4a — does a different physics-generator INPUT normalization improve tpinn-res?
-# Ablates PhysicsInformedDataset scaling via --phys_prep: peakscale (current default; NOT run here),
-# shared (one Lewis-coupled scale), stdscale (per-channel baseline-corrected std). Default channel (legacy
-# params_{region}.npy). Tagged _pp<mode> so rows coexist with Phase-1 peakscale tpinn-res in summary ('phys_prep').
-# Launch one (CONFIG, PHYS_PREP) per array job (chain them):
+# launch one (phys_prep, config) per array job:
 #   PHYS_PREP=shared   CONFIG=tres_kfold sbatch --array=0-49%200 experiments/30_physics_preprocessing.sh
 #   PHYS_PREP=shared   CONFIG=tres_loso  sbatch --array=0-79%200 experiments/30_physics_preprocessing.sh
-#   PHYS_PREP=stdscale CONFIG=tres_kfold sbatch --array=0-49%200 ...
-#   PHYS_PREP=stdscale CONFIG=tres_loso  sbatch --array=0-79%200 ...
-# Aggregate: PHYS_PREP=<m> CONFIG=<cfg> AGGREGATE=1 sbatch --array=0 experiments/30_physics_preprocessing.sh
+#   PHYS_PREP=stdscale CONFIG=tres_kfold sbatch --array=0-49%200 experiments/30_physics_preprocessing.sh
+#   PHYS_PREP=stdscale CONFIG=tres_loso  sbatch --array=0-79%200 experiments/30_physics_preprocessing.sh
+# kfold: 2 regions x 5 seeds x 5 folds = 50; loso: 2 regions x 5 seeds x N subjects (data-driven)
 LATENT_DIM=16; EMBED_DIM=8; PART_EMBED_DIM=8; BETA_MAX=0.01; ALPHA=0.05; N_COPIES=10
 REGIONS=(mouth nose); SEEDS=(0 1 7 42 123); SPLIT_SEED=42; EPOCHS="${EPOCHS:-500}"
 PHYS_PREP="${PHYS_PREP:?set PHYS_PREP=shared|stdscale}"
 CONFIG="${CONFIG:?set CONFIG=tres_kfold|tres_loso}"
 case "$CONFIG" in
   tres_kfold) CV=kfold; PD=0.0 ;;
-  tres_loso)  CV=loso;  PD=0.1 ;;
+  tres_loso) CV=loso; PD=0.1 ;;
   *) echo "bad CONFIG=$CONFIG"; exit 1 ;;
 esac
 MODEL=tpinn; MFLAGS="--phys_residual"
@@ -52,7 +50,7 @@ fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID or TASK_ID}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));    IDX=$(( IDX / N_SEEDS ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ))
 REGION=${REGIONS[$REGION_IDX]}; INIT_SEED=${SEEDS[$SEED_IDX]}; FOLD=${FOLDS[$FOLD_IDX]}
 
@@ -71,3 +69,5 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr --model "$MODEL" --region "$REGI
   --phys_prep "$PHYS_PREP" --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" --fold "$FOLD" --n_folds "$NF" \
   --part_dropout "$PD" --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --part_embed_dim "$PART_EMBED_DIM" \
   --alpha "$ALPHA" --n_copies "$N_COPIES" $MFLAGS --n_jobs 1 --eval_val --no_summary
+
+# Aggregate after the array finishes: PHYS_PREP=<m> CONFIG=<cfg> AGGREGATE=1 sbatch --array=0 experiments/30_physics_preprocessing.sh

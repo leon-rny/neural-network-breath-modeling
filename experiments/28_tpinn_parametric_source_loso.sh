@@ -13,9 +13,8 @@ set -euo pipefail
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# tpinn under LEAVE-ONE-SUBJECT-OUT. part_dropout=0.1 → null-token generation of the unseen subject
-# (same protocol as the CVAE/PINN LOSO, 08/09). 2 regions x N SUBJECTS (from data) x 5 seeds; N=8 -> 80 -> --array=0-79.
-# Baselines to beat: CVAE-LOSO mouth 0.666 / nose 0.483 ; PINN-LOSO mouth 0.47 / nose 0.37.
+# 2 regions x 5 seeds x N subjects (loso axis data-driven) = 2*5*N runs
+# loso axis data-driven; size with --array=0-$((2*5*N-1))%200
 LATENT_DIM=16
 EMBED_DIM=8
 PART_EMBED_DIM=8
@@ -26,15 +25,16 @@ PART_DROPOUT=0.1
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
 SPLIT_SEED=42
-# subject count is data-driven
+# subject count is data-driven; folds = seq 1 N_FOLDS
 N_FOLDS=$(python -c "from core.data import load_dataset, n_loso_folds; print(n_loso_folds(load_dataset('dataset')))")
-FOLDS=($(seq 1 "$N_FOLDS"))    # 1-indexed held-out subject
+FOLDS=($(seq 1 "$N_FOLDS")) # 1-indexed held-out subject
 EPOCHS="${EPOCHS:-500}"
 
 N_REGIONS=${#REGIONS[@]}
 N_SEEDS=${#INIT_SEEDS[@]}
 N_FOLDS_AX=${#FOLDS[@]}
 
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
@@ -50,7 +50,7 @@ fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (sbatch) or TASK_ID for a local run}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));    IDX=$(( IDX / N_SEEDS ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ))
 
 REGION=${REGIONS[$REGION_IDX]}

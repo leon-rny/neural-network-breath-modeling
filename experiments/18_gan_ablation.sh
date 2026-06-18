@@ -12,15 +12,14 @@ set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
+
+# 2 lr_d x 2 loss x 2 folds = 8 runs
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# GAN ablation (fairness): is the committed GAN at a config minimum? Grid lr_d{1e-4,2e-4}
-# (TTUR) x loss{bce,hinge} on kfold mouth folds {1,3} seed 0, gan_hidden=64. Compare best
-# kfold-mouth test acc to CVAE 0.798. bce/lrd1e-3 = original committed GAN config (not in grid;
-# this probes TTUR + hinge which are the standard GAN-stability levers).
 REGION=mouth; INIT_SEED=0; SPLIT_SEED=42; N_FOLDS=5; EPOCHS="${EPOCHS:-500}"
 LATENT_DIM=16; EMBED_DIM=8; PART_EMBED_DIM=8; ALPHA=0.05; N_COPIES=10; GAN_HIDDEN=64; LR_G=1e-3
-# decimals so the shell RUN_ID matches Python's float str() (1e-4 -> 0.0001) for the ckpt-skip check
+# decimals so RUN_ID matches Python's float str (1e-4 -> 0.0001) for the ckpt-skip check
 LRDS=(0.0001 0.0001 0.0002 0.0002); LOSSES=(bce hinge bce hinge); FOLDS=(1 3)
 N_CFG=${#LRDS[@]}
 

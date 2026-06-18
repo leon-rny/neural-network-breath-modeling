@@ -11,19 +11,18 @@ set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
+
+# one manifest row per array task (see ablations/tuning.py)
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# PHASE 4d — tune cvae_part + tpinn-res for 4 objectives (tstr/loso/tstr+/loso+). One array task = one
-# manifest row (see ablations/tuning.py). Set MANIFEST=<tsv> and EPOCHS, submit with the row count:
-#   MANIFEST=results/tuning4/search.tsv   EPOCHS=200 sbatch --array=0-$((N-1))%200 experiments/41_tune_four_objectives.sh
-#   MANIFEST=results/tuning4/validate.tsv EPOCHS=500 sbatch --array=0-$((N-1))%200 experiments/41_tune_four_objectives.sh
-# (N = data rows = lines-in-tsv minus the header.) hp_tag namespaces every run -> no summary writes (jsons only).
+# search then validate: MANIFEST=<tsv> EPOCHS=<n> sbatch --array=0-$((N-1))%200 experiments/41_tune_four_objectives.sh (N = tsv data rows)
 MANIFEST="${MANIFEST:?set MANIFEST=path to manifest tsv}"
 EPOCHS="${EPOCHS:?set EPOCHS}"
 SPLIT_SEED=42
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID or TASK_ID}}
 
-LINE=$(sed -n "$((IDX + 2))p" "$MANIFEST")   # +2: 1-indexed sed + skip header
+LINE=$(sed -n "$((IDX + 2))p" "$MANIFEST")  # +2: 1-indexed sed + skip header
 [ -n "$LINE" ] || { echo "[TUNE4] ERROR: no manifest row at idx $IDX"; exit 1; }
 IFS=$'\t' read -r MODEL OBJ MODE CV PD REGION HPTAG LD ED PED FB BM ALPHA NCOP AUGR SEED FOLD NF <<< "$LINE"
 

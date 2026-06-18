@@ -34,11 +34,7 @@ N_SEEDS=${#INIT_SEEDS[@]}
 N_FOLDS_AX=${#FOLDS[@]}
 
 # single thread per task
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
   echo "[PINN] aggregate-only: merging per-combo TSTR results into results/summary.csv"
@@ -55,9 +51,9 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
 fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..299> for a local run}}
-FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
-REGION_IDX=$(( IDX % N_REGIONS ));  IDX=$(( IDX / N_REGIONS ))
+FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
+REGION_IDX=$(( IDX % N_REGIONS )); IDX=$(( IDX / N_REGIONS ))
 LP_IDX=$(( IDX % N_LP ))
 
 LAMBDA_PHYS_VAL=${LAMBDA_PHYS[$LP_IDX]}
@@ -69,7 +65,7 @@ echo "[PINN] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} region=$REGION lambda_phys=$L
 
 PARAMS="results/pinn/params_${REGION}.npy"
 if [ ! -f "$PARAMS" ]; then
-  echo "[PINN] ERROR: missing CIR params ($PARAMS) — fit them before training the PINN." >&2
+  echo "[PINN] ERROR: missing CIR params ($PARAMS) - fit them before training the PINN." >&2
   exit 1
 fi
 CACHE="results/trtr/${REGION}_is${INIT_SEED}_ss${SPLIT_SEED}_fold${FOLD}of${N_FOLDS}_checkpoint.pkl"

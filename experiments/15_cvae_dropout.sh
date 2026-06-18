@@ -13,9 +13,6 @@ set -euo pipefail
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# Participant-dropout (null-token) A/B at the committed config, k-fold.
-#   A: part_dropout=0.0  -> reuses the committed fb0_off ckpt, should reproduce ~83/70
-#   B: part_dropout=0.10 -> learned null token (separate _pd0.1 artifacts)
 # 2 part_dropout x 2 regions x 5 seeds x 5 folds = 100 runs
 VARIANT=conv_baseline
 BETA_MAX=0.01
@@ -34,11 +31,7 @@ N_SEEDS=${#INIT_SEEDS[@]}
 N_FOLDS_AX=${#FOLDS[@]}
 
 # single thread per task
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
   echo "[PARTDROP] aggregate-only: merging both part_dropout values into summary.csv"
@@ -57,9 +50,9 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
 fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID=<0..99> for a local run}}
-FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
-REGION_IDX=$(( IDX % N_REGIONS ));  IDX=$(( IDX / N_REGIONS ))
+FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
+REGION_IDX=$(( IDX % N_REGIONS )); IDX=$(( IDX / N_REGIONS ))
 PD_IDX=$(( IDX % N_PD ))
 
 PART_DROPOUT=${PART_DROPOUTS[$PD_IDX]}

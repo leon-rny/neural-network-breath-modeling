@@ -13,9 +13,7 @@ set -euo pipefail
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# tpinn = shared-transport physics-as-decoder (humidity + temperature share advection-diffusion (D,v)).
-# k-fold, single config (fixed transport). 2 regions x 5 seeds x 5 folds = 50 -> --array=0-49.
-# Baselines to beat: CVAE k-fold mouth 0.798 / nose 0.664.
+# 2 regions x 5 seeds x 5 folds = 50 runs
 LATENT_DIM=16
 EMBED_DIM=8
 PART_EMBED_DIM=8
@@ -33,6 +31,7 @@ N_REGIONS=${#REGIONS[@]}
 N_SEEDS=${#INIT_SEEDS[@]}
 N_FOLDS_AX=${#FOLDS[@]}
 
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
@@ -48,7 +47,7 @@ fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (sbatch) or TASK_ID=<0..49>}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));    IDX=$(( IDX / N_SEEDS ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ))
 
 REGION=${REGIONS[$REGION_IDX]}

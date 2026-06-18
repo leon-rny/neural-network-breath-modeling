@@ -13,10 +13,7 @@ set -euo pipefail
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# Validate the Optuna-tuned config at FULL fidelity (5 folds x 5 seeds, 500 epochs) and compare to the
-# committed CVAE baseline (mouth .798 / nose .664). Best params read LIVE from the study journal
-# (best.json can be stale). Usage: MODEL=cvae_part REGION=mouth sbatch experiments/38_tune_cvae_validate.sh
-#        then  AGGREGATE=1 MODEL=cvae_part REGION=mouth sbatch --array=0 experiments/38_tune_cvae_validate.sh
+# 5 folds x 5 seeds = 25 runs
 MODEL="${MODEL:?set MODEL=cvae|cvae_part}"
 REGION="${REGION:?set REGION=mouth|nose}"
 EPOCHS="${EPOCHS:-500}"
@@ -24,13 +21,14 @@ SEEDS=(0 1 7 42 123)
 FOLDS=(1 2 3 4 5)
 N_FOLDS=5
 SPLIT_SEED=42
-CV_MODE="${CV_MODE:-kfold}"                    # kfold (in-distribution) or loso (cross-subject)
+CV_MODE="${CV_MODE:-kfold}"  # kfold or loso
 SFX=""; CV_FLAGS="--cv_mode $CV_MODE"
 [ "$CV_MODE" = "loso" ] && { SFX="_loso"; CV_FLAGS="--cv_mode loso --part_dropout 0.1"; }
 
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# pull best params from the Optuna study (live), matching cv_mode's study/log naming
+# pull best params from the optuna study (live), matching cv_mode's study/log naming
 read LD ED PED FB BETA LR ALPHA NC WARMUP BS <<EOF
 $(python3 - "$MODEL" "$REGION" "$EPOCHS" "$SFX" <<'PY'
 import sys, optuna
@@ -74,4 +72,4 @@ PYTHONHASHSEED="$SEED" python -m core.tstr --model "$MODEL" --region "$REGION" $
   --latent_dim "$LD" --embed_dim "$ED" $PART_FLAG --free_bits "$FB" \
   --alpha "$ALPHA" --n_copies "$NC" --n_jobs 1 --no_summary
 
-# Aggregate after the array: AGGREGATE=1 MODEL=$MODEL REGION=$REGION sbatch --array=0 experiments/38_tune_cvae_validate.sh
+# Aggregate after the array finishes: AGGREGATE=1 MODEL=$MODEL REGION=$REGION sbatch --array=0 experiments/38_tune_cvae_validate.sh

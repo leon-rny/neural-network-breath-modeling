@@ -13,28 +13,20 @@ set -euo pipefail
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# Nested-LOSO STAGE B (final). For each outer test subject t, retrain the per-fold SELECTED config
-# on all non-test subjects (train n-1) and TSTR-score on held-out t. The trtr real-data baseline runs
-# on the BYTE-IDENTICAL Stage-B split so model and baseline score the same held-out subject.
-#
-# PREREQUISITE: experiments/35_nested_loso_select.sh finished AND `python -m ablations.loso select` ran
-#   (writes results/loso/selected_{region}.csv : outer_fold,config,beta_max,accuracy).
-# RUN: sbatch --dependency=afterok:<07-jobid> experiments/36_nested_loso_final.sh
-# THEN: AGGREGATE=1 sbatch --array=0 experiments/36_nested_loso_final.sh   (or: python -m ablations.loso aggregate)
-#
-# Array size = REGIONS(2) x N_SUBJECTS(N from data) x SEEDS(5); default sized for N=8 -> --array=0-79
-# if N changes, submit with --array=0-$((2*N*5-1))%200
+# loso axis data-driven; 2 regions x 5 seeds x N subjects, default N=8 -> --array=0-$((2*N*5-1))%200
+# prerequisite: experiments/35_nested_loso_select.sh finished and python -m ablations.loso select ran
+# then: sbatch --dependency=afterok:<35-jobid> experiments/36_nested_loso_final.sh
 VARIANT=conv_baseline
 PART_DROPOUT=0.1
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
 SPLIT_SEED=42
-# N_SUBJECTS is data-driven (set below from n_loso_folds)
 EPOCHS="${EPOCHS:-500}"
 
 N_REGIONS=${#REGIONS[@]}
 N_SEEDS=${#INIT_SEEDS[@]}
 
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
@@ -59,7 +51,7 @@ INIT_SEED=${INIT_SEEDS[$SEED_IDX]}
 T=$(( FOLD_IDX + 1 ))
 
 SELECTED="results/loso/selected_${REGION}.csv"
-[ -f "$SELECTED" ] || { echo "[LOSO-B] ERROR: $SELECTED missing — run 'python -m ablations.loso select' first."; exit 1; }
+[ -f "$SELECTED" ] || { echo "[LOSO-B] ERROR: $SELECTED missing - run 'python -m ablations.loso select' first."; exit 1; }
 # selected rows: outer_fold,config,beta_max,accuracy
 LINE=$(awk -F, -v t="$T" 'NR>1 && $1==t {print $2","$3}' "$SELECTED")
 [ -n "$LINE" ] || { echo "[LOSO-B] ERROR: no selected config for outer_fold=$T in $SELECTED"; exit 1; }
@@ -68,7 +60,7 @@ BETA_MAX=${LINE##*,}
 
 echo "[LOSO-B] region=$REGION test_t=$T seed=$INIT_SEED | selected config=$CONFIG beta_max=$BETA_MAX"
 
-# conv_baseline: retrain on n-1 (exclude none), score held-out t
+# conv_baseline: retrain on n-1, score held-out t
 PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae --mode jittering \
   --variant "$VARIANT" --config "$CONFIG" --beta_max "$BETA_MAX" \
   --part_dropout "$PART_DROPOUT" \
@@ -77,7 +69,7 @@ PYTHONHASHSEED="$INIT_SEED" python -m ablations.cvae --mode jittering \
   --init_seed "$INIT_SEED" --split_seed "$SPLIT_SEED" --n_folds "$N_SUBJECTS" \
   --epochs "$EPOCHS" --n_jobs 1 --skip_existing --no_summary
 
-# trtr baseline on the identical Stage-B split (no generator, no config)
+# trtr baseline on the identical stage-b split (no generator, no config)
 PYTHONHASHSEED="$INIT_SEED" python -m core.tstr --model trtr \
   --cv_mode loso --loso_trial_val \
   --fold "$T" --region "$REGION" \

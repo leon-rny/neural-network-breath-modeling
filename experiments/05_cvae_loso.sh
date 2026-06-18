@@ -12,16 +12,16 @@ set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
+
+# loso axis data-driven; 2 regions x 5 seeds x N subjects, default N=8 -> --array=0-$((2*5*N-1))%200
+
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# cvae_part under LEAVE-ONE-SUBJECT-OUT at the COMMITTED config (plain, non-nested) — the headline
-# cvae_part LOSO row, matching the pinn/tpinn LOSO protocol (fixed config, null-token generation of the
-# unseen subject). 2 regions x N SUBJECTS (from data) x 5 seeds; default N=8 -> 80 -> --array=0-79.
-# Aggregate after:  AGGREGATE=1 sbatch --array=0 experiments/05_cvae_loso.sh
 LATENT_DIM=16; EMBED_DIM=8; PART_EMBED_DIM=8; FREE_BITS=0.0
-BETA_MAX=0.01; ALPHA=0.05; N_COPIES=10; PART_DROPOUT=0.1   # null-token required for LOSO generation
+BETA_MAX=0.01; ALPHA=0.05; N_COPIES=10; PART_DROPOUT=0.1  # null-token required for loso generation
 REGIONS=(mouth nose); INIT_SEEDS=(0 1 7 42 123); SPLIT_SEED=42
-# optional INCLUDE=comma,sorted participant subset (e.g. a,b,c,d,g) -> subset LOSO; empty = full pool
+# optional INCLUDE=comma,sorted participant subset -> subset loso; empty = full pool
 INCLUDE="${INCLUDE:-}"
 if [ -n "$INCLUDE" ]; then
   INC_ARG="--include_subjects $INCLUDE"; SUBTAG="_sub$(echo "$INCLUDE" | tr -d ',')"
@@ -49,7 +49,7 @@ fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (sbatch) or TASK_ID for a local run}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));    IDX=$(( IDX / N_SEEDS ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ))
 
 REGION=${REGIONS[$REGION_IDX]}
@@ -80,3 +80,5 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr \
   --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --part_embed_dim "$PART_EMBED_DIM" \
   --free_bits "$FREE_BITS" --alpha "$ALPHA" --n_copies "$N_COPIES" $INC_ARG \
   --n_jobs 1 --eval_val --no_summary
+
+# Aggregate after the array finishes: AGGREGATE=1 sbatch --array=0 experiments/05_cvae_loso.sh

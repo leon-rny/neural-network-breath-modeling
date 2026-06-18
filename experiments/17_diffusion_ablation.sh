@@ -12,12 +12,11 @@ set -euo pipefail
 
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
+
+# 2 hidden x 2 n_steps x 2 folds = 8 runs (each evaluated at guidance 1, 3, 5)
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# Diffusion ablation (fairness): is the committed diffusion at a config minimum? Grid
-# hidden{64,128} x n_steps{200,500} on kfold mouth folds {1,3} seed 0; each trained model
-# evaluated at guidance {1,3,5}. Compare best kfold-mouth test acc to CVAE 0.798.
-# h64/st200/guidance3 reproduces the original committed diffusion config.
 REGION=mouth; INIT_SEED=0; SPLIT_SEED=42; N_FOLDS=5; EPOCHS="${EPOCHS:-500}"
 EMBED_DIM=8; PART_EMBED_DIM=8; ALPHA=0.05; N_COPIES=10
 HIDDENS=(64 64 128 128); NSTEPS=(200 500 200 500); FOLDS=(1 3)

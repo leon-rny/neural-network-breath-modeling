@@ -13,25 +13,22 @@ set -euo pipefail
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# PINN under LEAVE-ONE-SUBJECT-OUT. Sweeps lambda_phys (incl. 0.0 = no-physics control) so the
-# same run isolates the effect of the physics constraint on cross-subject generalization.
-# 6 lambda_phys x 2 regions x N SUBJECTS (from data) x 5 seeds; default N=8 -> 480 -> --array=0-479
-# Compare against the unconstrained CVAE LOSO gap (Round 3): mouth -0.116, nose -0.057.
+# 6 lambda_phys x 2 regions x 5 seeds x N subjects (loso axis data-driven) = 6*2*5*N runs
+# loso axis data-driven; size with --array=0-$((6*2*5*N-1))%200
 LATENT_DIM=16
 EMBED_DIM=8
 PART_EMBED_DIM=8
 BETA_MAX=0.01
 ALPHA=0.05
 N_COPIES=10
-PART_DROPOUT=0.1                # null-token participant dropout — REQUIRED for LOSO generation of
-                               # the unseen held-out subject (matches the CVAE LOSO protocol, 07/08)
+PART_DROPOUT=0.1 # null-token participant dropout, required for loso generation
 LAMBDA_PHYS=(0.0 0.001 0.005 0.01 0.05 0.1)
 REGIONS=(mouth nose)
 INIT_SEEDS=(0 1 7 42 123)
 SPLIT_SEED=42
-# subject count is data-driven; FOLDS = 1..N held-out subjects
+# subject count is data-driven; folds = seq 1 N_FOLDS
 N_FOLDS=$(python -c "from core.data import load_dataset, n_loso_folds; print(n_loso_folds(load_dataset('dataset')))")
-FOLDS=($(seq 1 "$N_FOLDS"))    # 1-indexed held-out subject in [1, N_FOLDS]
+FOLDS=($(seq 1 "$N_FOLDS")) # 1-indexed held-out subject
 EPOCHS="${EPOCHS:-500}"
 
 N_LP=${#LAMBDA_PHYS[@]}
@@ -40,11 +37,7 @@ N_SEEDS=${#INIT_SEEDS[@]}
 N_FOLDS_AX=${#FOLDS[@]}
 
 # single thread per task
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
   echo "[LOSO-PINN] aggregate-only: merging per-combo LOSO TSTR results into results/summary.csv"
@@ -61,9 +54,9 @@ if [ "${AGGREGATE:-0}" = "1" ]; then
 fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID (via sbatch) or TASK_ID for a local run}}
-FOLD_IDX=$(( IDX % N_FOLDS_AX ));   IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));      IDX=$(( IDX / N_SEEDS ))
-REGION_IDX=$(( IDX % N_REGIONS ));  IDX=$(( IDX / N_REGIONS ))
+FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
+REGION_IDX=$(( IDX % N_REGIONS )); IDX=$(( IDX / N_REGIONS ))
 LP_IDX=$(( IDX % N_LP ))
 
 LAMBDA_PHYS_VAL=${LAMBDA_PHYS[$LP_IDX]}
@@ -75,11 +68,11 @@ echo "[LOSO-PINN] task=${SLURM_ARRAY_TASK_ID:-$TASK_ID} region=$REGION lambda_ph
 
 PARAMS="results/pinn/params_${REGION}.npy"
 if [ ! -f "$PARAMS" ]; then
-  echo "[LOSO-PINN] ERROR: missing CIR params ($PARAMS) — fit them before training the PINN." >&2
+  echo "[LOSO-PINN] ERROR: missing CIR params ($PARAMS) - fit them before training the PINN." >&2
   exit 1
 fi
 
-# checkpoint name must match core.train's run_id (cv-marker _loso + drop-marker _drop<pd> after _f<fold>)
+# checkpoint name must match core.train's run_id
 RUN_ID="${REGION}_s${INIT_SEED}_ld${LATENT_DIM}_ed${EMBED_DIM}_phys${LAMBDA_PHYS_VAL}_f${FOLD}_loso_drop${PART_DROPOUT}_a${ALPHA}_n${N_COPIES}"
 CKPT="results/pinn/${RUN_ID}_checkpoint.pt"
 if [ -f "$CKPT" ]; then

@@ -32,11 +32,7 @@ N_KFOLD=$(( N_PIPELINES * N_REGIONS * N_SEEDS * N_FOLDS_AX ))
 N_LEGACY=$(( N_REGIONS * N_SEEDS ))
 
 # single thread per task
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
   echo "[ABLATION] aggregate-only: merging results/ablation_trtr/*_trtr.json into summary.csv"

@@ -13,9 +13,8 @@ set -euo pipefail
 source /opt/miniforge/etc/profile.d/conda.sh
 conda activate nnbm
 
-# Subject-invariant cvae_part: gradient-reversal participant adversary on the latent (subject-invariant
-# z) on the COMMITTED config. CV_MODE=loso (default; the metric this targets) or kfold. SUBJ_LAMBDA = adv
-# strength. Compare LOSO TSTR to committed cvae_part LOSO (mouth .666 / nose .483).
+# 2 regions x 5 seeds x 5 folds = 50 runs
+# CV_MODE=loso|kfold (loso uses part_dropout 0.1 null token); SUBJ_LAMBDA = adversary strength
 CV_MODE="${CV_MODE:-loso}"
 SUBJ_LAMBDA="${SUBJ_LAMBDA:-1.0}"
 LATENT_DIM=16; EMBED_DIM=8; PART_EMBED_DIM=8; FREE_BITS=0.0; BETA_MAX=0.01; ALPHA=0.05; N_COPIES=10
@@ -26,6 +25,7 @@ PART_DROPOUT=0.0; CV_FLAGS="--cv_mode kfold"; CVM=""; DRP=""
 if [ "$CV_MODE" = "loso" ]; then PART_DROPOUT=0.1; CV_FLAGS="--cv_mode loso --part_dropout 0.1"; CVM="_loso"; DRP="_drop0.1"; fi
 ADV_TAG="_adv${SUBJ_LAMBDA}"
 N_REGIONS=${#REGIONS[@]}; N_SEEDS=${#INIT_SEEDS[@]}; N_FOLDS_AX=${#FOLDS[@]}
+# single thread per task
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 if [ "${AGGREGATE:-0}" = "1" ]; then
@@ -45,7 +45,7 @@ fi
 
 IDX=${SLURM_ARRAY_TASK_ID:-${TASK_ID:?set SLURM_ARRAY_TASK_ID or TASK_ID=<0..49>}}
 FOLD_IDX=$(( IDX % N_FOLDS_AX )); IDX=$(( IDX / N_FOLDS_AX ))
-SEED_IDX=$(( IDX % N_SEEDS ));    IDX=$(( IDX / N_SEEDS ))
+SEED_IDX=$(( IDX % N_SEEDS )); IDX=$(( IDX / N_SEEDS ))
 REGION_IDX=$(( IDX % N_REGIONS ))
 REGION=${REGIONS[$REGION_IDX]}; INIT_SEED=${INIT_SEEDS[$SEED_IDX]}; FOLD=${FOLDS[$FOLD_IDX]}
 
@@ -67,4 +67,4 @@ PYTHONHASHSEED="$INIT_SEED" python -m core.tstr --model cvae_part --region "$REG
   --latent_dim "$LATENT_DIM" --embed_dim "$EMBED_DIM" --part_embed_dim "$PART_EMBED_DIM" \
   --free_bits "$FREE_BITS" --alpha "$ALPHA" --n_copies "$N_COPIES" --n_jobs 1 --no_summary
 
-# Aggregate: AGGREGATE=1 [CV_MODE=loso] [SUBJ_LAMBDA=1.0] sbatch --array=0 experiments/16_cvae_subject_invariant.sh
+# Aggregate after the array finishes: AGGREGATE=1 [CV_MODE=loso] [SUBJ_LAMBDA=1.0] sbatch --array=0 experiments/16_cvae_subject_invariant.sh
