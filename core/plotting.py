@@ -52,6 +52,12 @@ CONFIG_LABELS = {"beta_cap_0.001": "β-cap 0.001",
 
 # exploratory data analysis
 def load_breath_pattern(classes, dataset_dir="../dataset"):
+    """Load raw .dat breath trials for the given classes into a DataFrame.
+
+    :param classes: Iterable of class folder names to load.
+    :return: A DataFrame with one row per trial (columns class, filename, participant,
+        region, trial_num, time, humidity, temperature).
+    """
     dataset = []
 
     # loop through all breath patterns
@@ -83,6 +89,11 @@ def load_breath_pattern(classes, dataset_dir="../dataset"):
     return pd.DataFrame(dataset)
 
 def resample_trials(trials_df, t_common, measurement_type):
+    """Interpolate each trial's measurement onto a common time grid.
+
+    :param measurement_type: Column to resample ('humidity' or 'temperature').
+    :return: A (n_trials, len(t_common)) array, NaN outside each trial's time span.
+    """
     out = []
     for row in trials_df.to_dict("records"):
         t = row["time"]
@@ -91,6 +102,11 @@ def resample_trials(trials_df, t_common, measurement_type):
     return np.array(out)
 
 def load_cir(dataset_dir="../dataset"):
+    """Load the channel-impulse-response .dat trials into a DataFrame.
+
+    :return: A DataFrame with one row per CIR trial (columns filename, region,
+        trial_num, time, humidity, temperature).
+    """
     dataset = []
     folder = os.path.join(dataset_dir, "cir")
 
@@ -116,6 +132,10 @@ def load_cir(dataset_dir="../dataset"):
     return pd.DataFrame(dataset)
 
 def cir_stats(region, cir_df):
+    """Compute per-time mean and std of the CIR trials for one region.
+
+    :return: (time, mean_humidity, mean_temperature, std_humidity, std_temperature) arrays.
+    """
     trials = cir_df[cir_df["region"] == region]
     humidity_mat = np.stack(trials["humidity"].values)
     temperature_mat = np.stack(trials["temperature"].values)
@@ -128,6 +148,7 @@ def cir_stats(region, cir_df):
     return time, mean_h, mean_t, std_h, std_t
 
 def plot_measurements(df, region):
+    """Plot all humidity and temperature trials per class for one region."""
     fig, axes = plt.subplots(2, 3, figsize=(WIDTH*3, HEIGHT*2), sharex="col", sharey="row")
 
     for col, cls in enumerate(CLASSES):
@@ -151,6 +172,7 @@ def plot_measurements(df, region):
     plt.show()
 
 def plot_region_comparison(df, t):
+    """Plot mean +/- std trajectories per class comparing mouth and nose regions."""
     fig, axes = plt.subplots(2, 3, figsize=(WIDTH*3, HEIGHT*2), sharex=True, sharey="row")
     for col, cls in enumerate(CLASSES):
         for row, measurement in enumerate(["humidity", "temperature"]):
@@ -180,6 +202,7 @@ def plot_region_comparison(df, t):
     plt.show()
 
 def plot_interparticipant_variability(df, t, region):
+    """Plot per-participant mean +/- std trajectories per class for one region."""
     fig, axes = plt.subplots(2, 3, figsize=(WIDTH*3, HEIGHT*2), sharex=True, sharey="row")
     for row, measurement in enumerate(["humidity", "temperature"]):
         for col, cls in enumerate(CLASSES):
@@ -212,6 +235,7 @@ def plot_interparticipant_variability(df, t, region):
     plt.show()
 
 def plot_correlation(df, participants=PARTICIPANTS):
+    """Scatter humidity vs temperature per participant and class with Pearson r."""
     fig, axes = plt.subplots(len(participants), 3, figsize=(WIDTH*3, HEIGHT*len(participants)), sharex=True, sharey=True)
 
     for p_idx, participant in enumerate(participants):
@@ -237,6 +261,7 @@ def plot_correlation(df, participants=PARTICIPANTS):
     plt.show()
 
 def plot_cir(df):
+    """Plot mean +/- std channel impulse response for mouth and nose."""
     t, mouth_h, mouth_t, mouth_h_std, mouth_t_std = cir_stats("mouth", df)
     t, nose_h,  nose_t, nose_h_std, nose_t_std = cir_stats("nose", df)
 
@@ -264,6 +289,10 @@ def plot_cir(df):
 
 # train-real-test-real ablation
 def load_trtr_features():
+    """Tally how often each feature appears in the top-20 across TRTR seeds.
+
+    :return: Dict mapping region ('mouth'/'nose') to a Counter of feature -> selection count.
+    """
     trtr_results_dir = "./results/trtr"
     feature_counts = {"mouth": Counter(), "nose": Counter()}
 
@@ -277,6 +306,7 @@ def load_trtr_features():
     return feature_counts
 
 def plot_trtr_ablation():
+    """Plot grouped-bar TRTR metrics across the pipeline-fix ablation stages."""
     df = pd.read_csv("results/ablation_trtr.csv")
     if "single_split" not in df.columns:
         df["single_split"] = False
@@ -304,6 +334,7 @@ def plot_trtr_ablation():
     agg_legacy = df_legacy.groupby("region")[metric_cols].agg(["mean", "std"])
 
     def lookup(region, pipeline, metric_col):
+        """Return the (mean, std) for a region/pipeline/metric, or (nan, 0) if missing."""
         if pipeline == "original":
             if region in agg_legacy.index:
                 return (agg_legacy.loc[region, (metric_col, "mean")],
@@ -360,6 +391,7 @@ def plot_trtr_ablation():
     plt.show()
 
 def plot_trtr_feature_count(feature_counts):
+    """Plot horizontal bars of the 20 most frequently selected features per region."""
     fig, axes = plt.subplots(1, 2, figsize=(WIDTH*4, HEIGHT*3))
 
     for ax, region in zip(axes, ["mouth", "nose"]):
@@ -385,6 +417,7 @@ def plot_trtr_feature_count(feature_counts):
     plt.show()
 
 def plot_trtr_feature_stability(feature_counts):
+    """Plot the distribution of feature selection frequency (1..5 seeds) per region."""
     fig, axes = plt.subplots(1, 2, figsize=(WIDTH*3, HEIGHT*1.5), sharey=True)
 
     for ax, region in zip(axes, ["mouth", "nose"]):
@@ -408,6 +441,7 @@ def plot_trtr_feature_stability(feature_counts):
     plt.show()
 
 def plot_trtr_channel_contribution():
+    """Plot TRTR accuracy for humidity-only, temperature-only and both channels per region."""
     df = pd.read_csv("results/summary.csv")
     df_trtr = df[df["model"]=="trtr"].copy()
     df_temperature_mouth = df_trtr[(df_trtr["channel"]=="temperature") & (df_trtr["region"]=="mouth")]
@@ -434,6 +468,11 @@ def plot_trtr_channel_contribution():
 
 # variational autoencoder
 def load_vaes(device, latent_dim=32, free_bits=[0.0, 0.1, 2.0]):
+    """Load trained VAE checkpoints and rebuild their datasets for every seed/region/free-bit.
+
+    :return: (models, datasets) where models[seed][region][free_bit] is an eval-mode VAE and
+        datasets[seed][region] is a dict of train/val/test BreathDatasets (val/test share train stats).
+    """
     models = {seed: {region: {} for region in REGIONS} for seed in SEEDS}
     datasets = {seed: {} for seed in SEEDS}
     splits = {seed: {} for seed in SEEDS}
@@ -461,6 +500,10 @@ def load_vaes(device, latent_dim=32, free_bits=[0.0, 0.1, 2.0]):
 
 @torch.no_grad()
 def encoder_outputs(model, train_ds, device):
+    """Run the VAE encoder over every sample in a dataset.
+
+    :return: (mus, logvars) tensors, each (n_samples, latent_dim) on CPU.
+    """
     mus, logvars = [], []
     model.eval()
     for i in range(len(train_ds)):
@@ -471,9 +514,14 @@ def encoder_outputs(model, train_ds, device):
     return torch.stack(mus), torch.stack(logvars)
 
 def per_dim_kl(mu, logvar):
+    """Mean per-latent-dimension KL divergence to the standard normal prior.
+
+    :return: A (latent_dim,) numpy array of mean KL in nats per dimension.
+    """
     return (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).mean(dim=0).numpy()
 
 def plot_vae_training(region, latent_dim=32, free_bits=[0.0, 0.1, 2.0]):
+    """Plot mean +/- std VAE train/val loss, reconstruction and KL curves per free-bits config."""
     # training curves
     pairs = [("train_loss", "val_loss", "Total loss"),
             ("train_recon", "val_recon", "Reconstruction loss"),
@@ -510,6 +558,7 @@ def plot_vae_training(region, latent_dim=32, free_bits=[0.0, 0.1, 2.0]):
     plt.show()
 
 def plot_vae_active_dims_training(region, latent_dim=32, free_bits=[0.0, 0.1, 2.0]):
+    """Plot mean +/- std active-latent-dimension curves over training per free-bits config."""
     fig, ax = plt.subplots(figsize=(WIDTH, HEIGHT))
 
     for i, free_bit in enumerate(free_bits):
@@ -538,6 +587,7 @@ def plot_vae_active_dims_training(region, latent_dim=32, free_bits=[0.0, 0.1, 2.
     plt.show()
 
 def plot_vae_active_dims_final(models, datasets, region, free_bits=[0.0, 0.1, 2.0], active_threshold=0.1):
+    """Plot sorted per-dimension KL bars of the trained VAEs per free-bits config."""
     fig, axes = plt.subplots(1, len(free_bits), figsize=(WIDTH * len(free_bits), HEIGHT*1.5), sharey=True)
 
     for i, (ax, free_bit) in enumerate(zip(axes, free_bits)):
@@ -570,6 +620,12 @@ def plot_vae_active_dims_final(models, datasets, region, free_bits=[0.0, 0.1, 2.
     plt.show()
 
 def participant_contours(ax, emb, parts, levels=(0.5,), grid_size=120, pad=0.1):
+    """Overlay per-participant KDE density contours of a 2D embedding onto an axis.
+
+    :param emb: (n, 2) embedding coordinates.
+    :param parts: Per-point participant indices into PARTICIPANTS.
+    :param levels: Cumulative-density mass levels at which to draw each contour.
+    """
     x_min, x_max = emb[:, 0].min(), emb[:, 0].max()
     y_min, y_max = emb[:, 1].min(), emb[:, 1].max()
     dx = (x_max - x_min) * pad
@@ -596,6 +652,7 @@ def participant_contours(ax, emb, parts, levels=(0.5,), grid_size=120, pad=0.1):
                 colors=[PARTICIPANT_COLORS[participant]], linewidths=1.5, alpha=0.9)
 
 def plot_vae_tSNE(models, datasets, region, free_bits=[0.0, 0.1, 2.0]):
+    """Plot t-SNE of VAE latent means colored by class with participant contours, per free-bits config."""
     train_ds = datasets[SEEDS[0]][region]["train"]
     classes = np.array([train_ds[i][2] for i in range(len(train_ds))])
     parts   = np.array([train_ds[i][3] for i in range(len(train_ds))])
@@ -640,7 +697,13 @@ def plot_vae_tSNE(models, datasets, region, free_bits=[0.0, 0.1, 2.0]):
 
 # conditional variational autoencoder
 def load_cvae_ablation_data(arch_dir="results/ablation_cvae_architecture", dyn_dir="results/ablation_cvae_training_dynamics"):
+    """Load the CVAE architecture and training-dynamics ablation summaries and histories.
+
+    :return: (arch_summary, arch_history, dyn_summary, dyn_history) DataFrames, each sorted
+        and with config/variant columns set as ordered categoricals.
+    """
     def load_histories(directory, key_col):
+        """Concatenate the per-run *_history.csv files, tagging name/region/seed columns."""
         pattern = re.compile(r"(?P<name>.+)_(?P<region>mouth|nose)_s(?P<seed>\d+)_history$")
         frames = []
         for path_str in sorted(glob.glob(str(Path(directory) / "*_history.csv"))):
@@ -677,6 +740,11 @@ def load_cvae_ablation_data(arch_dir="results/ablation_cvae_architecture", dyn_d
     return arch_summary, arch_history, dyn_summary, dyn_history
 
 def load_cvaes(device, configs=["beta_cap_0.001", "beta_cap_0.1", "beta_cap_1.0"], seed=0, ckpt_dir="results/ablation_cvae_training_dynamics"):
+    """Load trained CVAE checkpoints and rebuild their train datasets for the given configs.
+
+    :return: (models, datasets) where models[region][config] is an eval-mode CVAE and
+        datasets[region] is the train BreathDataset for that region.
+    """
     models = {region: {} for region in REGIONS}
     datasets = {}
 
@@ -700,6 +768,10 @@ def load_cvaes(device, configs=["beta_cap_0.001", "beta_cap_0.1", "beta_cap_1.0"
 
 @torch.no_grad()
 def cvae_encoder_outputs(model, dataset, device):
+    """Run the CVAE encoder (with class and optional participant conditioning) over a dataset.
+
+    :return: (mus, logvars) tensors, each (n_samples, latent_dim) on CPU.
+    """
     mus, logvars = [], []
     model.eval()
     for i in range(len(dataset)):
@@ -712,6 +784,7 @@ def cvae_encoder_outputs(model, dataset, device):
     return torch.stack(mus), torch.stack(logvars)
 
 def plot_cvae_architecture_ablation(arch_summary):
+    """Plot mean +/- std TSTR metric bars per CVAE architecture variant and region."""
     metrics = ["accuracy", "f1_weighted", "roc_auc"]
     titles = {"accuracy": "Accuracy", "f1_weighted": "F1 (weighted)", "roc_auc": "ROC-AUC"}
     stats = arch_summary.groupby(["region", "variant"], observed=True)[metrics].agg(["mean", "std"])
@@ -736,6 +809,7 @@ def plot_cvae_architecture_ablation(arch_summary):
     plt.show()
 
 def plot_cvae_architecture_dynamics(arch_history, warmup_end=250, latent_dim=16):
+    """Plot mean +/- std KL and active-dimension training curves per CVAE architecture and region."""
     fig, axes = plt.subplots(2, 2, figsize=(WIDTH * 3, HEIGHT * 2), sharex=True, sharey="row")
     for col, region in enumerate(REGIONS):
         ax_kl = axes[0, col]
@@ -777,6 +851,7 @@ def plot_cvae_architecture_dynamics(arch_history, warmup_end=250, latent_dim=16)
     plt.show()
 
 def plot_cvae_beta_sweep(dyn_summary):
+    """Plot accuracy, active dims and final KL vs beta-cap per region, marking the best beta-cap."""
     region_colors = {"mouth": "tab:blue", "nose": "tab:orange"}
     metrics = ["accuracy", "active_dims", "kl_final"]
     ylabels = {"accuracy": "TSTR accuracy", "active_dims": "Active dimensions", "kl_final": "Final KL"}
@@ -825,6 +900,7 @@ def plot_cvae_beta_sweep(dyn_summary):
     plt.show()
 
 def plot_cvae_beta_active_dims(dyn_history, warmup_end=250, latent_dim=16):
+    """Plot mean +/- std active-dimension training curves per beta-cap config and region."""
     beta_colors = dict(zip(BETA_CONFIGS, sns.color_palette("Blues", n_colors=len(BETA_CONFIGS) + 2)[2:]))
 
     fig, axes = plt.subplots(1, 2, figsize=(WIDTH * 3, HEIGHT * 1.5), sharey=True)
@@ -859,6 +935,7 @@ def plot_cvae_beta_active_dims(dyn_history, warmup_end=250, latent_dim=16):
     plt.show()
 
 def plot_cvae_tSNE(models, datasets, region, configs=["beta_cap_0.001", "beta_cap_0.1", "beta_cap_1.0"], device="cpu", random_state=0, perplexity=30.0):
+    """Plot t-SNE of CVAE latent means colored by class with participant contours, per beta-cap config."""
     dataset = datasets[region]
     region_models = models[region]
     classes = np.array([dataset[i][2] for i in range(len(dataset))])
@@ -896,6 +973,7 @@ def plot_cvae_tSNE(models, datasets, region, configs=["beta_cap_0.001", "beta_ca
     plt.show()
 
 def plot_cvae_lag(dyn_summary):
+    """Plot mean +/- std TSTR accuracy bars for the lagging-inference configs vs the beta 1.0 baseline."""
     lag_colors = {"beta_cap_1.0": "#4d4d4d", **dict(zip(LAG_CONFIGS, sns.color_palette("viridis", n_colors=len(LAG_CONFIGS) + 3)[1:-2]))}
     plot_configs = ["beta_cap_1.0", *LAG_CONFIGS]
     labels = {"beta_cap_1.0": r"$\beta$ 1.0 baseline", **{cfg: CONFIG_LABELS[cfg] for cfg in LAG_CONFIGS}}
@@ -927,9 +1005,11 @@ def plot_cvae_lag(dyn_summary):
     plt.show()
 
 def plot_cvae_summary(dyn_summary, arch_summary):
+    """Plot ranked horizontal accuracy bars of all training-dynamics configs vs the architecture baseline."""
     rank_colors = {"beta": "tab:green", "lag": "tab:purple", "combined": "tab:red"}
 
     def family_of(config):
+        """Classify a config as 'beta', 'lag' or 'combined'."""
         if config in BETA_CONFIGS:
             return "beta"
         if config in LAG_CONFIGS:
@@ -967,6 +1047,7 @@ def plot_cvae_summary(dyn_summary, arch_summary):
     plt.show()
 
 def plot_cvae_jittering():
+    """Plot mean +/- std TSTR metric bars per jittering-augmentation config, highlighting the best per panel."""
     df = pd.read_csv("results/ablation_cvae_jittering/summary.csv")
 
     metrics = ["accuracy", "f1_weighted", "roc_auc"]
@@ -978,6 +1059,7 @@ def plot_cvae_jittering():
     bar_colors = ["lightgray" if cfg == "baseline" else alpha_colors[df[df["config"] == cfg]["alpha"].iloc[0]] for cfg in configs]
 
     def label(cfg):
+        """Format a jittering config as an alpha/n-copies axis label ('baseline' passes through)."""
         if cfg == "baseline":
             return "baseline"
         a = df[df["config"] == cfg]["alpha"].iloc[0]

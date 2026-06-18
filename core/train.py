@@ -16,25 +16,28 @@ from models.diffusion import ConditionalDiffusion
 from models.gan import Generator, Discriminator
 
 def _cv_marker(cv_mode: str) -> str:
+    """Run-id suffix for the cross-validation mode ('' for kfold)."""
     return '' if cv_mode == 'kfold' else f'_{cv_mode}'
 
 def _drop_marker(part_dropout: float) -> str:
+    """Run-id suffix for the participant-dropout rate ('' when off)."""
     return '' if part_dropout == 0.0 else f'_drop{part_dropout}'
 
 # cli arguments
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     p = argparse.ArgumentParser()
     # general
     p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part', 'pinn', 'tpinn', 'diffusion', 'gan'])
-    p.add_argument('--n_steps', type=int, default=200, help='diffusion: number of DDPM timesteps')
+    p.add_argument('--n_steps', type=int, default=200)
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--log_every', type=int, default=25)
-    p.add_argument('--init_seed', type=int, default=42, help='Model-internal randomness; varies across runs to characterize sensitivity.')
-    p.add_argument('--split_seed', type=int, default=42, help='Data partition; fixed for paired comparisons.')
-    p.add_argument('--fold', type=int, default=1, help='1-indexed fold in [1, n_folds] (kfold) or [1, n_subjects] (loso).')
+    p.add_argument('--init_seed', type=int, default=42)
+    p.add_argument('--split_seed', type=int, default=42)
+    p.add_argument('--fold', type=int, default=1)
     p.add_argument('--n_folds', type=int, default=5)
-    p.add_argument('--cv_mode', choices=['kfold', 'loso'], default='kfold', help='kfold: split by trial; loso: leave-one-subject-out (fold count derived from data).')
+    p.add_argument('--cv_mode', choices=['kfold', 'loso'], default='kfold')
     p.add_argument('--epochs', type=int, default=500)
     p.add_argument('--batch_size', type=int, default=32)
     # model-specific
@@ -42,37 +45,43 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--embed_dim', type=int, default=8)     # ablation default
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--free_bits', type=float, default=0.0)
-    p.add_argument('--part_dropout', type=float, default=0.0, help='CFG-style participant-dropout prob (cvae_part/pinn). Required >0 for LOSO null-token generation.')
-    p.add_argument('--include_subjects', default='', help='Comma-separated participant letters to restrict training to a subset (empty=full pool); namespaces run_id/checkpoint to match core.tstr.')
-    p.add_argument('--cir_tag', default='', help="pinn/tpinn fitted-CIR channel variant, e.g. '300s' -> loads results/pinn/params_{region}_300s.npy and tags run_id/summary; empty = active params_{region}.npy.")
-    p.add_argument('--phys_prep', choices=['peakscale', 'shared', 'stdscale'], default='peakscale', help="pinn/tpinn input normalization (PhysicsInformedDataset): peakscale (current per-channel peak-dev), shared (one Lewis-coupled scale), stdscale (per-channel baseline-corrected std). Tags run_id; default unchanged.")
+    p.add_argument('--part_dropout', type=float, default=0.0)
+    p.add_argument('--include_subjects', default='')
+    p.add_argument('--cir_tag', default='')
+    p.add_argument('--phys_prep', choices=['peakscale', 'shared', 'stdscale'], default='peakscale')
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--beta_max', type=float, default=0.1)
-    p.add_argument('--beta_warmup_epochs', type=int, default=None, help='Epochs to linearly warm beta 0->beta_max. Defaults to epochs // 2 (matches the ablations).')
+    p.add_argument('--beta_warmup_epochs', type=int, default=None)
     # pinn-specific (ignored by vae/cvae/cvae_part)
-    p.add_argument('--lambda_phys', type=float, default=0.0, help='Weight of the physics-consistency penalty (pinn only).')
-    p.add_argument('--tau_s', type=float, default=15.0, help='Sensor time constant for the CIR convolution (pinn only).')
-    p.add_argument('--learn_cir_params', action='store_true', help='Learn per-sample CIR params from z (pinn only).')
-    p.add_argument('--phys_residual', action='store_true', help='tpinn: add a learned conv-decoder residual on top of the physics envelope (recovers class-discriminative capacity).')
-    p.add_argument('--class_transport', action='store_true', help='tpinn: per-class learnable (D,v) transport + learnable global tau_s (class expressed through physical params; corrects CIR over-smoothing).')
-    p.add_argument('--parametric_source', action='store_true', help='tpinn: interpretable analytic source u(t)=A*sigmoid((t-t0)/rate) with per-class params (onset/rate/amplitude) + global learnable transport.')
+    p.add_argument('--lambda_phys', type=float, default=0.0)
+    p.add_argument('--tau_s', type=float, default=15.0)
+    p.add_argument('--learn_cir_params', action='store_true')
+    p.add_argument('--phys_residual', action='store_true')
+    p.add_argument('--class_transport', action='store_true')
+    p.add_argument('--parametric_source', action='store_true')
     # jittering augmentation (training only; defaults = off)
     p.add_argument('--alpha', type=float, default=0.0)
     p.add_argument('--n_copies', type=int, default=1)
-    p.add_argument('--hp_tag', default='', help='optional run_id suffix to namespace HP-grid runs (4c tuning); empty = no-op, existing runs byte-identical.')
-    p.add_argument('--subj_adv_lambda', type=float, default=0.0, help='cvae_part: gradient-reversal participant-adversary strength (subject-invariant latent for LOSO)')
-    p.add_argument('--diff_hidden', type=int, default=64, help='diffusion: denoiser conv width (capacity ablation)')
-    p.add_argument('--gan_hidden', type=int, default=64, help='gan: generator/discriminator conv width (capacity ablation)')
-    p.add_argument('--gan_lr_d', type=float, default=None, help='gan: discriminator lr (TTUR); defaults to --lr')
-    p.add_argument('--gan_loss', choices=['bce', 'hinge'], default='bce', help='gan: adversarial loss')
+    p.add_argument('--hp_tag', default='')
+    p.add_argument('--subj_adv_lambda', type=float, default=0.0)
+    p.add_argument('--diff_hidden', type=int, default=64)
+    p.add_argument('--gan_hidden', type=int, default=64)
+    p.add_argument('--gan_lr_d', type=float, default=None)
+    p.add_argument('--gan_loss', choices=['bce', 'hinge'], default='bce')
     return p.parse_args()
 
 # vae and cvae training
 def beta_capped(epoch: int, warmup_epochs: int, beta_max: float = 0.1) -> float:
-    """Linear warmup from 0 → beta_max over first half of training, then hold."""
+    """Linear warmup from 0 -> beta_max over first half of training, then hold."""
     return min(beta_max, (epoch / warmup_epochs) * beta_max)
 
 def train_vae_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1):
+    """Train a (C)VAE for one epoch with beta-warmup ELBO.
+
+    :param conditional: pass the class label to the model (cvae/cvae_part).
+    :param use_participant: also pass the participant index (cvae_part).
+    :return: epoch-mean (loss, recon, kl).
+    """
     model.train()
     beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
     total_loss = recon_sum = kl_sum = 0.0
@@ -105,7 +114,9 @@ def train_cvae_adv_one_epoch(model, loader, optimizer, epoch, warmup_epochs, dev
     beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
     total = recon_sum = kl_sum = 0.0
     for signal, _time, label, participant in loader:
-        signal = signal.to(device); label = label.long().to(device); participant = participant.long().to(device)
+        signal = signal.to(device)
+        label = label.long().to(device)
+        participant = participant.long().to(device)
         p_in = participant
         if model._cond_part and model.part_dropout > 0.0 and torch.rand(1).item() < model.part_dropout:
             p_in = torch.full_like(participant, model.null_part_idx)
@@ -115,13 +126,23 @@ def train_cvae_adv_one_epoch(model, loader, optimizer, epoch, warmup_epochs, dev
         elbo, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
         adv = F.cross_entropy(model.adv_logits(z, adv_lambda), participant)  # GRL flips sign to the encoder
         loss = elbo + adv
-        optimizer.zero_grad(); loss.backward(); optimizer.step()
-        total += loss.item(); recon_sum += recon.item(); kl_sum += kl.item()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total += loss.item()
+        recon_sum += recon.item()
+        kl_sum += kl.item()
     n = len(loader)
     return total / n, recon_sum / n, kl_sum / n
 
 @torch.no_grad()
 def evaluate(model, loader, epoch, warmup_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1):
+    """Evaluate a (C)VAE for one epoch (no grad).
+
+    :param conditional: pass the class label to the model (cvae/cvae_part).
+    :param use_participant: also pass the participant index (cvae_part).
+    :return: epoch-mean (loss, recon, kl).
+    """
     model.eval()
     beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
     total_loss = recon_sum = kl_sum = 0.0
@@ -145,6 +166,10 @@ def evaluate(model, loader, epoch, warmup_epochs, device, free_bits, conditional
 
 @torch.no_grad()
 def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_participant=False):
+    """Count latent dims whose mean per-dim KL exceeds threshold (no grad).
+
+    :return: number of active latent dimensions.
+    """
     mus, logvars = [], []
     for i in range(len(dataset)):
         signal, _, label, participant = dataset[i]
@@ -166,6 +191,12 @@ def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_pa
 PINN_DIAG_KEYS = ('u_norm', 'logA_mean', 'logA_std', 'logD_mean', 'logD_std', 'logv_mean', 'logv_std')
 
 def pinn_diag_stats(u_post_softplus, cir_params):
+    """Per-batch diagnostics for PINN training.
+
+    :param u_post_softplus: (B, 36) physics source after softplus.
+    :param cir_params: (log_A, log_D, log_v) transport-parameter tensors.
+    :return: dict keyed by PINN_DIAG_KEYS (source norm, per-param mean/std).
+    """
     log_A, log_D, log_v = cir_params
     return {'u_norm': u_post_softplus.norm(dim=1).mean().item(),
             'logA_mean': log_A.mean().item(), 'logA_std': log_A.std().item(),
@@ -173,6 +204,10 @@ def pinn_diag_stats(u_post_softplus, cir_params):
             'logv_mean': log_v.mean().item(), 'logv_std': log_v.std().item()}
 
 def train_pinn_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, lambda_phys, beta_max=0.1):
+    """Train a (t)PINN for one epoch: loss = ELBO + lambda_phys * MSE(humidity_phys, x_hat humidity).
+
+    :return: dict of epoch-mean metrics ('total', 'recon', 'kl', 'phys') plus PINN_DIAG_KEYS.
+    """
     model.train()
     beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
     totals = {k: 0.0 for k in ('total', 'recon', 'kl', 'phys') + PINN_DIAG_KEYS}
@@ -200,6 +235,10 @@ def train_pinn_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device,
 
 @torch.no_grad()
 def evaluate_pinn(model, loader, epoch, warmup_epochs, device, free_bits, lambda_phys, beta_max=0.1):
+    """Evaluate a (t)PINN for one epoch (no grad), same loss as training.
+
+    :return: dict of epoch-mean metrics ('total', 'recon', 'kl', 'phys') plus PINN_DIAG_KEYS.
+    """
     model.eval()
     beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
     totals = {k: 0.0 for k in ('total', 'recon', 'kl', 'phys') + PINN_DIAG_KEYS}
@@ -223,6 +262,7 @@ def evaluate_pinn(model, loader, epoch, warmup_epochs, device, free_bits, lambda
 
 # main loop
 def main():
+    """Entry point: parse args, build the dataset split, train the requested model, save checkpoint and history."""
     args = parse_args()
     if args.beta_warmup_epochs is None:
         args.beta_warmup_epochs = args.epochs // 2
@@ -275,7 +315,7 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     if args.alpha > 0 and args.n_copies > 1:
-        print(f'[TRAIN] Jitter: alpha={args.alpha}, n_copies={args.n_copies} ({len(train_ds_clean)} → {len(train_ds)} samples)')
+        print(f'[TRAIN] Jitter: alpha={args.alpha}, n_copies={args.n_copies} ({len(train_ds_clean)} -> {len(train_ds)} samples)')
 
     # vae, cvae, and cvae_part branch
     if args.model in ('vae', 'cvae', 'cvae_part'):
@@ -357,7 +397,7 @@ def main():
             scheduler.step()
 
             beta = beta_capped(epoch, args.beta_warmup_epochs, beta_max=args.beta_max)
-            # select on the ELBO (recon + beta*KL), excluding the physics penalty — comparable across the lambda_phys sweep and to the CVAE
+            # select on the ELBO (recon + beta*KL), excluding the physics penalty - comparable across the lambda_phys sweep and to the CVAE
             val_elbo = val_m['recon'] + beta * val_m['kl']
             if val_elbo < best_val_loss and beta >= args.beta_max:
                 best_val_loss = val_elbo
@@ -381,7 +421,7 @@ def main():
                                    'kl': f'{val_m["kl"]:.4f}',
                                    'ph': f'{val_m["phys"]:.4f}'})
 
-    # diffusion branch (DDPM eps-prediction; BreathDataset z-score; save last epoch — stable training)
+    # diffusion branch (DDPM eps-prediction; BreathDataset z-score; save last epoch - stable training)
     elif args.model == 'diffusion':
         model = ConditionalDiffusion(num_classes=3, num_participants=num_participants,
                                      embed_dim=args.embed_dim, part_embed_dim=args.part_embed_dim,
@@ -392,18 +432,26 @@ def main():
         history = []
         epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
         for epoch in epoch_bar:
-            model.train(); tr = 0.0
+            model.train()
+            tr = 0.0
             for signal, _time, label, participant in train_loader:
-                signal = signal.to(device); label = label.long().to(device); participant = participant.long().to(device)
+                signal = signal.to(device)
+                label = label.long().to(device)
+                participant = participant.long().to(device)
                 loss = model.loss(signal, label, participant)
-                optimizer.zero_grad(); loss.backward(); optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
                 tr += loss.item()
             scheduler.step()
             tr /= len(train_loader)
-            model.eval(); vl = 0.0
+            model.eval()
+            vl = 0.0
             with torch.no_grad():
                 for signal, _time, label, participant in val_loader:
-                    signal = signal.to(device); label = label.long().to(device); participant = participant.long().to(device)
+                    signal = signal.to(device)
+                    label = label.long().to(device)
+                    participant = participant.long().to(device)
                     vl += model.loss(signal, label, participant).item()
             vl /= max(len(val_loader), 1)
             torch.save({'epoch': epoch, 'model_state': model.state_dict(), 'stats': train_ds.stats,
@@ -428,9 +476,13 @@ def main():
         history = []
         epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
         for epoch in epoch_bar:
-            G.train(); D.train(); dl = gl = 0.0
+            G.train()
+            D.train()
+            dl = gl = 0.0
             for signal, _time, label, participant in train_loader:
-                signal = signal.to(device); label = label.long().to(device); participant = participant.long().to(device)
+                signal = signal.to(device)
+                label = label.long().to(device)
+                participant = participant.long().to(device)
                 B = signal.size(0)
                 p_in = participant.clone()
                 if args.part_dropout > 0:                                    # train the null-token path for LOSO
@@ -438,18 +490,24 @@ def main():
                 # D step
                 z = torch.randn(B, z_dim, device=device)
                 fake = G(z, label, p_in).detach()
-                d_real = D(signal, label); d_fake = D(fake, label)
+                d_real = D(signal, label)
+                d_fake = D(fake, label)
                 if args.gan_loss == 'hinge':
                     lossD = F.relu(1.0 - d_real).mean() + F.relu(1.0 + d_fake).mean()
                 else:
                     lossD = bce(d_real, torch.full_like(d_real, 0.9)) + bce(d_fake, torch.zeros_like(d_fake))
-                optD.zero_grad(); lossD.backward(); optD.step()
+                optD.zero_grad()
+                lossD.backward()
+                optD.step()
                 # G step
                 z = torch.randn(B, z_dim, device=device)
                 g_logit = D(G(z, label, p_in), label)
                 lossG = -g_logit.mean() if args.gan_loss == 'hinge' else bce(g_logit, torch.ones((B, 1), device=device))
-                optG.zero_grad(); lossG.backward(); optG.step()
-                dl += lossD.item(); gl += lossG.item()
+                optG.zero_grad()
+                lossG.backward()
+                optG.step()
+                dl += lossD.item()
+                gl += lossG.item()
             n = len(train_loader)
             torch.save({'epoch': epoch, 'model_state': G.state_dict(), 'stats': train_ds.stats,
                         'embed_dim': args.embed_dim, 'part_embed_dim': args.part_embed_dim, 'z_dim': z_dim,

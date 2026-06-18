@@ -28,13 +28,16 @@ from models.diffusion import ConditionalDiffusion
 from models.gan import Generator as GANGenerator
 
 def _cv_marker(cv_mode: str) -> str:
+    """Return the run-id suffix for a non-kfold cv mode (empty for kfold)."""
     return '' if cv_mode == 'kfold' else f'_{cv_mode}'
 
 def _drop_marker(part_dropout: float) -> str:
+    """Return the run-id suffix for a nonzero participant dropout rate."""
     return '' if part_dropout == 0.0 else f'_drop{part_dropout}'
 
 # cli
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     p = argparse.ArgumentParser()
     # general
     p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'pinn', 'tpinn', 'diffusion', 'gan'])
@@ -46,35 +49,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--n_jobs', type=int, default=4)
     p.add_argument('--force_rebuild', action='store_true')
-    p.add_argument('--no_summary', action='store_true', help='Skip writing to results/summary.csv. Use during parallel runs to avoid races; a sequential pass can then aggregate.')
+    p.add_argument('--no_summary', action='store_true')
     p.add_argument('--init_seed', type=int, default=42) # varies across experiments to characterize sensitivity
     p.add_argument('--split_seed', type=int, default=42) # always fixed!
-    p.add_argument('--fold', type=int, default=1, help='1-indexed fold in [1, n_folds] (kfold) or [1, n_subjects] (loso).')
+    p.add_argument('--fold', type=int, default=1)
     p.add_argument('--n_folds', type=int, default=5)
-    p.add_argument('--cv_mode', choices=['kfold', 'loso'], default='kfold', help='kfold: split by trial; loso: leave-one-subject-out (generates from the null token).')
-    p.add_argument('--part_dropout', type=float, default=0.0, help='Must match the trained checkpoint (only affects run_id/path lookup here).')
-    p.add_argument('--loso_trial_val', action='store_true', help='Nested-LOSO: trial-level early-stop val + subject excludes (loso_split_final). Used by the part-4 orchestration.')
-    p.add_argument('--loso_exclude', default='', help='Nested-LOSO: comma-separated 1-indexed subject folds to drop from the training pool (e.g. the outer test subject during selection).')
+    p.add_argument('--cv_mode', choices=['kfold', 'loso'], default='kfold')
+    p.add_argument('--part_dropout', type=float, default=0.0)
+    p.add_argument('--loso_trial_val', action='store_true')
+    p.add_argument('--loso_exclude', default='')
     # model-specific
     p.add_argument('--free_bits', type=float, default=0.0)
     p.add_argument('--latent_dim', type=int, default=16)
     p.add_argument('--embed_dim', type=int, default=8)
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--lambda_phys', type=float, default=1.0)
-    p.add_argument('--tau_s', type=float, default=15.0, help='Accepted for CLI symmetry with train; tpinn reconstruction uses the checkpoint value.')
-    p.add_argument('--subj_adv_lambda', type=float, default=0.0, help='cvae_part subject-adversarial variant (must match checkpoint; affects run_id/path).')
-    p.add_argument('--diff_hidden', type=int, default=64, help='diffusion: denoiser width (must match checkpoint; affects run_id/path).')
-    p.add_argument('--n_steps', type=int, default=200, help='diffusion: DDPM timesteps (must match checkpoint; affects run_id/path).')
-    p.add_argument('--guidance', type=float, default=-1.0, help='diffusion: CFG strength override at sampling (>=0 overrides ckpt; not in run_id).')
-    p.add_argument('--gan_hidden', type=int, default=64, help='gan: generator/discriminator width (must match checkpoint; affects run_id/path).')
-    p.add_argument('--gan_loss', choices=['bce', 'hinge'], default='bce', help='gan: loss variant (must match checkpoint; affects run_id/path).')
-    p.add_argument('--gan_lr_d', type=float, default=None, help='gan: discriminator lr/TTUR variant (must match checkpoint; affects run_id/path).')
-    p.add_argument('--lr', type=float, default=1e-3, help='gan: generator lr (default for gan_lr_d; affects run_id/path).')
-    p.add_argument('--phys_residual', action='store_true', help='tpinn: model has a conv-decoder residual (must match the trained checkpoint; affects run_id/path).')
-    p.add_argument('--class_transport', action='store_true', help='tpinn: per-class transport variant (must match the trained checkpoint; affects run_id/path).')
-    p.add_argument('--parametric_source', action='store_true', help='tpinn: parametric-source variant (must match the trained checkpoint; affects run_id/path).')
-    p.add_argument('--learn_cir_params', action='store_true', help='tpinn: global learnable transport (D,v) variant (must match the trained checkpoint; affects run_id/path).')
-    p.add_argument('--hp_tag', default='', help='optional run_id suffix to namespace HP-grid runs (4c tuning); must match the trained checkpoint; empty = no-op.')
+    p.add_argument('--tau_s', type=float, default=15.0)
+    p.add_argument('--subj_adv_lambda', type=float, default=0.0)
+    p.add_argument('--diff_hidden', type=int, default=64)
+    p.add_argument('--n_steps', type=int, default=200)
+    p.add_argument('--guidance', type=float, default=-1.0)
+    p.add_argument('--gan_hidden', type=int, default=64)
+    p.add_argument('--gan_loss', choices=['bce', 'hinge'], default='bce')
+    p.add_argument('--gan_lr_d', type=float, default=None)
+    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--phys_residual', action='store_true')
+    p.add_argument('--class_transport', action='store_true')
+    p.add_argument('--parametric_source', action='store_true')
+    p.add_argument('--learn_cir_params', action='store_true')
+    p.add_argument('--hp_tag', default='')
     # jittering augmentation
     p.add_argument('--alpha', type=float, default=0.0)
     p.add_argument('--n_copies', type=int, default=1)
@@ -85,21 +88,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--regions', default=None)
     p.add_argument('--init_seeds', default=None)
     p.add_argument('--folds', default=None)
-    p.add_argument('--include_subjects', default='', help='Comma-separated participant letters to restrict the whole run to a subset (empty=full pool); namespaces summary/run_id/cache so subset runs do not collide.')
-    p.add_argument('--cir_tag', default='', help="pinn/tpinn fitted-CIR channel variant (must match the trained checkpoint, e.g. '300s'); tags run_id + summary 'cir' column.")
-    p.add_argument('--preprocessing', choices=['raw', 'baseline', 'peaknorm'], default='raw', help='trtr signal preprocessing before feature extraction: raw (current), baseline (subtract per-channel pre-onset baseline), peaknorm (baseline + per-signal amplitude normalize). Tags run_id + summary prep column.')
-    p.add_argument('--phys_prep', choices=['peakscale', 'shared', 'stdscale'], default='peakscale', help="pinn/tpinn input normalization variant (must match the trained checkpoint); tags run_id + summary 'phys_prep' column.")
+    p.add_argument('--include_subjects', default='')
+    p.add_argument('--cir_tag', default='')
+    p.add_argument('--preprocessing', choices=['raw', 'baseline', 'peaknorm'], default='raw')
+    p.add_argument('--phys_prep', choices=['peakscale', 'shared', 'stdscale'], default='peakscale')
     return p.parse_args()
 
 # utils
 def preprocess_signals(df: pd.DataFrame, mode: str = 'raw', nb: int = 5) -> pd.DataFrame:
-    '''Per-trial signal preprocessing before feature extraction (Phase 4 ablation). raw=identity;
-    baseline=subtract per-channel pre-onset baseline (first nb samples); peaknorm=baseline then divide each
-    channel by its own peak |amplitude| (removes the seasonal offset+gain shift). Returns a transformed copy.'''
+    """Per-trial signal preprocessing before feature extraction (Phase 4 ablation).
+
+    raw=identity; baseline=subtract per-channel pre-onset baseline (first nb samples);
+    peaknorm=baseline then divide each channel by its own peak |amplitude| (removes the
+    offset+gain shift). Returns a transformed copy of df.
+    """
     if mode in ('', 'raw'):
         return df
     def tx(arr):
-        a = np.asarray(arr, dtype=float); c = a - a[:nb].mean()
+        """Apply the selected baseline/peaknorm transform to a single channel array."""
+        a = np.asarray(arr, dtype=float)
+        c = a - a[:nb].mean()
         if mode == 'peaknorm':
             pk = np.abs(c).max()
             return c / pk if pk > 1e-8 else c
@@ -110,6 +118,12 @@ def preprocess_signals(df: pd.DataFrame, mode: str = 'raw', nb: int = 5) -> pd.D
     return df
 
 def df_to_df_long(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Reshape a trial dataframe into the tsfresh long format and class labels.
+
+    :param df: dataframe with per-trial 'humidity'/'temperature' arrays and a 'class' column.
+    :return: (df_long, y) where df_long has columns id/time/Humidity/Temperature (one row per
+        sample) and y is an int class-index Series indexed by trial id.
+    """
     hum_all  = np.stack(df['humidity'].values)
     temp_all = np.stack(df['temperature'].values)
 
@@ -127,6 +141,12 @@ def df_to_df_long(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return df_long, y
 
 def filter_features(features, channel: str):
+    """Keep only features whose name starts with the given channel prefix.
+
+    :param features: a feature DataFrame or list of feature names.
+    :param channel: 'both' (no filtering), 'humidity', or 'temperature'.
+    :return: the same type as features, restricted to the selected channel.
+    """
     if channel == 'both':
         return features
     prefix = channel.capitalize() + '__'
@@ -135,6 +155,14 @@ def filter_features(features, channel: str):
     return [c for c in features if c.startswith(prefix)]
 
 def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n_jobs: int = 4) -> pd.DataFrame:
+    """Extract a fixed set of tsfresh features from long-format data.
+
+    :param df_long: long-format data with id/time/channel columns.
+    :param top_features_raw: raw tsfresh feature names to compute (order preserved).
+    :param n_jobs: parallel workers for tsfresh.
+    :return: DataFrame with exactly top_features_raw as columns; any feature tsfresh fails
+        to produce is filled with 0.0.
+    """
     kind_to_fc = from_columns(top_features_raw)
     X = extract_features(df_long, column_id='id', column_sort='time', kind_to_fc_parameters=kind_to_fc, n_jobs=n_jobs)
     impute(X)
@@ -145,7 +173,16 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
     return X[top_features_raw]
 
 def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_seed: int, n_jobs: int = -1) -> StackingClassifier:
+    """Fit a SMOTE + XGB/CatBoost stacking classifier with a random-forest meta-learner.
+
+    :param X_train: feature matrix.
+    :param y_train: integer class labels.
+    :param init_seed: random seed for all estimators and SMOTE.
+    :param n_jobs: parallel workers for the stacker's cross-validation.
+    :return: the fitted StackingClassifier.
+    """
     def make_base(clf):
+        """Wrap a base estimator in a SMOTE pipeline, or return it unchanged if SMOTE is infeasible."""
         if k_neighbors < 1: # too few samples in minority class for SMOTE
             return clf
         return ImbPipeline([("smote", SMOTE(random_state=init_seed, k_neighbors=k_neighbors)),
@@ -164,6 +201,14 @@ def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_see
     return stacker
 
 def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.ndarray) -> dict:
+    """Score a fitted classifier on a test set.
+
+    :param clf: a fitted classifier exposing predict/predict_proba.
+    :param X_test: test feature matrix.
+    :param y_test: integer test labels.
+    :return: dict with keys 'accuracy', 'f1_weighted', 'roc_auc_ovr' (nan if it fails),
+        'log_loss', and 'per_class_f1' (class name -> f1).
+    """
     y_pred = clf.predict(X_test)
     y_prob = clf.predict_proba(X_test)
 
@@ -175,18 +220,26 @@ def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.
 
     report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
 
-    return {'accuracy':    float(accuracy_score(y_test, y_pred)),
+    return {'accuracy': float(accuracy_score(y_test, y_pred)),
             'f1_weighted': float(f1_score(y_test, y_pred, average='weighted', zero_division=0)),
             'roc_auc_ovr': roc_auc,
-            'log_loss':    float(log_loss(y_test, y_prob)),
+            'log_loss': float(log_loss(y_test, y_prob)),
             'per_class_f1': {cls: float(report.get(str(i), {}).get('f1-score', float('nan'))) for i, cls in enumerate(CLASSES)}}
 
 def save_result(result: dict, model: str, run_id: str) -> None:
+    """Write a result dict to results/<model>/<run_id>_tstr.json as JSON-safe values.
+
+    :param result: the result dict (nan/numpy values are converted on write).
+    :param model: model name, used as the results subdirectory.
+    :param run_id: artifact id used as the filename stem.
+    :return: None.
+    """
     # paths
     os.makedirs(f'results/{model}', exist_ok=True)
     path = f'results/{model}/{run_id}_tstr.json'
 
     def _json_safe(obj):
+        """Recursively convert nan and numpy scalars/arrays into JSON-serializable values."""
         if isinstance(obj, float) and np.isnan(obj):
             return None
         if isinstance(obj, (np.floating,)):
@@ -204,6 +257,15 @@ def save_result(result: dict, model: str, run_id: str) -> None:
         json.dump(_json_safe(result), f, indent=2)
 
 def save_summary(result: dict) -> None:
+    """Append a flattened result row to results/summary.csv, deduping by config keys.
+
+    Reconciles columns with any existing file and keeps the last row per unique
+    (model, region, channel, cv_mode, seeds, fold, model/aug hyperparameters, subset,
+    phys_variant, cir, prep, phys_prep) combination.
+
+    :param result: a result dict as produced by trtr/tstr/tstr_plus.
+    :return: None.
+    """
     csv_path = 'results/summary.csv'
     m = result['metrics']
     new_row = {'model': result['model'],
@@ -250,7 +312,7 @@ def save_summary(result: dict) -> None:
     if os.path.exists(csv_path):
         df_old = pd.read_csv(csv_path)
         if 'cv_mode' not in df_old.columns:
-            df_old['cv_mode'] = 'kfold'  # rows predating LOSO are all k-fold
+            df_old['cv_mode'] = 'kfold'
         for col in df_row.columns:
             if col not in df_old.columns:
                 df_old[col] = pd.NA
@@ -268,10 +330,12 @@ def save_summary(result: dict) -> None:
 
 # train real test real
 def _cache_path(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both', cv_mode: str = 'kfold', loso_tag: str = '', sub_tag: str = '', prep_tag: str = '') -> str:
+    """Build the trtr checkpoint cache path for a given configuration."""
     suffix = f'_ch{channel}' if channel != 'both' else ''
     return f'results/trtr/{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}{_cv_marker(cv_mode)}{loso_tag}{sub_tag}{prep_tag}{suffix}_checkpoint.pkl'
 
 def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both', cv_mode: str = 'kfold', loso_tag: str = '', sub_tag: str = '', prep_tag: str = '') -> dict | None:
+    """Load the cached trtr checkpoint for a configuration, or None if it does not exist."""
     path = _cache_path(region, init_seed, split_seed, fold, n_folds, channel, cv_mode, loso_tag, sub_tag, prep_tag)
     if os.path.exists(path):
         with open(path, 'rb') as f:
@@ -279,6 +343,29 @@ def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds:
     return None
 
 def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed: int, fold: int, n_folds: int = 5, channel: str = 'both', cv_mode: str = 'kfold', exclude_subjects: tuple = (), loso_trial_val: bool = False, include_subjects: tuple = (), preprocessing: str = 'raw') -> dict:
+    """Run the train-real-test-real pipeline and cache its artifacts.
+
+    Loads/splits the region data, extracts tsfresh features, selects the top-20 by SHAP from a
+    tuned LGBM, trains the stacking classifier on real data, evaluates on the real test fold,
+    pickles the cache to results/trtr, and returns it.
+
+    :param dataset_dir: dataset root directory.
+    :param region: 'mouth' or 'nose'.
+    :param n_jobs: parallel workers for feature extraction and the classifier.
+    :param init_seed: model/estimator seed.
+    :param split_seed: data-split seed.
+    :param fold: 1-indexed fold (converted to 0-indexed for get_split).
+    :param n_folds: number of cv folds.
+    :param channel: 'both', 'humidity', or 'temperature' feature filter.
+    :param cv_mode: 'kfold' or 'loso'.
+    :param exclude_subjects: 0-indexed subjects to hold out (nested LOSO).
+    :param loso_trial_val: use trial-level validation under LOSO.
+    :param include_subjects: restrict the pool to these subjects.
+    :param preprocessing: 'raw', 'baseline', or 'peaknorm' signal preprocessing.
+    :return: cache dict with keys top_20_features_raw, top_20_features_sanitized, X_train_top,
+        X_test_top, y_train, y_test, stats, n_train, trtr_metrics, channel, cv_mode, init_seed,
+        split_seed, fold, n_folds.
+    """
     # load dataset
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
@@ -362,6 +449,14 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
 
 # train synthetic test real
 def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[torch.nn.Module, dict]:
+    """Load a trained generator checkpoint and rebuild the matching model.
+
+    :param model_name: one of vae, cvae, cvae_part, pinn, tpinn, diffusion, gan.
+    :param run_id: artifact id locating results/<model_name>/<run_id>_checkpoint.pt.
+    :param device: torch device to load weights onto.
+    :return: (model, stats) where model is the eval-mode network and stats is the
+        normalization stats dict saved with the checkpoint.
+    """
     # load model
     ckpt_path = f'results/{model_name}/{run_id}_checkpoint.pt'
     if not os.path.exists(ckpt_path):
@@ -378,58 +473,50 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
                      num_participants=ckpt.get('num_participants', 3), part_embed_dim=ckpt['part_embed_dim'],
                      part_dropout=ckpt.get('part_dropout', 0.0), subj_adv=ckpt.get('subj_adv', False))
     elif model_name == 'pinn':
-        model = PhysicsInformedCVAE(
-            cir_params_init=ckpt['cir_params'],
-            t_grid=ckpt['t_grid'],
-            tau_s=ckpt.get('tau_s', 15.0),
-            learn_cir_params=ckpt.get('learn_cir_params', True),
-            latent_dim=ckpt['latent_dim'],
-            num_classes=3,
-            embed_dim=ckpt['embed_dim'],
-            condition_on_participant=ckpt.get('condition_on_participant', True),
-            num_participants=ckpt.get('num_participants', 3),
-            part_embed_dim=ckpt.get('part_embed_dim', 8),
-            part_dropout=ckpt.get('part_dropout', 0.0),
-        )
+        model = PhysicsInformedCVAE(cir_params_init=ckpt['cir_params'],
+                                    t_grid=ckpt['t_grid'],
+                                    tau_s=ckpt.get('tau_s', 15.0),
+                                    learn_cir_params=ckpt.get('learn_cir_params', True),
+                                    latent_dim=ckpt['latent_dim'],
+                                    num_classes=3,
+                                    embed_dim=ckpt['embed_dim'],
+                                    condition_on_participant=ckpt.get('condition_on_participant', True),
+                                    num_participants=ckpt.get('num_participants', 3),
+                                    part_embed_dim=ckpt.get('part_embed_dim', 8),
+                                    part_dropout=ckpt.get('part_dropout', 0.0))
     elif model_name == 'tpinn':
-        model = SharedTransportPINN(
-            cir_params_init=ckpt['cir_params'],
-            t_grid=ckpt['t_grid'],
-            tau_s=ckpt.get('tau_s', 15.0),
-            learn_transport=ckpt.get('learn_cir_params', False),
-            residual=ckpt.get('phys_residual', False),
-            class_transport=ckpt.get('class_transport', False),
-            parametric_source=ckpt.get('parametric_source', False),
-            latent_dim=ckpt['latent_dim'],
-            num_classes=3,
-            embed_dim=ckpt['embed_dim'],
-            condition_on_participant=ckpt.get('condition_on_participant', True),
-            num_participants=ckpt.get('num_participants', 3),
-            part_embed_dim=ckpt.get('part_embed_dim', 8),
-            part_dropout=ckpt.get('part_dropout', 0.0),
-        )
+        model = SharedTransportPINN(cir_params_init=ckpt['cir_params'],
+                                    t_grid=ckpt['t_grid'],
+                                    tau_s=ckpt.get('tau_s', 15.0),
+                                    learn_transport=ckpt.get('learn_cir_params', False),
+                                    residual=ckpt.get('phys_residual', False),
+                                    class_transport=ckpt.get('class_transport', False),
+                                    parametric_source=ckpt.get('parametric_source', False),
+                                    latent_dim=ckpt['latent_dim'],
+                                    num_classes=3,
+                                    embed_dim=ckpt['embed_dim'],
+                                    condition_on_participant=ckpt.get('condition_on_participant', True),
+                                    num_participants=ckpt.get('num_participants', 3),
+                                    part_embed_dim=ckpt.get('part_embed_dim', 8),
+                                    part_dropout=ckpt.get('part_dropout', 0.0))
     elif model_name == 'diffusion':
-        model = ConditionalDiffusion(
-            num_classes=3,
-            num_participants=ckpt.get('num_participants', 3),
-            embed_dim=ckpt['embed_dim'],
-            part_embed_dim=ckpt.get('part_embed_dim', 8),
-            condition_on_participant=ckpt.get('condition_on_participant', True),
-            part_dropout=ckpt.get('part_dropout', 0.0),
-            n_steps=ckpt.get('n_steps', 200),
-            hidden=ckpt.get('hidden', 64),
-        )
+        model = ConditionalDiffusion(num_classes=3,
+                                     num_participants=ckpt.get('num_participants', 3),
+                                     embed_dim=ckpt['embed_dim'],
+                                     part_embed_dim=ckpt.get('part_embed_dim', 8),
+                                     condition_on_participant=ckpt.get('condition_on_participant', True),
+                                     part_dropout=ckpt.get('part_dropout', 0.0),
+                                     n_steps=ckpt.get('n_steps', 200),
+                                     hidden=ckpt.get('hidden', 64))
     elif model_name == 'gan':
-        model = GANGenerator(
-            z_dim=ckpt.get('z_dim', ckpt.get('latent_dim', 16)),
-            num_classes=3,
-            num_participants=ckpt.get('num_participants', 3),
-            embed_dim=ckpt['embed_dim'],
-            part_embed_dim=ckpt.get('part_embed_dim', 8),
-            condition_on_participant=ckpt.get('condition_on_participant', True),
-            part_dropout=ckpt.get('part_dropout', 0.0),
-            hidden=ckpt.get('hidden', 64),
-        )
+        model = GANGenerator(z_dim=ckpt.get('z_dim', ckpt.get('latent_dim', 16)),
+                             num_classes=3,
+                             num_participants=ckpt.get('num_participants', 3),
+                             embed_dim=ckpt['embed_dim'],
+                             part_embed_dim=ckpt.get('part_embed_dim', 8),
+                             condition_on_participant=ckpt.get('condition_on_participant', True),
+                             part_dropout=ckpt.get('part_dropout', 0.0),
+                             hidden=ckpt.get('hidden', 64))
     else:
         raise ValueError(f'Unknown model: {model_name}')
     model.load_state_dict(ckpt['model_state'])
@@ -438,6 +525,21 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
     return model, ckpt['stats']
 
 def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: dict, device: 'torch.device', init_seed: int, participant_idx: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Sample synthetic signals from a generator and denormalize to physical units.
+
+    Splits n_synthetic as evenly as possible across the classes, samples per model family,
+    and undoes normalization (physics models use the phys_prep scaling stored in stats).
+
+    :param model: a loaded generator with a .sample method.
+    :param model_name: one of vae, cvae, cvae_part, pinn, tpinn, diffusion, gan.
+    :param n_synthetic: total number of signals to generate.
+    :param stats: normalization stats (mean/std and, for physics models, phys_prep scales).
+    :param device: torch device.
+    :param init_seed: seed set before sampling for determinism.
+    :param participant_idx: participant id to condition on, or None (e.g. LOSO null token).
+    :return: (signals, labels) where signals is (n_synthetic, 2, T) in physical units and
+        labels is the int class-index array.
+    """
     # determine num per class
     n_classes = len(CLASSES)
     n_per_class = n_synthetic // n_classes
@@ -466,16 +568,19 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
         signals_phys = np.concatenate(all_signals, axis=0)
         labels = np.concatenate(all_labels,  axis=0)
     elif model_name in ('pinn', 'tpinn'):
-        # un-normalize both channels per the stored --phys_prep mode (de-norm must mirror PhysicsInformedDataset).
-        # legacy pinn checkpoints (z-scored temperature, no t_scale) fall back to t_std/t_mean for temperature.
         mode = stats.get('phys_prep', 'peakscale')
-        t_mean = float(stats['mean'][1]); t_std = float(stats['std'][1])
+        t_mean = float(stats['mean'][1])
+        t_std = float(stats['std'][1])
         if mode == 'shared':
-            h_dn = t_dn = float(stats['shared_scale']); use_tscale = True
+            h_dn = t_dn = float(stats['shared_scale'])
+            use_tscale = True
         elif mode == 'stdscale':
-            h_dn = float(stats['h_bcstd']); t_dn = float(stats['t_bcstd']); use_tscale = True
+            h_dn = float(stats['h_bcstd'])
+            t_dn = float(stats['t_bcstd'])
+            use_tscale = True
         else:  # peakscale (default)
-            h_dn = float(stats['h_scale']); use_tscale = 't_scale' in stats
+            h_dn = float(stats['h_scale'])
+            use_tscale = 't_scale' in stats
             t_dn = float(stats['t_scale']) if use_tscale else None
         all_signals, all_labels = [], []
         for cls_idx, count in enumerate(counts):
@@ -492,12 +597,39 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
     return signals_phys, labels
 
 def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 16, embed_dim: int = 8, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, eval_val: bool = False, dataset_dir: str = 'dataset', n_folds: int = 5, cv_mode: str = 'kfold', guidance: float = -1.0, include_subjects: tuple = ()) -> dict:
+    """Run train-synthetic-test-real: train the classifier on generated data, test on the real fold.
+
+    Generates synthetic signals from the loaded generator, extracts the cached top-20 features,
+    trains the stacking classifier on synthetic data, evaluates on the real test fold (and the
+    real val split if eval_val), and measures SHAP top-feature overlap with the real model.
+
+    :param cache: trtr cache providing top features, the real test set, and n_train.
+    :param model_name: generator model name.
+    :param region: 'mouth' or 'nose'.
+    :param n_synthetic: number of synthetic signals to generate.
+    :param n_jobs: parallel workers.
+    :param device: torch device.
+    :param init_seed: model/sampling seed.
+    :param split_seed: data-split seed.
+    :param fold: 1-indexed fold.
+    :param run_id: artifact id locating the generator checkpoint.
+    :param free_bits, latent_dim, embed_dim, part_embed_dim, lambda_phys, alpha, n_copies:
+        hyperparameters recorded in the result.
+    :param eval_val: also evaluate on the real validation split as a sanity check.
+    :param dataset_dir: dataset root (used only when eval_val).
+    :param n_folds: number of cv folds.
+    :param cv_mode: 'kfold' or 'loso'.
+    :param guidance: classifier-free guidance scale for diffusion (ignored if < 0).
+    :param include_subjects: restrict the pool to these subjects.
+    :return: result dict with config fields plus 'metrics' (test scores), 'metrics_val'
+        (val scores or None), 'feature_overlap', 'top_20_synth_features', and 'trtr_metrics'.
+    """
     model, ckpt_stats = load_model(model_name, run_id, device)
     if guidance >= 0 and model_name == 'diffusion':
-        model.guidance_scale = guidance                       # CFG strength sweep (ablation)
+        model.guidance_scale = guidance
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}')
 
-    # under LOSO the test subject is unseen → generate from the learned null token (participant-conditioned models only)
+    # under LOSO the test subject is unseen -> generate from the learned null token
     participant_idx = model.null_part_idx if (cv_mode == 'loso' and getattr(model, '_cond_part', False)) else None
     synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed, participant_idx=participant_idx)
     print(f'[TSTR] Generated {n_synthetic} synthetic signals' + (' (null token)' if participant_idx is not None else ''))
@@ -571,6 +703,28 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
 
 # train synthetic/real test real
 def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, cv_mode: str = 'kfold') -> dict:
+    """Run augmentation TSTR+: train the classifier on real + synthetic data, test on the real fold.
+
+    Generates int(n_train * augmentation_ratio) synthetic signals, concatenates their cached
+    top-20 features with the real training features, trains the stacking classifier on the
+    combined set, and evaluates on the real test fold.
+
+    :param cache: trtr cache providing real train/test features and n_train.
+    :param model_name: generator model name (result model is suffixed with '_plus').
+    :param region: 'mouth' or 'nose'.
+    :param augmentation_ratio: synthetic-to-real ratio for the augmentation set.
+    :param n_jobs: parallel workers.
+    :param device: torch device.
+    :param init_seed: model/sampling seed.
+    :param split_seed: data-split seed.
+    :param fold: 1-indexed fold.
+    :param run_id: artifact id locating the generator checkpoint.
+    :param free_bits, latent_dim, embed_dim, part_embed_dim, lambda_phys, alpha, n_copies:
+        hyperparameters recorded in the result.
+    :param cv_mode: 'kfold' or 'loso'.
+    :return: result dict with config fields plus 'augmentation_ratio', 'metrics' (test scores),
+        'feature_overlap' (None), 'top_20_synth_features' (None), and 'trtr_metrics'.
+    """
     n_synthetic = int(cache['n_train'] * augmentation_ratio)
     model, ckpt_stats = load_model(model_name, run_id, device)
     print(f'[TSTR+] model={model_name}, n_synthetic={n_synthetic}, n_train_real={cache["n_train"]}')
@@ -621,6 +775,13 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
             'trtr_metrics': cache['trtr_metrics']}
 
 def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '', phys_residual: bool = False, class_transport: bool = False, parametric_source: bool = False, learn_cir_params: bool = False, subj_adv_lambda: float = 0.0, diff_hidden: int = 64, n_steps: int = 200, gan_hidden: int = 64, gan_loss: str = 'bce', gan_lr_d: float = None, lr: float = 1e-3, include_subjects: tuple = (), cir_tag: str = '', preprocessing: str = 'raw', phys_prep: str = 'peakscale', hp_tag: str = '') -> str:
+    """Build the generator artifact id encoding the model and its config flags.
+
+    Assembles a per-model-family base id (region, seed, dims, model-specific markers) and appends
+    fold, cv-mode, dropout, subset, cir, preprocessing, jitter, channel, and hp tags.
+
+    :return: the run-id string used to locate checkpoints and result files.
+    """
     base_model = model.removesuffix('_plus')
     if base_model == 'vae':
         run_id = f'{region}_s{init_seed}_ld{latent_dim}_fb{free_bits}'
@@ -649,10 +810,11 @@ def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim:
 
 # main
 def main():
+    """Run the TRTR/TSTR/TSTR+ pipeline (or aggregate-only summary merge) from CLI args."""
     args = parse_args()
     device = torch.device('cpu')
 
-    # nested-LOSO: 0-indexed excludes from the 1-indexed CLI; path tag namespaces nested artifacts
+    # nested-LOSO: 0-indexed excludes from the 1-indexed CLI
     exclude_subjects = tuple(int(x) - 1 for x in args.loso_exclude.split(',') if x.strip()) if args.loso_exclude else ()
     loso_tag = loso_path_tag(args.loso_trial_val, exclude_subjects)
     include_subjects = tuple(x.strip() for x in args.include_subjects.split(',') if x.strip())

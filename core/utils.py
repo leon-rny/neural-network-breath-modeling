@@ -5,6 +5,7 @@ import torch
 
 # reproducibility
 def seed_everything(init_seed: int) -> None:
+    """Seed Python, numpy and torch (incl. MPS) RNGs and force deterministic algorithms for reproducibility."""
     random.seed(init_seed)
     np.random.seed(init_seed)
     torch.manual_seed(init_seed)
@@ -16,11 +17,13 @@ def seed_everything(init_seed: int) -> None:
     torch.use_deterministic_algorithms(True, warn_only=False)
 
 def seed_worker(_worker_id):
+    """Seed numpy and Python RNGs inside a DataLoader worker from torch's per-worker seed."""
     worker_seed = torch.initial_seed() % 2 ** 32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
 def make_generator(seed: int) -> torch.Generator:
+    """Return a torch.Generator seeded with `seed` for reproducible DataLoader shuffling."""
     g = torch.Generator()
     g.manual_seed(seed)
     return g
