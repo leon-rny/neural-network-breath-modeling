@@ -31,23 +31,30 @@ _PIPELINES = ("replication", "shap_fix", "lgbm_fix", "tsfresh_fix", "smote_fix")
 
 # cli
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     p = argparse.ArgumentParser(description="TRTR pipeline ablation")
     p.add_argument("--region", choices=["mouth", "nose"], default=None)  # required except in --aggregate
-    p.add_argument("--pipeline", choices=list(_PIPELINES), default=None, help="Which cumulative pipeline variant to run (required except in --aggregate)")
-    p.add_argument("--init_seed", type=int, default=42, help="Classifier-internal randomness; varies across runs.")
-    p.add_argument("--split_seed", type=int, default=42, help="Outer/inner data partition; fixed for paired comparisons.")
-    p.add_argument("--fold", type=int, default=1, help="1-indexed fold in [1, n_folds].")
+    p.add_argument("--pipeline", choices=list(_PIPELINES), default=None)
+    p.add_argument("--init_seed", type=int, default=42)
+    p.add_argument("--split_seed", type=int, default=42)
+    p.add_argument("--fold", type=int, default=1)
     p.add_argument("--n_folds", type=int, default=5)
-    p.add_argument("--single_split", action="store_true", help="Legacy protocol: one 80/10/10 stratified train/val/test split (mirrors core/data.split_dataset). When set, --fold and --n_folds are ignored.")
+    p.add_argument("--single_split", action="store_true")
     p.add_argument("--dataset_dir", default="dataset")
     p.add_argument("--n_jobs", type=int, default=4)
     p.add_argument("--force_rebuild", action="store_true")
-    p.add_argument("--no_summary", action="store_true", help="Skip writing to summary.csv. Use during parallel runs to avoid races; a sequential pass can then aggregate.")
-    p.add_argument("--aggregate", action="store_true", help="Merge all results/ablation_trtr/*_trtr.json into results/ablation_trtr/summary.csv and exit.")
+    p.add_argument("--no_summary", action="store_true")
+    p.add_argument("--aggregate", action="store_true")
     return p.parse_args()
 
 # utils
 def df_to_df_long(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Reshape a trial dataframe into the tsfresh long format and class labels.
+
+    :param df: dataframe with per-trial 'humidity'/'temperature' arrays and a 'class' column.
+    :return: (df_long, y) where df_long has columns id/time/Humidity/Temperature (one row per
+        sample) and y is an int class-index Series indexed by trial id.
+    """
     hum_all  = np.stack(df["humidity"].values)
     temp_all = np.stack(df["temperature"].values)
     n, T = hum_all.shape
@@ -61,6 +68,14 @@ def df_to_df_long(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return df_long, y
 
 def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n_jobs: int = 4) -> pd.DataFrame:
+    """Extract a fixed set of tsfresh features from long-format data.
+
+    :param df_long: long-format data with id/time/channel columns.
+    :param top_features_raw: raw tsfresh feature names to compute (order preserved).
+    :param n_jobs: parallel workers for tsfresh.
+    :return: DataFrame with exactly top_features_raw as columns; any feature tsfresh fails
+        to produce is filled with 0.0.
+    """
     kind_to_fc = from_columns(top_features_raw)
     X = extract_features(df_long, column_id="id", column_sort="time", kind_to_fc_parameters=kind_to_fc, n_jobs=n_jobs)
     impute(X)
@@ -70,6 +85,16 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
     return X[top_features_raw]
 
 def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_seed: int, fix_smote: bool = False, n_jobs: int = -1) -> StackingClassifier:
+    """Fit a SMOTE + XGB/CatBoost stacking classifier with a random-forest meta-learner.
+
+    :param X_train: feature matrix.
+    :param y_train: integer class labels.
+    :param init_seed: random seed for all estimators and SMOTE.
+    :param fix_smote: if True, apply SMOTE inside each base estimator's CV pipeline (no leakage);
+        if False, oversample globally before stacking (leaks across the stacker's internal folds).
+    :param n_jobs: parallel workers for the stacker's cross-validation.
+    :return: the fitted StackingClassifier.
+    """
     min_class = int(np.bincount(y_train).min())
     k_neighbors = min(5, min_class - 1)
 
@@ -84,6 +109,7 @@ def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_see
     if fix_smote:
         # SMOTE inside each base estimator's pipeline: resampling happens inside the stacker's internal CV folds, no leakage into hold-outs.
         def make_base(clf):
+            """Wrap a base estimator in a SMOTE pipeline, or return it unchanged if SMOTE is infeasible."""
             if k_neighbors < 1:
                 return clf
             return ImbPipeline([("smote", SMOTE(random_state=init_seed, k_neighbors=k_neighbors)),
@@ -111,6 +137,14 @@ def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_see
     return stacker
 
 def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.ndarray) -> dict:
+    """Score a fitted classifier on a test set.
+
+    :param clf: a fitted classifier exposing predict/predict_proba.
+    :param X_test: test feature matrix.
+    :param y_test: integer test labels.
+    :return: dict with keys 'accuracy', 'f1_weighted', 'roc_auc_ovr' (nan if it fails),
+        'log_loss', and 'per_class_f1' (class name -> f1).
+    """
     y_pred = clf.predict(X_test)
     y_prob = clf.predict_proba(X_test)
     try:
@@ -126,9 +160,16 @@ def evaluate_classifier(clf: StackingClassifier, X_test: np.ndarray, y_test: np.
             "per_class_f1": {cls: float(report.get(str(i), {}).get("f1-score", float("nan"))) for i, cls in enumerate(CLASSES)}}
 
 def save_result(result: dict, run_id: str) -> None:
+    """Write a result dict to results/ablation_trtr/<run_id>_trtr.json as JSON-safe values.
+
+    :param result: the result dict (nan/numpy values are converted on write).
+    :param run_id: artifact id used as the filename stem.
+    :return: None.
+    """
     os.makedirs("results/ablation_trtr", exist_ok=True)
     path = f"results/ablation_trtr/{run_id}_trtr.json"
     def _json_safe(obj):
+        """Recursively convert nan and numpy scalars/arrays into JSON-serializable values."""
         if isinstance(obj, float) and np.isnan(obj):
             return None
         if isinstance(obj, np.floating):
@@ -146,6 +187,14 @@ def save_result(result: dict, run_id: str) -> None:
         json.dump(_json_safe(result), f, indent=2)
 
 def save_summary(result: dict) -> None:
+    """Append a flattened result row to results/ablation_trtr/summary.csv, deduping by config keys.
+
+    Reconciles the single_split column with any existing file and keeps the last row per unique
+    (pipeline, region, init_seed, split_seed, single_split, fold, n_folds) combination.
+
+    :param result: a result dict as produced by trtr.
+    :return: None.
+    """
     csv_path = "results/ablation_trtr/summary.csv"
     m = result["metrics"]
     new_row = {"pipeline": result["pipeline"],
@@ -178,13 +227,16 @@ def save_summary(result: dict) -> None:
 
 # cache
 def _split_tag(single_split: bool, fold: int, n_folds: int) -> str:
+    """Return the run-id split tag: 'single' for a single split, else 'fold{fold}of{n_folds}'."""
     return "single" if single_split else f"fold{fold}of{n_folds}"
 
 def _cache_path(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, pipeline: str, single_split: bool = False) -> str:
+    """Build the trtr ablation checkpoint cache path for a given configuration."""
     tag = _split_tag(single_split, fold, n_folds)
     return f"results/ablation_trtr/{region}_is{init_seed}_ss{split_seed}_{tag}_{pipeline}_checkpoint.pkl"
 
 def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, pipeline: str, single_split: bool = False) -> dict | None:
+    """Load the cached trtr ablation checkpoint for a configuration, or None if it does not exist."""
     path = _cache_path(region, init_seed, split_seed, fold, n_folds, pipeline, single_split)
     if os.path.exists(path):
         with open(path, "rb") as f:
@@ -193,6 +245,27 @@ def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds:
 
 # trtr with ablation
 def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed: int, fold: int, n_folds: int, pipeline: str, single_split: bool = False) -> dict:
+    """Run one train-real-test-real pipeline ablation and cache its artifacts.
+
+    Toggles the leakage behaviours that distinguish the pipeline stages (SHAP on test,
+    hardcoded nose LGBM hyperparams, tsfresh selection on the full dataset, SMOTE outside
+    the stacker's CV), then loads/splits the region data, selects the top-20 SHAP features,
+    trains the stacking classifier, evaluates on the real test set, pickles the cache to
+    results/ablation_trtr, and returns it.
+
+    :param dataset_dir: dataset root directory.
+    :param region: 'mouth' or 'nose'.
+    :param n_jobs: parallel workers for feature extraction and the classifier.
+    :param init_seed: model/estimator seed.
+    :param split_seed: data-split seed.
+    :param fold: 1-indexed fold (ignored when single_split).
+    :param n_folds: number of cv folds.
+    :param pipeline: ablation stage name (one of _PIPELINES) selecting which leaks are present.
+    :param single_split: use one legacy 80/10/10 split instead of stratified k-fold.
+    :return: cache dict with keys top_20_features_raw, top_20_features_sanitized, X_train_top,
+        X_test_top, y_train, y_test, stats, n_train, metrics, init_seed, split_seed, fold,
+        n_folds, single_split, pipeline.
+    """
     shap_on_test = (pipeline == "replication")
     nose_hardcoded = (pipeline in ("replication", "shap_fix") and region == "nose")
     tsfresh_on_full = (pipeline in ("replication", "shap_fix", "lgbm_fix"))
@@ -321,6 +394,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
 
 # main
 def main():
+    """Run one TRTR pipeline-ablation config (or aggregate-only summary merge) from CLI args."""
     args = parse_args()
 
     # aggregate mode

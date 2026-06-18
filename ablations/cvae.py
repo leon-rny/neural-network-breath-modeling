@@ -93,6 +93,7 @@ TAG = "DYNAMICS"
 
 # cli
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     p = argparse.ArgumentParser(description="Unified CVAE ablation (dynamics | jittering | architecture)")
     p.add_argument("--mode", default="dynamics", choices=list(MODES))
     p.add_argument("--configs", default=",".join(CONFIGS))
@@ -124,10 +125,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--latent_dim", type=int, default=16)
     p.add_argument("--n_jobs", type=int, default=4)
-    p.add_argument("--part_dropout", type=float, default=0.0, help="CFG-style participant-dropout prob (conv_baseline only). 0.0 = off, behaviour unchanged.")
-    p.add_argument("--cv_mode", choices=["kfold", "loso"], default="kfold", help="kfold: split by trial; loso: leave-one-subject-out (generates from the null token).")
-    p.add_argument("--loso_trial_val", action="store_true", help="Nested-LOSO: trial-level early-stop val + subject excludes (loso_split_final). Used by the part-4 orchestration.")
-    p.add_argument("--loso_exclude", default="", help="Nested-LOSO: comma-separated 1-indexed subject folds to drop from the training pool (e.g. the outer test subject during selection).")
+    p.add_argument("--part_dropout", type=float, default=0.0)
+    p.add_argument("--cv_mode", choices=["kfold", "loso"], default="kfold")
+    p.add_argument("--loso_trial_val", action="store_true")
+    p.add_argument("--loso_exclude", default="")
     p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--no_summary", action="store_true")
@@ -135,6 +136,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 def _parse_bool(s: str) -> bool:
+    """Parse a truthy/falsy string into a bool."""
     if s.lower() in ("true", "1", "yes"):
         return True
     if s.lower() in ("false", "0", "no"):
@@ -143,42 +145,53 @@ def _parse_bool(s: str) -> bool:
 
 # config knob accessor
 def resolve_beta(cfg: dict, region: str, override: float | None) -> float:
+    """Resolve beta_max from override, config, then region default."""
     if override is not None:
         return override
     return cfg.get("beta_max", BETA_MAX[region])
 
 ## paths
 def _pd_marker(part_dropout: float) -> str:
+    """Filename marker for participant dropout (empty if disabled)."""
     return "" if part_dropout == 0.0 else f"_pd{part_dropout}"
 
 def _cv_marker(cv_mode: str) -> str:
+    """Filename marker for the cv mode (empty for kfold)."""
     return "" if cv_mode == "kfold" else f"_{cv_mode}"
 
 def _stem(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, part_dropout: float = 0.0, cv_mode: str = "kfold", loso_tag: str = "") -> str:
+    """Build the ablation artifact filename stem."""
     return f"{variant}_b{beta_max}_{config}_{region}_is{init_seed}_ss{split_seed}{_pd_marker(part_dropout)}{_cv_marker(cv_mode)}{loso_tag}_fold{fold}of{n_folds}"
 
 def ckpt_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, part_dropout: float = 0.0, cv_mode: str = "kfold", loso_tag: str = "") -> str:
+    """Path to the ablation checkpoint file."""
     if CKPT_SCHEME == "f_checkpoint":
         return f"{RESULTS_DIR}/{variant}_b{beta_max}_{config}_{region}_is{init_seed}_ss{split_seed}{_pd_marker(part_dropout)}{_cv_marker(cv_mode)}{loso_tag}_f{fold}of{n_folds}_checkpoint.pt"
     return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag)}.pt"
 
 def hist_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, part_dropout: float = 0.0, cv_mode: str = "kfold", loso_tag: str = "") -> str:
+    """Path to the ablation training-history CSV."""
     return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag)}_history.csv"
 
 def result_path(variant: str, beta_max: float, config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, part_dropout: float = 0.0, cv_mode: str = "kfold", loso_tag: str = "") -> str:
+    """Path to the ablation per-combo result JSON."""
     return f"{RESULTS_DIR}/{_stem(variant, beta_max, config, region, init_seed, split_seed, fold, n_folds, part_dropout, cv_mode, loso_tag)}_result.json"
 
 def _arch_stem(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool) -> str:
+    """Build the architecture artifact filename stem."""
     cp_marker = "" if cond_part else "_nocp"
     return f"{variant}_{region}_is{init_seed}_ss{split_seed}{cp_marker}_fold{fold}of{n_folds}"
 
 def arch_ckpt_path(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool) -> str:
+    """Path to the architecture checkpoint file."""
     return f"{RESULTS_DIR}/{_arch_stem(variant, region, init_seed, split_seed, fold, n_folds, cond_part)}.pt"
 
 def arch_hist_path(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool) -> str:
+    """Path to the architecture training-history CSV."""
     return f"{RESULTS_DIR}/{_arch_stem(variant, region, init_seed, split_seed, fold, n_folds, cond_part)}_history.csv"
 
 def arch_result_path(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool) -> str:
+    """Path to the architecture per-combo result JSON."""
     return f"{RESULTS_DIR}/{_arch_stem(variant, region, init_seed, split_seed, fold, n_folds, cond_part)}_result.json"
 
 # tstr scoring
@@ -187,7 +200,7 @@ def _tstr_score(model, stats: dict, cache: dict, device: torch.device, n_jobs: i
     tsfresh features, train a stacking classifier on synthetic, and score on the
     real test set (TSTR). Returns the evaluate_classifier metrics dict."""
     n_synthetic = cache["n_train"]
-    # under LOSO the test subject is unseen → generate from the learned null token
+    # under LOSO the test subject is unseen -> generate from the learned null token
     participant_idx = model.null_part_idx if (cv_mode == "loso" and getattr(model, "_cond_part", False)) else None
     synth_signals, synth_labels = generate_synthetic_signals(model, "cvae_part", n_synthetic, stats, device, init_seed, participant_idx=participant_idx)
     print(f"  [{TAG}] {label} | Generated {n_synthetic} synthetic signals")
@@ -218,6 +231,7 @@ def _null_gen_stats(model, device: torch.device, n: int = 60) -> dict:
             "null_gen_std": float(out.std().item())}
 
 def _final_kl_active(hp: str) -> tuple[float, int]:
+    """Read final train_kl and active_dims from a history CSV (nan/0 if missing)."""
     kl_final, active_dims_final = float("nan"), 0
     if os.path.exists(hp):
         hist_df = pd.read_csv(hp)
@@ -228,6 +242,32 @@ def _final_kl_active(hp: str) -> tuple[float, int]:
 ## ablation family
 # training
 def train_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, dataset_dir: str, device: torch.device, epochs: int, lr: float, latent_dim: int, variant: str = "conv_baseline", beta_max_override: float | None = None, part_dropout: float = 0.0, cv_mode: str = "kfold", exclude_subjects: tuple = (), loso_trial_val: bool = False, verbose: bool = False) -> None:
+    """Train one CVAE for a CONFIGS entry, checkpointing the best-val model and history CSV.
+
+    Resolves the config knobs (beta_max, lag, free_bits, jitter, warmup), loads the region
+    data, applies optional jitter augmentation, trains the selected variant with optional
+    lagging-inference encoder updates, and saves the best-val checkpoint and full history.
+
+    :param config: CONFIGS key selecting the ablation knobs.
+    :param region: 'mouth' or 'nose'.
+    :param init_seed: model/optimisation seed.
+    :param split_seed: data-split seed.
+    :param fold: 1-indexed fold.
+    :param n_folds: number of cv folds.
+    :param dataset_dir: dataset root.
+    :param device: torch device.
+    :param epochs: number of training epochs.
+    :param lr: Adam learning rate.
+    :param latent_dim: latent dimensionality.
+    :param variant: VARIANT_MAP key selecting the model architecture.
+    :param beta_max_override: beta_max overriding config/region default if not None.
+    :param part_dropout: probability of dropping the participant token to the null token.
+    :param cv_mode: 'kfold' or 'loso'.
+    :param exclude_subjects: subjects held out under nested LOSO.
+    :param loso_trial_val: under LOSO, draw the val split from held-out trials.
+    :param verbose: show the per-epoch progress bar.
+    :return: None.
+    """
     loso_tag = loso_path_tag(loso_trial_val, exclude_subjects)
     cfg = CONFIGS[config]
     beta_max = resolve_beta(cfg, region, beta_max_override)
@@ -253,7 +293,7 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
     val_ds = BreathDataset(df_val, stats=train_ds.stats)
 
     if alpha > 0 and n_copies > 1:
-        print(f"[{TAG}] Jitter: {len(train_ds_clean)} → {len(train_ds)} samples (alpha={alpha}, n_copies={n_copies})")
+        print(f"[{TAG}] Jitter: {len(train_ds_clean)} -> {len(train_ds)} samples (alpha={alpha}, n_copies={n_copies})")
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
@@ -371,6 +411,31 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
 
 # tstr evaluation
 def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cache: dict, device: torch.device, n_jobs: int, variant: str = "conv_baseline", beta_max_override: float | None = None, part_dropout: float = 0.0, cv_mode: str = "kfold", exclude_subjects: tuple = (), loso_trial_val: bool = False) -> dict:
+    """Load an ablation checkpoint, run TSTR, and build the result row.
+
+    Reloads the trained variant, scores it with TSTR against the real test fold, runs the
+    null-token sanity check when participant dropout was used, and reads the final KL and
+    active-dim counts from the history CSV.
+
+    :param config: CONFIGS key selecting the ablation knobs.
+    :param region: 'mouth' or 'nose'.
+    :param init_seed: model/sampling seed.
+    :param split_seed: data-split seed.
+    :param fold: 1-indexed fold.
+    :param n_folds: number of cv folds.
+    :param cache: trtr cache providing top features, the real test set, and n_train.
+    :param device: torch device.
+    :param n_jobs: parallel workers.
+    :param variant: VARIANT_MAP key selecting the model architecture.
+    :param beta_max_override: beta_max overriding config/region default if not None.
+    :param part_dropout: participant dropout used at train time (affects the path).
+    :param cv_mode: 'kfold' or 'loso'.
+    :param exclude_subjects: subjects held out under nested LOSO.
+    :param loso_trial_val: under LOSO, whether the val split used held-out trials.
+    :return: result row dict with config/seed/hyperparameter fields, the TSTR metrics
+        (accuracy, f1_weighted, roc_auc_ovr, log_loss, per-class f1), null-gen diagnostics,
+        and kl_final/active_dims.
+    """
     loso_tag = loso_path_tag(loso_trial_val, exclude_subjects)
     cfg = CONFIGS[config]
     beta_max = resolve_beta(cfg, region, beta_max_override)
@@ -436,6 +501,26 @@ def eval_config(config: str, region: str, init_seed: int, split_seed: int, fold:
 ## architecture family
 # training
 def train_variant(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool, dataset_dir: str, device: torch.device, epochs: int, lr: float, verbose: bool = False) -> None:
+    """Train one architecture variant under fixed hyperparameters, saving best-val and history.
+
+    Trains the selected variant on a k-fold split at the architecture-sweep constants
+    (ARCH_BETA_MAX, ARCH_WARMUP_FRAC, no free bits), checkpoints the best-val model once beta
+    has fully warmed up, and writes the full training history.
+
+    :param variant: VARIANT_MAP key selecting the model architecture.
+    :param region: 'mouth' or 'nose'.
+    :param init_seed: model/optimisation seed.
+    :param split_seed: data-split seed.
+    :param fold: 1-indexed fold.
+    :param n_folds: number of cv folds.
+    :param cond_part: condition the model on the participant token.
+    :param dataset_dir: dataset root.
+    :param device: torch device.
+    :param epochs: number of training epochs.
+    :param lr: Adam learning rate.
+    :param verbose: show the per-epoch progress bar.
+    :return: None.
+    """
     warmup_epochs = int(epochs * ARCH_WARMUP_FRAC)
 
     # reproducibility
@@ -514,6 +599,24 @@ def train_variant(variant: str, region: str, init_seed: int, split_seed: int, fo
 
 # tstr evaluation
 def eval_variant(variant: str, region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, cond_part: bool, cache: dict, device: torch.device, n_jobs: int) -> dict:
+    """Load an architecture checkpoint, run TSTR, and build the result row.
+
+    Reloads the trained variant, scores it with TSTR against the real test fold, and reads
+    the final KL and active-dim counts from the history CSV.
+
+    :param variant: VARIANT_MAP key selecting the model architecture.
+    :param region: 'mouth' or 'nose'.
+    :param init_seed: model/sampling seed.
+    :param split_seed: data-split seed.
+    :param fold: 1-indexed fold.
+    :param n_folds: number of cv folds.
+    :param cond_part: whether the model was conditioned on the participant token.
+    :param cache: trtr cache providing top features, the real test set, and n_train.
+    :param device: torch device.
+    :param n_jobs: parallel workers.
+    :return: result row dict with variant/seed/cond_part fields, the TSTR metrics (accuracy,
+        f1_weighted, roc_auc_ovr, log_loss, per-class f1), and kl_final/active_dims.
+    """
     path = arch_ckpt_path(variant, region, init_seed, split_seed, fold, n_folds, cond_part)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
@@ -550,6 +653,7 @@ def eval_variant(variant: str, region: str, init_seed: int, split_seed: int, fol
 
 # persistence
 def _json_safe(obj):
+    """Recursively convert numpy/NaN values into JSON-serialisable Python types."""
     if isinstance(obj, float) and np.isnan(obj):
         return None
     if isinstance(obj, (np.floating,)):
@@ -565,6 +669,11 @@ def _json_safe(obj):
     return obj
 
 def save_result(row: dict) -> None:
+    """Write one result row to its per-combo JSON, picking the path by FAMILY.
+
+    :param row: result row dict from eval_config/eval_variant.
+    :return: None.
+    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     if FAMILY == "architecture":
         path = arch_result_path(row["variant"], row["region"], row["init_seed"], row["split_seed"], row["fold"], row["n_folds"], row["condition_on_participant"])
@@ -574,6 +683,14 @@ def save_result(row: dict) -> None:
         json.dump(_json_safe(row), f, indent=2)
 
 def save_summary(rows: list[dict]) -> None:
+    """Merge result rows into the summary CSV, de-duplicating on the family key subset.
+
+    Appends to an existing summary.csv (backfilling columns added after earlier runs) and
+    keeps the last row per combo.
+
+    :param rows: result row dicts to merge.
+    :return: None.
+    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     csv_path = f"{RESULTS_DIR}/summary.csv"
     subset = ARCH_SUBSET if FAMILY == "architecture" else ABLATION_SUBSET
@@ -590,10 +707,21 @@ def save_summary(rows: list[dict]) -> None:
             df_old["loso_tag"] = ""
         df_new = pd.concat([df_old, df_new], ignore_index=True).drop_duplicates(subset=subset, keep="last")
     df_new.to_csv(csv_path, index=False)
-    print(f"[{TAG}] Saved {len(df_new)} rows → {csv_path}")
+    print(f"[{TAG}] Saved {len(df_new)} rows -> {csv_path}")
 
 # flow: ablation
 def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
+    """Drive the ablation family: resolve the sweep axes, then train/eval/aggregate each combo.
+
+    Resolves the config/seed/fold/region lists from args (including jitter single-combo
+    synthesis and nested-LOSO excludes). In aggregate mode it only collects existing
+    result.json files into the summary; otherwise it builds the TRTR cache, trains (unless
+    skip_existing finds a checkpoint), runs TSTR, and writes results plus the summary.
+
+    :param args: parsed command-line arguments.
+    :param device: torch device.
+    :return: None.
+    """
     variant = args.variant if args.variant else "conv_baseline"
     if variant not in VARIANT_MAP:
         print(f'Unknown variant "{variant}". Valid: {list(VARIANT_MAP)}')
@@ -692,6 +820,17 @@ def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
 
 ## flow: architecture
 def run_architecture(args: argparse.Namespace, device: torch.device) -> None:
+    """Drive the architecture family: sweep variants x cond_part, then train/eval/aggregate.
+
+    Resolves the variant/seed/fold/region/cond_part lists from args. In aggregate mode it
+    only collects existing result.json files into the summary; otherwise it builds the TRTR
+    cache, trains each variant (unless skip_existing finds a checkpoint), runs TSTR, and
+    writes results plus the summary.
+
+    :param args: parsed command-line arguments.
+    :param device: torch device.
+    :return: None.
+    """
     variants = ([args.variant] if args.variant
                 else args.variants.split(",") if args.variants
                 else list(VARIANT_MAP))
@@ -761,6 +900,7 @@ def run_architecture(args: argparse.Namespace, device: torch.device) -> None:
 
 # main
 def main() -> None:
+    """Parse args, set the mode globals, and dispatch to the architecture or ablation flow."""
     args = parse_args()
 
     # modes

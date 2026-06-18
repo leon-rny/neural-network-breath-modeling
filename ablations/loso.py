@@ -12,7 +12,6 @@ COMMITTED_BETA_MAX = 0.01
 DEFAULT_SUMMARY = "results/ablation_cvae_jittering/summary.csv"
 LOSO_DIR = "results/loso"
 
-
 def build_shortlist(summary_path: str, region: str, k: int = 3) -> pd.DataFrame:
     """Rank (config, beta_max) candidates in `summary_path` for `region` by mean accuracy,
     keep the top-k distinct tuples (diversity guard), and force-include the committed config.
@@ -36,7 +35,7 @@ def build_shortlist(summary_path: str, region: str, k: int = 3) -> pd.DataFrame:
     if not in_pool:
         raise ValueError(
             f"committed config ({COMMITTED_CONFIG}, beta_max={COMMITTED_BETA_MAX}) absent from candidate pool "
-            f"in {summary_path}. You are likely reading the wrong summary — the committed model was selected "
+            f"in {summary_path}. You are likely reading the wrong summary - the committed model was selected "
             f"from the jitter x beta grid (results/ablation_cvae_jittering/summary.csv).")
 
     short = grp.head(k).copy()
@@ -47,13 +46,11 @@ def build_shortlist(summary_path: str, region: str, k: int = 3) -> pd.DataFrame:
     short = short.drop_duplicates(subset=["config", "beta_max"]).reset_index(drop=True)
     return short
 
-
 def _outer_fold_from_tag(loso_tag: str) -> int | None:
     """Recover the 1-indexed outer test fold t from a Stage-A `loso_tag` of the form `_nested_x{t0}`
     (t0 is the 0-indexed excluded subject). Returns None if the tag has no exclude (not a Stage-A row)."""
     m = re.search(r"_x(\d+)(?:-|$)", loso_tag or "")
     return int(m.group(1)) + 1 if m else None
-
 
 def select_best(results_dir: str, region: str) -> pd.DataFrame:
     """For each outer test fold t, pick the (config, beta_max) with the best mean val accuracy
@@ -77,13 +74,11 @@ def select_best(results_dir: str, region: str) -> pd.DataFrame:
     best = agg.loc[agg.groupby("outer_fold")["accuracy"].idxmax()].sort_values("outer_fold").reset_index(drop=True)
     return best[["outer_fold", "config", "beta_max", "accuracy"]]
 
-
 def _row_acc(r: dict, key: str):
     """Accuracy/f1 live flat in ablation result jsons but under `metrics` in core.tstr jsons."""
     if key in r and not isinstance(r.get(key), dict):
         return r.get(key)
     return (r.get("metrics") or {}).get(key)
-
 
 def aggregate(ablation_dir: str = "results/ablation_cvae_jittering", trtr_dir: str = "results/trtr") -> pd.DataFrame:
     """Collect the Stage-B (final) LOSO results into one table: conv_baseline (`*_loso_nested_fold*`,
@@ -103,21 +98,21 @@ def aggregate(ablation_dir: str = "results/ablation_cvae_jittering", trtr_dir: s
         raise ValueError(f"no Stage-B LOSO result jsons found in {ablation_dir} / {trtr_dir}")
     return pd.DataFrame(rows).sort_values(["model", "region", "fold", "init_seed"]).reset_index(drop=True)
 
-
 def main() -> None:
+    """Entry point: dispatch the nested-LOSO 'shortlist', 'select' or 'aggregate' subcommand and write its CSV to LOSO_DIR."""
     p = argparse.ArgumentParser(description="Nested-LOSO shortlist / selection helper")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    ps = sub.add_parser("shortlist", help="build the per-region candidate shortlist from the k-fold grid summary")
-    ps.add_argument("--summary", default=DEFAULT_SUMMARY, help=f"k-fold grid summary csv (default {DEFAULT_SUMMARY})")
+    ps = sub.add_parser("shortlist")
+    ps.add_argument("--summary", default=DEFAULT_SUMMARY)
     ps.add_argument("--regions", default="mouth,nose")
     ps.add_argument("--k", type=int, default=3)
 
-    pe = sub.add_parser("select", help="pick the best config per outer fold from Stage-A results")
+    pe = sub.add_parser("select")
     pe.add_argument("--results_dir", default="results/ablation_cvae_jittering")
     pe.add_argument("--regions", default="mouth,nose")
 
-    pa = sub.add_parser("aggregate", help="consolidate Stage-B conv_baseline + trtr LOSO results")
+    pa = sub.add_parser("aggregate")
     pa.add_argument("--ablation_dir", default="results/ablation_cvae_jittering")
     pa.add_argument("--trtr_dir", default="results/trtr")
 
@@ -144,7 +139,6 @@ def main() -> None:
         table.to_csv(out, index=False)
         print(f"[LOSO] aggregated {len(table)} Stage-B rows -> {out}")
         print(table.to_string(index=False))
-
 
 if __name__ == "__main__":
     main()

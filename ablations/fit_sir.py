@@ -1,27 +1,3 @@
-"""Fit the advection-diffusion-sensor (SIR) channel model to the SIR dataset.
-
-Headless CLI port of `pinn.ipynb` cell 3. Loads the long step-input SIR
-measurements, averages humidity & temperature over trials per region, then fits:
-
-  1. Humidity: advection-diffusion channel (A, D, v, t_shift) convolved with a
-     single-exponential sensor kernel (tau_s = 15 s).
-  2. Temperature: a bi-exponential sensor (A, tau_fast, alpha, tau_slow) reusing
-     humidity's transport (D, v, t_shift).
-
-Only the humidity 4-vector (A, D, v, t_shift) is saved to
-`results/pinn/params_{region}.npy`, which is what `core/train.py` and
-`models/pinn.py` consume (the latter unpacks `A, D, v, _`).
-
-Differences vs. the notebook (deliberate):
-  - Loads the new long SIR files via regex
-    `^(sir_long|bradypnea|eupnea|tachypnea)_(mouth|nose)_trial_(\\d+)\\.dat$`,
-    which excludes the legacy bare `{region}_trial_N.dat` (76 s) files.
-  - Resamples every trial onto a common time grid with `np.interp` before
-    averaging, instead of `np.stack`-ing raw arrays (trial lengths differ).
-
-Usage:
-    python -m ablations.fit_sir [--dataset_dir dataset] [--per_class] [--region mouth]
-"""
 import os
 import re
 import argparse
@@ -30,23 +6,15 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import differential_evolution
 
-# --------------------------------------------------------------------------- #
-# constants (mirrors pinn.ipynb cell 1)
-# --------------------------------------------------------------------------- #
+# constants
 SEED = 0
 REGIONS = ["mouth", "nose"]
 CLASSES = ["bradypnea", "eupnea", "tachypnea"]
 TAU_S_HUMIDITY = 15.0
 D0 = 0.03  # source-detector separation (m), matches advection_diffusion default
-
-# Only files for which we want to fit the channel; the bare legacy
-# `{region}_trial_N.dat` (76 s) files are intentionally NOT matched.
 SIR_RE = re.compile(r"^(sir_long|bradypnea|eupnea|tachypnea)_(mouth|nose)_trial_(\d+)\.dat$")
 
-
-# --------------------------------------------------------------------------- #
 # data loading
-# --------------------------------------------------------------------------- #
 def load_sir(dataset_dir="dataset"):
     """Load all matched SIR .dat files into a DataFrame.
 
@@ -72,13 +40,11 @@ def load_sir(dataset_dir="dataset"):
 
     return pd.DataFrame(dataset)
 
-
 def preprocess_cir(humidity, temperature):
     """Baseline-correct by subtracting the mean of the first 6 samples."""
     baseline_h = np.mean(humidity[:6])
     baseline_t = np.mean(temperature[:6])
     return humidity - baseline_h, temperature - baseline_t
-
 
 def common_time_grid(df):
     """Build a uniform common time grid shared across all trials in `df`.
@@ -95,7 +61,6 @@ def common_time_grid(df):
     n = int(np.floor((t_end - t_start) / dt)) + 1
     return t_start + np.arange(n) * dt
 
-
 def cir_stats(df, t_grid):
     """Resample each trial onto `t_grid` (via np.interp) then average over trials.
 
@@ -110,11 +75,21 @@ def cir_stats(df, t_grid):
     return (np.mean(humidity_all, axis=0), np.mean(temperature_all, axis=0),
             np.std(humidity_all, axis=0), np.std(temperature_all, axis=0))
 
-
-# --------------------------------------------------------------------------- #
-# physical model (verbatim from pinn.ipynb cell 3)
-# --------------------------------------------------------------------------- #
+# physical model
 def advection_diffusion(time, A, D, v, t_shift, d0=D0):
+    """Advection-diffusion channel response at a fixed source-detector distance.
+
+    Evaluates A / sqrt(4 pi D (t - t_shift)) * exp(-(d0 - v (t - t_shift))^2
+    / (4 D (t - t_shift))), zeroed for t <= t_shift.
+
+    :param time: time samples (s), shape (N,).
+    :param A: amplitude scale.
+    :param D: diffusion coefficient (m^2/s).
+    :param v: advection velocity (m/s).
+    :param t_shift: onset delay (s).
+    :param d0: source-detector separation (m).
+    :return: channel response, shape (N,).
+    """
     t = np.asarray(time, dtype=float)
     out = np.zeros_like(t)
 
@@ -128,18 +103,42 @@ def advection_diffusion(time, A, D, v, t_shift, d0=D0):
 
     return out
 
-
 def sensor_kernel(t, tau_s=15.0):
+    """Single-exponential sensor-lag kernel (1/tau_s) exp(-t/tau_s), zero for t <= 0.
+
+    :param t: time samples (s), shape (N,).
+    :param tau_s: sensor time constant (s).
+    :return: kernel values, shape (N,).
+    """
     return np.where(t > 0, (1.0 / tau_s) * np.exp(-t / tau_s), 0.0)
 
-
 def sensor_kernel_biexp(t, tau_fast, alpha, tau_slow):
+    """Bi-exponential sensor-lag kernel: alpha fast plus (1 - alpha) slow, zero for t <= 0.
+
+    :param t: time samples (s), shape (N,).
+    :param tau_fast: fast time constant (s).
+    :param alpha: weight of the fast component in [0, 1].
+    :param tau_slow: slow time constant (s).
+    :return: kernel values, shape (N,).
+    """
     fast = (alpha / tau_fast) * np.exp(-t / tau_fast)
     slow = ((1.0 - alpha) / tau_slow) * np.exp(-t / tau_slow)
     return np.where(t > 0, fast + slow, 0.0)
 
-
 def system_impulse_response(time, A, D, v, t_shift, sensor_fn):
+    """Channel response convolved with a sensor kernel, sampled on `time`.
+
+    Convolves advection_diffusion(time, A, D, v, t_shift) with sensor_fn
+    evaluated on a uniform kernel grid, then truncates to the input length.
+
+    :param time: uniformly sampled time (s), shape (N,).
+    :param A: channel amplitude scale.
+    :param D: diffusion coefficient (m^2/s).
+    :param v: advection velocity (m/s).
+    :param t_shift: onset delay (s).
+    :param sensor_fn: callable mapping a time grid to sensor-kernel values.
+    :return: system impulse response, shape (N,).
+    """
     t = np.asarray(time, dtype=float)
     dt = t[1] - t[0]  # assume uniform sampling
     t_kernel = np.arange(0, t[-1] + dt, dt)
@@ -149,10 +148,7 @@ def system_impulse_response(time, A, D, v, t_shift, sensor_fn):
 
     return np.convolve(cir, s, mode="full")[:len(t)] * dt
 
-
-# --------------------------------------------------------------------------- #
-# fitting (verbatim from pinn.ipynb cell 3)
-# --------------------------------------------------------------------------- #
+# fitting
 def fit_sir(signal, tau_s_humidity=TAU_S_HUMIDITY):
     """Fit humidity (A, D, v, t_shift) and temperature (A, tau_fast, alpha, tau_slow).
 
@@ -162,10 +158,11 @@ def fit_sir(signal, tau_s_humidity=TAU_S_HUMIDITY):
     time = signal["time"]
     h, t_data = preprocess_cir(signal["humidity"], signal["temperature"])
 
-    # --- humidity: advection-diffusion + single-exponential sensor ---
+    # humidity: advection-diffusion + single-exponential sensor
     sensor_h = lambda tk: sensor_kernel(tk, tau_s_humidity)
 
     def obj_h(params, t, h):
+        """MSE between the humidity SIR for (A, D, v, t_shift) and measured h."""
         A, D, v, ts = params
         pred = system_impulse_response(t, A, D, v, ts, sensor_h)
         return np.mean((pred - h) ** 2)
@@ -175,19 +172,18 @@ def fit_sir(signal, tau_s_humidity=TAU_S_HUMIDITY):
                                    seed=SEED, tol=1e-8, maxiter=1000, polish=True)
     A_h, D, v, t_shift = res_h.x
 
-    # --- temperature: bi-exponential sensor, reusing humidity transport ---
+    # temperature: bi-exponential sensor, reusing humidity transport
     def obj_t(params, t, td):
+        """MSE between the temperature SIR (bi-exp sensor, fixed transport) and measured td."""
         A, tau_fast, alpha, tau_slow = params
         sensor_t = lambda tk: sensor_kernel_biexp(tk, tau_fast, alpha, tau_slow)
         pred = system_impulse_response(t, A, D, v, t_shift, sensor_t)
         return np.mean((pred - td) ** 2)
 
     bounds_t = [(1e-3, 1e2), (0.5, 5.0), (0.2, 0.95), (30.0, 250.0)]  # A, tau_fast, alpha, tau_slow
-    res_t = differential_evolution(obj_t, bounds=bounds_t, args=(time, t_data),
-                                   seed=SEED, tol=1e-8, maxiter=1000, polish=True)
+    res_t = differential_evolution(obj_t, bounds=bounds_t, args=(time, t_data), seed=SEED, tol=1e-8, maxiter=1000, polish=True)
 
     return res_h.x, res_t.x, res_h.fun, res_t.fun
-
 
 def _r2(signal, params_h, params_t, tau_s_humidity=TAU_S_HUMIDITY):
     """Compute R^2 of the humidity and temperature fits (diagnostic only)."""
@@ -203,16 +199,14 @@ def _r2(signal, params_h, params_t, tau_s_humidity=TAU_S_HUMIDITY):
     sol_t = system_impulse_response(time, A_t, D, v, t_shift, sensor_t)
 
     def r2(y, yhat):
+        """Coefficient of determination of yhat against y."""
         ss_res = np.sum((y - yhat) ** 2)
         ss_tot = np.sum((y - np.mean(y)) ** 2)
         return 1 - ss_res / ss_tot
 
     return r2(h_bc, sol_h), r2(t_bc, sol_t)
 
-
-# --------------------------------------------------------------------------- #
 # driver
-# --------------------------------------------------------------------------- #
 def fit_group(df_group, label):
     """Average over trials and fit; print a report; return the humidity 4-vector."""
     t_grid = common_time_grid(df_group)
@@ -236,16 +230,12 @@ def fit_group(df_group, label):
 
     return params_h
 
-
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset_dir", default="dataset",
-                        help="Path to the dataset directory (default: dataset)")
-    parser.add_argument("--per_class", action="store_true",
-                        help="Additionally fit & save per-(region, class) params.")
-    parser.add_argument("--region", choices=REGIONS, default=None,
-                        help="Restrict fitting to a single region (default: both).")
+    """Fit the SIR model per region (and optionally per class) and save humidity params."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dataset_dir", default="dataset")
+    parser.add_argument("--per_class", action="store_true")
+    parser.add_argument("--region", choices=REGIONS, default=None)
     args = parser.parse_args()
 
     out_dir = os.path.join("results", "pinn")
@@ -257,7 +247,7 @@ def main():
 
     regions = [args.region] if args.region else REGIONS
 
-    # --- generic fit: sir_long step-input, per region ---
+    # generic fit: sir_long step-input, per region
     df_long = df_sir[df_sir["class"] == "sir_long"]
     for region in regions:
         df_r = df_long[df_long["region"] == region]
@@ -269,7 +259,7 @@ def main():
         np.save(out_path, params_h)
         print(f"  saved -> {out_path}")
 
-    # --- optional per-class fits ---
+    # optional per-class fits
     if args.per_class:
         for region in regions:
             for cls in CLASSES:
@@ -281,7 +271,6 @@ def main():
                 out_path = os.path.join(out_dir, f"params_{region}_{cls}.npy")
                 np.save(out_path, params_h)
                 print(f"  saved -> {out_path}")
-
 
 if __name__ == "__main__":
     main()
