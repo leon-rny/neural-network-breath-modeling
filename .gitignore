@@ -10,7 +10,12 @@ __pycache__/
 .claude/
 
 # results
+experiments/
 results/
 test.*
 *.pdf
 *.md
+
+# evaluation
+plotting.py
+*.ipynb
