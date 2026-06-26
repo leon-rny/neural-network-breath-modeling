@@ -28,7 +28,7 @@ class AblationCVAE(nn.Module):
         self.num_participants = num_participants
         self._cond_part = condition_on_participant
         # CFG-style participant dropout: with prob part_dropout swap the batch to a learned null token.
-        # null row sits just past the real participants; only allocated when part_dropout > 0 (see subclass).
+        # null row sits just past the real participants at index num_participants; the subclass always allocates it (num_participants + 1 rows).
         self.part_dropout = part_dropout
         self.null_part_idx = num_participants
         self._null_steps = 0
@@ -109,7 +109,7 @@ class _Enc_ConvBaseline(nn.Module):
             nn.Conv1d(32, 64, 3, padding=1), nn.ReLU(),
         )
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 64 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU())
         self.mu_head = nn.Linear(128, latent_dim)
@@ -127,7 +127,7 @@ class _Dec_ConvBaseline(nn.Module):
         """Build the Conv-baseline decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Linear(128, 64 * 36))
         self.conv = nn.Sequential(
@@ -169,7 +169,7 @@ class _Enc_ConvLargeKernel(nn.Module):
             nn.Conv1d(32, 64, 7, padding=3), nn.ReLU(),
         )
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 64 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU())
         self.mu_head = nn.Linear(128, latent_dim)
@@ -187,7 +187,7 @@ class _Dec_ConvLargeKernel(nn.Module):
         """Build the Large-kernel conv decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Linear(128, 64 * 36))
         self.conv = nn.Sequential(
@@ -218,7 +218,7 @@ class _Enc_ConvTiny(nn.Module):
         super().__init__()
         self.conv = nn.Sequential(nn.Conv1d(2, 8, 3, padding=1), nn.ReLU())
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 8 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 16), nn.ReLU())
         self.mu_head = nn.Linear(16, latent_dim)
@@ -236,7 +236,7 @@ class _Dec_ConvTiny(nn.Module):
         """Build the Tiny-conv decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 16), nn.ReLU(), nn.Linear(16, 8 * 36))
         self.conv = nn.ConvTranspose1d(8, 2, 3, padding=1)
@@ -266,7 +266,7 @@ class _Enc_ConvSlim(nn.Module):
             nn.Conv1d(8, 16, 3, padding=1), nn.ReLU(),
         )
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 16 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 64), nn.ReLU())
         self.mu_head = nn.Linear(64, latent_dim)
@@ -284,7 +284,7 @@ class _Dec_ConvSlim(nn.Module):
         """Build the Slim-conv decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 64), nn.ReLU(), nn.Linear(64, 16 * 36))
         self.conv = nn.Sequential(
@@ -313,7 +313,7 @@ class _Enc_MLP(nn.Module):
         """Build the MLP encoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 72 + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Linear(128, 64), nn.ReLU())
         self.mu_head = nn.Linear(64, latent_dim)
@@ -331,7 +331,7 @@ class _Dec_MLP(nn.Module):
         """Build the MLP decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(
             nn.Linear(in_fc, 64), nn.ReLU(),
@@ -365,7 +365,7 @@ class _Enc_MLPSmall(nn.Module):
         """Build the Small-MLP encoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 72 + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 64), nn.ReLU(), nn.Linear(64, 32), nn.ReLU())
         self.mu_head = nn.Linear(32, latent_dim)
@@ -383,7 +383,7 @@ class _Dec_MLPSmall(nn.Module):
         """Build the Small-MLP decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(
             nn.Linear(in_fc, 32), nn.ReLU(),
@@ -411,7 +411,7 @@ class _Enc_MLPTiny(nn.Module):
         """Build the Tiny-MLP encoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 72 + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 32), nn.ReLU())
         self.mu_head = nn.Linear(32, latent_dim)
@@ -429,7 +429,7 @@ class _Dec_MLPTiny(nn.Module):
         """Build the Tiny-MLP decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 32), nn.Linear(32, 72))
 
@@ -453,7 +453,7 @@ class _Dec_ConvAsym(nn.Module):
         """Build the Asymmetric-conv decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(
             nn.Linear(in_fc, 128), nn.ReLU(),
@@ -483,7 +483,7 @@ class _Dec_ConvAsymNoDropout(nn.Module):
         """Build the Asymmetric-conv (no-dropout) decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Linear(128, 64 * 36))
         self.conv = nn.ConvTranspose1d(64, 2, 3, padding=1)  # single deconv layer
@@ -514,7 +514,7 @@ class _Enc_ConvBaselineDropout(nn.Module):
             nn.Conv1d(32, 64, 3, padding=1), nn.ReLU(),
         )
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 64 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Dropout(0.4))
         self.mu_head = nn.Linear(128, latent_dim)
@@ -532,7 +532,7 @@ class _Dec_ConvBaselineDropout(nn.Module):
         """Build the Conv-baseline (dropout) decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(
             nn.Linear(in_fc, 128), nn.ReLU(), nn.Dropout(0.4),
@@ -570,7 +570,7 @@ class _Enc_Transformer(nn.Module):
                                            batch_first=True, dropout=0.1)
         self.transformer = nn.TransformerEncoder(layer, num_layers=2)
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 32 + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 64), nn.ReLU())
         self.mu_head = nn.Linear(64, latent_dim)
@@ -590,7 +590,7 @@ class _Dec_Transformer(nn.Module):
         """Build the Transformer decoder layers."""
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, embed_dim)
-        self.part_embed = nn.Embedding(num_participants, part_embed_dim) if cond_part else None
+        self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Linear(in_fc, 36 * 32)
         self.pos_embed = nn.Parameter(torch.zeros(1, 36, 32))

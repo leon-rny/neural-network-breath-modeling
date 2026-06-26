@@ -530,6 +530,7 @@ def train_variant(variant: str, region: str, init_seed: int, split_seed: int, fo
     # data
     df = load_dataset(dataset_dir)
     df = df[df["region"] == region].reset_index(drop=True)
+    num_participants = df["participant"].nunique()  # embedding table covers all subjects; derive before split
     df_train, df_val, _ = kfold_split_dataset(df, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
     train_ds = BreathDataset(df_train)
     val_ds = BreathDataset(df_val, stats=train_ds.stats)
@@ -538,7 +539,7 @@ def train_variant(variant: str, region: str, init_seed: int, split_seed: int, fo
 
     # model + optimiser
     model_cls = VARIANT_MAP[variant]
-    model = model_cls(latent_dim=LATENT_DIM, embed_dim=EMBED_DIM, condition_on_participant=cond_part, part_embed_dim=PART_EMBED_DIM).to(device)
+    model = model_cls(latent_dim=LATENT_DIM, embed_dim=EMBED_DIM, condition_on_participant=cond_part, num_participants=num_participants, part_embed_dim=PART_EMBED_DIM).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -623,9 +624,12 @@ def eval_variant(variant: str, region: str, init_seed: int, split_seed: int, fol
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model_cls = VARIANT_MAP[variant]
+    # recover the participant-table size from the trained weights (rows = num_participants + 1 null token)
+    num_participants = int(ckpt["model_state"]["encoder.part_embed.weight"].shape[0]) - 1 if cond_part else 3
     model = model_cls(latent_dim=ckpt["latent_dim"],
                       embed_dim=ckpt["embed_dim"],
                       condition_on_participant=cond_part,
+                      num_participants=num_participants,
                       part_embed_dim=ckpt["part_embed_dim"]).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
