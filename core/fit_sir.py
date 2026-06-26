@@ -6,13 +6,13 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import differential_evolution
 
+
 # constants
 SEED = 0
 REGIONS = ["mouth", "nose"]
 CLASSES = ["bradypnea", "eupnea", "tachypnea"]
 TAU_S_HUMIDITY = 15.0
 D0 = 0.03  # source-detector separation (m), matches advection_diffusion default
-SIR_RE = re.compile(r"^(sir_long|bradypnea|eupnea|tachypnea)_(mouth|nose)_trial_(\d+)\.dat$")
 
 # data loading
 def load_sir(dataset_dir="dataset"):
@@ -25,7 +25,7 @@ def load_sir(dataset_dir="dataset"):
     folder = os.path.join(dataset_dir, "sir")
 
     for fname in sorted(os.listdir(folder)):
-        m = SIR_RE.match(fname)
+        m = re.compile(r"^(sir_long|bradypnea|eupnea|tachypnea)_(mouth|nose)_trial_(\d+)\.dat$").match(fname)
         if m is None:
             continue
 
@@ -180,7 +180,7 @@ def fit_sir(signal, tau_s_humidity=TAU_S_HUMIDITY):
         pred = system_impulse_response(t, A, D, v, t_shift, sensor_t)
         return np.mean((pred - td) ** 2)
 
-    bounds_t = [(1e-3, 1e2), (0.5, 5.0), (0.2, 0.95), (30.0, 250.0)]  # A, tau_fast, alpha, tau_slow
+    bounds_t = [(1e-3, 1e2), (0.1, 5.0), (0.2, 1.5), (30.0, 350.0)]  # A, tau_fast, alpha, tau_slow
     res_t = differential_evolution(obj_t, bounds=bounds_t, args=(time, t_data), seed=SEED, tol=1e-8, maxiter=1000, polish=True)
 
     return res_h.x, res_t.x, res_h.fun, res_t.fun
@@ -273,4 +273,102 @@ def main():
                 print(f"  saved -> {out_path}")
 
 if __name__ == "__main__":
-    main()
+    # main()
+
+    import matplotlib.pyplot as plt
+    TAU_S = 15.0
+    REGION = ["mouth", "nose"]
+    T_MAX = 300.0  # truncate sir_long to the ~70 s short-sir window before fitting (None = full length)
+
+    df_sir = load_sir(dataset_dir='../dataset/')
+    df_long = df_sir[df_sir["class"] == "sir_long"]  # generic step-input trials
+
+    # fitting (mirrors fit_sir.fit_group, with plotting); separate dict so mean_then_fit is untouched
+    module_fit = {}
+    fig, ax = plt.subplots(1, 2, figsize=(14, 4), sharey=True)
+    ax_twin = [ax[0].twinx(), ax[1].twinx()]
+    ax_twin[1].sharey(ax_twin[0])
+    ax_twin[0].tick_params(right=False, labelright=False)
+    for col, region in enumerate(REGION):
+        df_region = df_long[df_long["region"] == region]
+
+        # common time grid + interpolated mean over trials
+        t_grid = common_time_grid(df_region)
+        humidity_mean, temperature_mean, _, _ = cir_stats(df_region, t_grid)
+
+        # shorten the recording before fitting
+        if T_MAX is not None:
+            keep = t_grid <= T_MAX
+            t_grid = t_grid[keep]
+            humidity_mean = humidity_mean[keep]
+            temperature_mean = temperature_mean[keep]
+
+        signal = dict(time=t_grid, humidity=humidity_mean, temperature=temperature_mean)
+
+        # fit model to mean signal
+        params_humidity, params_temperature, loss_h, loss_t = fit_sir(signal)
+        A_h, D, v, t_shift = params_humidity
+        A_t, tau_fast, alpha, tau_slow = params_temperature
+        r2_humidity, r2_temperature = _r2(signal, params_humidity, params_temperature)
+
+        # reconstruct fitted curves
+        sensor_h = lambda tk: sensor_kernel(tk, tau_s=TAU_S)
+        sensor_t = lambda tk: sensor_kernel_biexp(tk, tau_fast, alpha, tau_slow)
+        solution_humidity = system_impulse_response(t_grid, A_h, D, v, t_shift, sensor_h)
+        solution_temperature = system_impulse_response(t_grid, A_t, D, v, t_shift, sensor_t)
+        humidity_baseline_corrected, temperature_baseline_corrected = preprocess_cir(humidity_mean, temperature_mean)
+
+        module_fit[region] = {"humidity_params": params_humidity,
+                            "temperature_params": params_temperature,
+                            "r2_humidity": r2_humidity,
+                            "r2_temperature": r2_temperature}
+
+        # humidity
+        ax[col].scatter(t_grid, humidity_baseline_corrected, marker="o", color="tab:blue", alpha=0.5)
+        ax[col].plot(t_grid, solution_humidity, label=rf"$R^2_{{humidity}}=${r2_humidity:.4f}", color="tab:blue")
+        ax[col].set_xlabel("Time in s")
+        ax[col].tick_params(axis="y", labelcolor="tab:blue")
+        ax[col].grid()
+
+        # temperature
+        ax_twin[col].scatter(t_grid, temperature_baseline_corrected, marker="o", color="tab:orange", alpha=0.5)
+        ax_twin[col].plot(t_grid, solution_temperature, label=rf"$R^2_{{temperature}}=${r2_temperature:.4f}", color="tab:orange")
+        ax_twin[col].tick_params(axis="y", labelcolor="tab:orange")
+
+        ax[0].set_ylabel("Humidity in %", color="tab:blue")
+        ax_twin[1].set_ylabel("Temperature in °C", color="tab:orange")
+        h1, l1 = ax[col].get_legend_handles_labels()
+        h2, l2 = ax_twin[col].get_legend_handles_labels()
+        ax[col].legend(h1 + h2, l1 + l2, loc="upper right")
+        window = f"<= {T_MAX:.0f}s" if T_MAX is not None else "full"
+        ax[col].set_title(f"{region.capitalize()} (sir_long {window}, from fit_sir.py)")
+
+    plt.tight_layout()
+    plt.show()
+
+    # print
+    header = f"{'Parameter':<16}{'Mouth':>14}{'Nose':>14}"
+    sep    = "─" * len(header)
+    print(sep)
+    print(header)
+    print(sep)
+    print("Humidity")
+    rows_h = [("  A",         "{:.4f}",   "humidity_params", 0),
+            ("  D (m²/s)",  "{:.2e}",   "humidity_params", 1),
+            ("  v (m/s)",   "{:.4f}",   "humidity_params", 2),
+            ("  t_shift (s)","{:.4f}",  "humidity_params", 3)]
+    for label, fmt, key, idx in rows_h:
+        m = fmt.format(module_fit["mouth"][key][idx])
+        n = fmt.format(module_fit["nose"][key][idx])
+        print(f"{label:<16}{m:>14}{n:>14}")
+
+    print("Temperature")
+    rows_t = [("  A",          "{:.4f}", "temperature_params", 0),
+            ("  tau_fast (s)","{:.4f}","temperature_params", 1),
+            ("  alpha",      "{:.4f}", "temperature_params", 2),
+            ("  tau_slow (s)","{:.4f}","temperature_params", 3)]
+    for label, fmt, key, idx in rows_t:
+        m = fmt.format(module_fit["mouth"][key][idx])
+        n = fmt.format(module_fit["nose"][key][idx])
+        print(f"{label:<16}{m:>14}{n:>14}")
+    print(sep)
