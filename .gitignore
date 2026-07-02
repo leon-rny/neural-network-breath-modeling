@@ -15,6 +15,7 @@ results/
 test.*
 *.pdf
 *.md
+backups/
 
 # evaluation
 plotting.py

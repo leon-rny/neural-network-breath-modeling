@@ -300,15 +300,15 @@ def main():
     # dataset
     df = load_dataset(args.dataset_dir)
     df = df[df['region'] == args.region].reset_index(drop=True)
-    num_participants = df['participant'].nunique()  # embedding table covers all subjects; derive before the split
-    if include_subjects:  # restrict to a participant subset (embedding table stays full-size; indices are global)
+    num_participants = df['participant'].nunique()
+    if include_subjects:
         df = df[df['participant'].isin(include_subjects)].reset_index(drop=True)
     # args.fold is 1-indexed
     df_train, df_val, _ = get_split(df, cv_mode=args.cv_mode, fold=args.fold - 1, n_folds=args.n_folds, split_seed=args.split_seed)
     DatasetCls = PhysicsInformedDataset if args.model in ('pinn', 'tpinn') else BreathDataset
     ds_kwargs = {'alpha': args.alpha, 'n_copies': args.n_copies}
     if args.model in ('pinn', 'tpinn'):
-        ds_kwargs['phys_prep'] = args.phys_prep      # input-normalization mode (stored in stats -> ckpt)
+        ds_kwargs['phys_prep'] = args.phys_prep
     train_ds = DatasetCls(df_train, **ds_kwargs)
     train_ds_clean = DatasetCls(df_train, stats=train_ds.stats) if args.alpha > 0 else train_ds
     val_ds = DatasetCls(df_val, stats=train_ds.stats)
