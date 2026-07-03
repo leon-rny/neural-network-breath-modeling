@@ -220,7 +220,7 @@ class SharedTransportPINN(CVAE):
     channels (heat-mass / Lewis analogy: exhaled heat and water-vapour ride the same turbulent
     airflow, so they share the transport (D, v) and differ only in their per-channel source u)."""
 
-    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, learn_transport: bool = False, residual: bool = False, class_transport: bool = False, parametric_source: bool = False, **cvae_kwargs):
+    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, learn_transport: bool = False, residual: bool = False, class_transport: bool = False, parametric_source: bool = False, ode: bool = False, **cvae_kwargs):
         """
         :param cir_params_init: (A, D, v, ...) initial transport parameters from the SIR fit (A is unused; the kernel is unit-integral).
         :param t_grid: 1D array of sample times (seconds) for the transport kernel.
@@ -251,6 +251,15 @@ class SharedTransportPINN(CVAE):
         cond_dim = self.latent_dim + emb + (self.decoder.part_embed.embedding_dim if self._cond_part else 0)
         self.uH_head = nn.Sequential(nn.Linear(cond_dim, 64), nn.ReLU(), nn.Linear(64, T))
         self.uT_head = nn.Sequential(nn.Linear(cond_dim, 64), nn.ReLU(), nn.Linear(64, T))
+
+        # UDE: integrate a driven first-order relaxation ODE (known sensor physics) + a learned neural residual,
+        # over the T-step grid, instead of the fixed CIR convolution. dx/dt = k*(u(t)-x) + g_theta(x, cond).
+        self.ode = ode
+        self.T = T
+        if ode:
+            self.log_k = nn.Parameter(torch.log(torch.tensor([0.3, 0.3])))  # per-channel relaxation rate
+            self.res_net = nn.Sequential(nn.Linear(2 + cond_dim, 32), nn.Tanh(), nn.Linear(32, 2))
+            nn.init.zeros_(self.res_net[-1].weight); nn.init.zeros_(self.res_net[-1].bias)  # start as pure physics
 
         _, D_init, v_init, _ = cir_params_init
         log_D_init = float(np.log(D_init))
@@ -290,6 +299,19 @@ class SharedTransportPINN(CVAE):
         """
         B = z.shape[0]
         zero_A = torch.zeros(B, device=z.device)  # A is normalised out of the unit-integral kernel
+        if self.ode:
+            # UDE: integrate dx/dt = k*(u(t)-x) [known driven relaxation] + g_theta(x, cond) [neural residual], x(0)=0
+            c = self._cond(z, y, p)
+            u = torch.stack([F.softplus(self.uH_head(c)), F.softplus(self.uT_head(c))], dim=1)  # (B,2,T) drive
+            k = F.softplus(self.log_k).view(1, 2)
+            x = torch.zeros(B, 2, device=z.device); traj = []
+            for t in range(self.T):
+                x = x + k * (u[:, :, t] - x) + self.res_net(torch.cat([x, c], dim=1))  # Euler step (dt=1)
+                traj.append(x)
+            x_hat = torch.stack(traj, dim=2)  # (B,2,T)
+            if self.residual:
+                x_hat = x_hat + self.decoder(z, y, p)
+            return x_hat, u[:, 0, :], u[:, 1, :], (zero_A, self.log_k[0].expand(B), self.log_k[1].expand(B))
         # transport params
         if self.class_transport:
             log_D = self.log_D[y]  # per-class transport, indexed by breath class
