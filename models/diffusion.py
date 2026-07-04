@@ -138,7 +138,7 @@ class ConditionalDiffusion(nn.Module):
         y = y.to(device)
         if not self._cond_part:
             p = None
-        elif participant is not None:  # null_part_idx for LOSO unseen-subject gen
+        elif participant is not None: # null_part_idx for LOSO unseen-subject gen
             p = torch.full((n,), participant, dtype=torch.long, device=device)
         else:
             p = torch.randint(0, self.num_participants, (n,), device=device)
