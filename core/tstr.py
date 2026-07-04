@@ -6,7 +6,6 @@ import re
 from collections import defaultdict
 
 import numpy as np
-from scipy.spatial.distance import cdist
 import pandas as pd
 import torch
 from tsfresh import extract_features, extract_relevant_features
@@ -44,16 +43,13 @@ def parse_args() -> argparse.Namespace:
     # general
     p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'pinn', 'tpinn', 'diffusion', 'gan'])
     p.add_argument('--region', choices=['mouth', 'nose'], default=None)
-    p.add_argument('--mode', choices=['tstr', 'tstr_plus', 'fewshot'], default='tstr')
-    p.add_argument('--fewshot_k', type=int, default=2, help='fewshot mode: number of held-out-subject trials PER CLASS used for adaptation (added to training; excluded from test)')
-    p.add_argument('--ensemble_model', type=str, default='', help='tstr: also mix synthetic from this second generator (e.g. tpinn = tpinn-res@stdscale) for a two-generator ensemble')
-    p.add_argument('--aug_source', choices=['gen', 'mixup', 'warp', 'mixwarp', 'xmixup'], default='gen', help='tstr_plus: augmentation source. gen = generator synthetic (default); mixup/warp/mixwarp/xmixup = non-generator real-signal augmentation (xmixup = cross-subject mixup)')
+    p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
+    p.add_argument('--ensemble_model', type=str, default='')   # tstr: mix synthetic from a 2nd generator (e.g. tpinn) for a two-generator ensemble
+    p.add_argument('--aug_source', choices=['gen', 'mixup'], default='gen')   # tstr_plus: gen = generator synthetic; mixup = real-signal mixup
     p.add_argument('--channel', choices=['humidity', 'temperature', 'both'], default='both')
     p.add_argument('--n_synthetic', type=int, default=None)
     p.add_argument('--augmentation_ratio', type=float, default=1.0)
-    p.add_argument('--real_fraction', type=float, default=1.0, help='tstr_plus: stratified fraction of real training data to keep (data-scarcity curve)')
-    p.add_argument('--filter_conf', type=float, default=-1.0, help='tstr_plus: informative-synthetic filtering. <0 = off (keep all synth); >=0 = keep only synth a real-trained classifier predicts correctly with confidence >= this threshold')
-    p.add_argument('--filter_div_keep', type=float, default=-1.0, help='tstr_plus: diversity filtering. <0 = off; in (0,1] = keep this top-fraction of synth by novelty (nearest-real distance in feature space)')
+    p.add_argument('--real_fraction', type=float, default=1.0)   # tstr_plus: stratified fraction of real training data (data-scarcity curve)
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--n_jobs', type=int, default=4)
     p.add_argument('--force_rebuild', action='store_true')
@@ -82,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--gan_lr_d', type=float, default=None)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--phys_residual', action='store_true')
-    p.add_argument('--ode', action='store_true', help='tpinn UDE mode (must match the trained checkpoint)')
+    p.add_argument('--ode', action='store_true')   # UDE mode (must match the trained checkpoint)
     p.add_argument('--class_transport', action='store_true')
     p.add_argument('--parametric_source', action='store_true')
     p.add_argument('--learn_cir_params', action='store_true')
@@ -107,8 +103,8 @@ def parse_args() -> argparse.Namespace:
 def _prep_channel(arr, mode: str = 'raw', nb: int = 5) -> np.ndarray:
     """Apply the selected baseline/peaknorm transform to a single channel array.
 
-    raw=identity; baseline=subtract the per-channel pre-onset baseline (mean of first nb
-    samples); peaknorm=baseline then divide by the channel's own peak |amplitude|.
+    raw=identity, baseline=subtract the per-channel pre-onset baseline (mean of first nb
+    samples), peaknorm=baseline then divide by the channel's own peak |amplitude|.
     """
     a = np.asarray(arr, dtype=float)
     if mode in ('', 'raw'):
@@ -122,7 +118,7 @@ def _prep_channel(arr, mode: str = 'raw', nb: int = 5) -> np.ndarray:
 def preprocess_signals(df: pd.DataFrame, mode: str = 'raw', nb: int = 5) -> pd.DataFrame:
     """Per-trial signal preprocessing before feature extraction (Phase 4 ablation).
 
-    raw=identity; baseline=subtract per-channel pre-onset baseline (first nb samples);
+    raw=identity, baseline=subtract per-channel pre-onset baseline (first nb samples),
     peaknorm=baseline then divide each channel by its own peak |amplitude| (removes the
     offset+gain shift). Returns a transformed copy of df.
     """
@@ -190,7 +186,7 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
     :param df_long: long-format data with id/time/channel columns.
     :param top_features_raw: raw tsfresh feature names to compute (order preserved).
     :param n_jobs: parallel workers for tsfresh.
-    :return: DataFrame with exactly top_features_raw as columns; any feature tsfresh fails
+    :return: DataFrame with exactly top_features_raw as columns, any feature tsfresh fails
         to produce is filled with 0.0.
     """
     kind_to_fc = from_columns(top_features_raw)
@@ -379,7 +375,9 @@ def _ssl_embeddings(df: pd.DataFrame, ssl_ckpt: str) -> np.ndarray:
     from core.ssl import SSLEncoder, embed, _baseline_correct
     if ssl_ckpt not in _SSL_CACHE:
         ck = torch.load(ssl_ckpt, map_location='cpu')
-        enc = SSLEncoder(ck['emb_dim']); enc.load_state_dict(ck['state']); enc.eval()
+        enc = SSLEncoder(ck['emb_dim'])
+        enc.load_state_dict(ck['state'])
+        enc.eval()
         _SSL_CACHE[ssl_ckpt] = enc
     sigs = np.stack([_baseline_correct(np.stack([r['humidity'], r['temperature']])) for _, r in df.iterrows()])
     return embed(_SSL_CACHE[ssl_ckpt], sigs)
@@ -454,7 +452,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
     top_20_raw = [san_to_raw[s] for s in top_20_san]
     X_train_top = X_full_san[top_20_san].values
     if ssl_ckpt:
-        X_train_top = np.hstack([X_train_top, _ssl_embeddings(df_train, ssl_ckpt)])  # append SSL embeddings (research #4)
+        X_train_top = np.hstack([X_train_top, _ssl_embeddings(df_train, ssl_ckpt)])
 
     ## test real
     df_long_test, y_test = df_to_df_long(df_test)
@@ -463,7 +461,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
     X_test_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_test_san.columns]
     X_test_top = X_test_san[top_20_san].values
     if ssl_ckpt:
-        X_test_top = np.hstack([X_test_top, _ssl_embeddings(df_test, ssl_ckpt)])  # append SSL embeddings (research #4)
+        X_test_top = np.hstack([X_test_top, _ssl_embeddings(df_test, ssl_ckpt)])
 
     # train stack classifier
     clf = train_stacking_classifier(X_train_top, y_train.values, init_seed, n_jobs=n_jobs)
@@ -683,7 +681,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     synth_signals = preprocess_synth_signals(synth_signals, preprocessing)
     print(f'[TSTR] Generated {n_synthetic} synthetic signals' + (' (null token)' if participant_idx is not None else ''))
 
-    # ensemble: mix in synthetic from a SECOND generator (different inductive bias -> decorrelated errors)
+    # ensemble: mix in synthetic from a second generator
     if ensemble_model and ensemble_ckpt_run_id:
         m2, stats2 = load_model(ensemble_model, ensemble_ckpt_run_id, device)
         p2 = m2.null_part_idx if (cv_mode == 'loso' and getattr(m2, '_cond_part', False)) else None
@@ -761,53 +759,38 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
             'top_20_synth_features': top_k_synth,
             'trtr_metrics': cache['trtr_metrics']}
 
-def _mag_warp(s: np.ndarray, rng, sigma: float = 0.1, knots: int = 4) -> np.ndarray:
-    """Per-channel smooth magnitude warping: multiply by a random cubic-ish curve ~N(1, sigma)."""
-    T = s.shape[1]; xs = np.linspace(0, T - 1, knots + 2); out = s.copy()
-    for ch in range(s.shape[0]):
-        curve = np.interp(np.arange(T), xs, rng.normal(1.0, sigma, knots + 2))
-        out[ch] = s[ch] * curve
-    return out
+def generate_real_aug(df_train: pd.DataFrame, n_aug: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Non-generator augmentation from REAL trials: class-balanced same-class mixup (a convex combo of two
+    same-class trials, mixing across subjects within a class to smooth subject boundaries).
 
-def _time_warp(s: np.ndarray, rng, sigma: float = 0.15, knots: int = 4) -> np.ndarray:
-    """Smooth monotonic time warping (shared across channels to keep humidity/temperature aligned)."""
-    T = s.shape[1]; xs = np.linspace(0, T - 1, knots + 2)
-    y = np.cumsum(np.abs(rng.normal(1.0, sigma, knots + 2)))
-    y = (y - y.min()) / (y.max() - y.min() + 1e-8) * (T - 1)
-    warp = np.interp(np.arange(T), xs, y)
-    return np.stack([np.interp(np.arange(T), warp, s[ch]) for ch in range(s.shape[0])])
-
-def generate_real_aug(df_train: pd.DataFrame, n_aug: int, mode: str, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    """Non-generator augmentation from REAL trials (research idea #1): same-class mixup and/or time/magnitude warping.
-
-    mixup = convex combo of two same-class trials (mixes ACROSS subjects within a class -> smooths subject boundaries);
-    warp = magnitude+time warping of one trial; mixwarp = mixup then warp. Class-balanced. Returns (n_aug,2,36), labels.
+    :param df_train: training trials with humidity/temperature/class columns.
+    :param n_aug: number of augmented signals to produce.
+    :param seed: RNG seed.
+    :return: (n_aug, 2, 36) signals and their integer class labels.
     """
     rng = np.random.RandomState(seed)
-    by_class = defaultdict(list)  # class -> list of (signal, subject)
+    # bucket trials by class
+    by_class = defaultdict(list)
     for r in df_train.to_dict('records'):
-        by_class[CLASS_TO_IDX[r['class']]].append((np.stack([r['humidity'], r['temperature']]).astype(np.float32), r['participant']))
+        by_class[CLASS_TO_IDX[r['class']]].append(np.stack([r['humidity'], r['temperature']]).astype(np.float32))
     classes = sorted(by_class)
+    # class-balanced mixup
     sigs, labs = [], []
     for i in range(n_aug):
-        c = classes[i % len(classes)]; pool = by_class[c]
-        a_sig, a_subj = pool[rng.randint(len(pool))]
+        c = classes[i % len(classes)]
+        pool = by_class[c]
+        a_sig = pool[rng.randint(len(pool))]
         s = a_sig
-        if mode in ('mixup', 'mixwarp', 'xmixup') and len(pool) > 1:
-            if mode == 'xmixup':  # cross-subject mixup: 2nd trial from a DIFFERENT subject (smooth subject boundaries)
-                others = [q for q in pool if q[1] != a_subj]
-                b_sig = (others or pool)[rng.randint(len(others) if others else len(pool))][0]
-            else:
-                b_sig = pool[rng.randint(len(pool))][0]
+        if len(pool) > 1:
+            b_sig = pool[rng.randint(len(pool))]
             lam = rng.beta(0.4, 0.4)
             s = lam * a_sig + (1 - lam) * b_sig
-        if mode in ('warp', 'mixwarp'):
-            s = _time_warp(_mag_warp(s, rng), rng)
-        sigs.append(s); labs.append(c)
+        sigs.append(s)
+        labs.append(c)
     return np.stack(sigs), np.array(labs)
 
 # train synthetic/real test real
-def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, cv_mode: str = 'kfold', preprocessing: str = 'raw', ckpt_run_id: str | None = None, real_fraction: float = 1.0, filter_conf: float = -1.0, filter_div_keep: float = -1.0, aug_source: str = 'gen', dataset_dir: str = 'dataset', n_folds: int = 5, include_subjects: tuple = ()) -> dict:
+def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, cv_mode: str = 'kfold', preprocessing: str = 'raw', ckpt_run_id: str | None = None, real_fraction: float = 1.0, aug_source: str = 'gen', dataset_dir: str = 'dataset', n_folds: int = 5, include_subjects: tuple = ()) -> dict:
     """Run augmentation TSTR+: train the classifier on real + synthetic data, test on the real fold.
 
     Generates int(n_train * augmentation_ratio) synthetic signals, concatenates their cached
@@ -830,8 +813,6 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     :return: result dict with config fields plus 'augmentation_ratio', 'metrics' (test scores),
         'feature_overlap' (None), 'top_20_synth_features' (None), and 'trtr_metrics'.
     """
-    # data-scarcity: optionally use only a stratified (seeded) fraction of the real training set,
-    # and scale the synthetic count to that subsample so augmentation_ratio stays relative to the real data used.
     X_real, y_real = cache['X_train_top'], cache['y_train']
     if real_fraction < 1.0:
         idx = np.arange(len(y_real))
@@ -845,11 +826,12 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
         participant_idx = model.null_part_idx if (cv_mode == 'loso' and getattr(model, '_cond_part', False)) else None
         synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed, participant_idx=participant_idx)
     else:
-        # non-generator REAL-signal augmentation (research #1): mixup / warp of real training trials
-        df = load_dataset(dataset_dir); df = df[df['region'] == region].reset_index(drop=True)
+        # non-generator REAL-signal augmentation: same-class mixup of real training trials
+        df = load_dataset(dataset_dir)
+        df = df[df['region'] == region].reset_index(drop=True)
         df_tr, _, _ = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed, include_subjects=include_subjects)
-        synth_signals, synth_labels = generate_real_aug(df_tr, n_synthetic, aug_source, init_seed)
-        print(f'[TSTR+] real-aug source={aug_source}, n={n_synthetic}, n_real_used={n_real_used}, preprocessing={preprocessing}')
+        synth_signals, synth_labels = generate_real_aug(df_tr, n_synthetic, init_seed)
+        print(f'[TSTR+] real-aug mixup, n={n_synthetic}, n_real_used={n_real_used}, preprocessing={preprocessing}')
     # match the real-data feature space (cache X_train/X_test are already preprocessed in trtr)
     synth_signals = preprocess_synth_signals(synth_signals, preprocessing)
 
@@ -865,27 +847,6 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     X_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_san.columns]
     X_synth_top = X_san[cache['top_20_features_sanitized']].values
 
-    # informative-synthetic filtering: keep only synth a real-trained classifier predicts correctly
-    # (class-confidence >= filter_conf). Removes off-class / low-quality generations before augmenting.
-    n_synth_before = len(synth_labels)
-    if filter_conf >= 0 and n_synth_before > 0:
-        filt = LGBMClassifier(n_estimators=200, learning_rate=0.05, random_state=init_seed, verbose=-1)
-        filt.fit(X_real, y_real)
-        proba = filt.predict_proba(X_synth_top)
-        pred, conf = proba.argmax(axis=1), proba.max(axis=1)
-        keep = (pred == synth_labels) & (conf >= filter_conf)
-        if keep.sum() == 0:  # never drop everything: fall back to all class-correct synth
-            keep = (pred == synth_labels)
-        X_synth_top, synth_labels = X_synth_top[keep], synth_labels[keep]
-        print(f'[TSTR+] filter conf>={filter_conf}: kept {len(synth_labels)}/{n_synth_before} synthetic')
-    elif filter_div_keep >= 0 and n_synth_before > 0:
-        # diversity filter: keep the top-fraction most NOVEL synth (largest nearest-real distance in z-scored feature space)
-        mu, sd = X_real.mean(0), X_real.std(0) + 1e-8
-        dmin = cdist((X_synth_top - mu) / sd, (X_real - mu) / sd).min(axis=1)
-        k = max(1, int(round(len(dmin) * filter_div_keep)))
-        idx = np.argsort(dmin)[::-1][:k]
-        X_synth_top, synth_labels = X_synth_top[idx], synth_labels[idx]
-        print(f'[TSTR+] filter diversity keep_top={filter_div_keep}: kept {len(synth_labels)}/{n_synth_before} synthetic')
     n_synth_kept = len(synth_labels)
 
     X_combined = np.concatenate([X_real, X_synth_top])
@@ -918,7 +879,6 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
             'real_fraction': real_fraction,
             'n_synthetic': n_synthetic,
             'n_synth_kept': n_synth_kept,
-            'filter_conf': filter_conf,
             'augmentation_ratio': augmentation_ratio,
             'metrics_realonly': metrics_realonly,
             'top_20_features': cache['top_20_features_sanitized'],
@@ -927,107 +887,13 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
             'top_20_synth_features': None,
             'trtr_metrics': cache['trtr_metrics']}
 
-def fit_fewshot_embedding(model, x_norm: np.ndarray, y: np.ndarray, device, n_steps: int = 300, lr: float = 0.05, beta: float = 0.01) -> torch.Tensor:
-    """Fit a per-subject decoder participant embedding to a few normalized real trials of an unseen subject.
-
-    Freezes the generator, initializes encoder/decoder participant embeddings from the null token, and optimizes
-    them to reconstruct the k few-shot signals (recon + small KL). Returns the fitted DECODER embedding for sampling.
-    """
-    for p in model.parameters():
-        p.requires_grad_(False)
-    null = model.null_part_idx
-    e_enc = model.encoder.part_embed.weight[null].detach().clone().to(device).requires_grad_(True)
-    e_dec = model.decoder.part_embed.weight[null].detach().clone().to(device).requires_grad_(True)
-    opt = torch.optim.Adam([e_enc, e_dec], lr=lr)
-    xt = torch.tensor(x_norm, dtype=torch.float32, device=device)
-    yt = torch.tensor(y, dtype=torch.long, device=device)
-    model.eval()  # deterministic recon (reparameterize returns mu; participant-dropout is training-only)
-    for _ in range(n_steps):
-        opt.zero_grad()
-        x_hat, mu, logvar = model(xt, yt, p_embed_enc=e_enc, p_embed_dec=e_dec)
-        recon = ((x_hat - xt) ** 2).mean()
-        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
-        (recon + beta * kl).backward()
-        opt.step()
-    return e_dec.detach()
-
-def tstr_fewshot(cache: dict, model_name: str, region: str, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, ckpt_run_id: str, fewshot_k: int = 2, augmentation_ratio: float = 1.0, dataset_dir: str = 'dataset', n_folds: int = 5, preprocessing: str = 'raw', include_subjects: tuple = ()) -> dict:
-    """Few-shot LOSO+: adapt the generator to k real trials of the held-out subject, then augment.
-
-    Splits the held-out subject into fewshot_k-per-class (adaptation, added to training) and the rest (test).
-    Fits a subject embedding on the few-shot trials, generates subject-adapted synthetic, and compares a classifier
-    trained on (n-1 real + few-shot real + adapted synth) vs (n-1 real + few-shot real). Lift = aug - real-only.
-    """
-    model, ckpt_stats = load_model(model_name, ckpt_run_id, device)
-    mean = np.asarray(ckpt_stats['mean'], dtype=np.float32).reshape(1, 2, 1)
-    std = np.asarray(ckpt_stats['std'], dtype=np.float32).reshape(1, 2, 1)
-
-    # held-out subject's trials for this LOSO fold
-    df = load_dataset(dataset_dir)
-    df = df[df['region'] == region].reset_index(drop=True)
-    _, _, df_held = get_split(df, cv_mode='loso', fold=fold - 1, n_folds=n_folds, split_seed=split_seed, include_subjects=include_subjects)
-
-    # stratified split: fewshot_k per class for adaptation (seeded), the rest for test
-    rng = np.random.RandomState(init_seed)
-    fs_idx, test_idx = [], []
-    for c in df_held['class'].unique():
-        ci = df_held.index[df_held['class'] == c].to_numpy()
-        rng.shuffle(ci)
-        fs_idx.extend(ci[:fewshot_k]); test_idx.extend(ci[fewshot_k:])
-    df_fs = df_held.loc[fs_idx].reset_index(drop=True)
-    df_test = df_held.loc[test_idx].reset_index(drop=True)
-
-    # fit subject embedding on RAW few-shot signals normalized to the generator's z-score space
-    fs_raw = np.stack([np.stack([r['humidity'], r['temperature']]) for _, r in df_fs.iterrows()]).astype(np.float32)
-    fs_norm = (fs_raw - mean) / (std + 1e-8)
-    fs_y = np.array([CLASS_TO_IDX[c] for c in df_fs['class']])
-    e_dec = fit_fewshot_embedding(model, fs_norm, fs_y, device)
-
-    # generate subject-adapted synthetic
-    n_syn = int(cache['n_train'] * augmentation_ratio)
-    counts = [n_syn // len(CLASSES) + (1 if i < n_syn % len(CLASSES) else 0) for i in range(len(CLASSES))]
-    mean_t = torch.tensor(ckpt_stats['mean'], dtype=torch.float32).view(1, 2, 1).to(device)
-    std_t = torch.tensor(ckpt_stats['std'], dtype=torch.float32).view(1, 2, 1).to(device)
-    torch.manual_seed(init_seed)
-    syn_sig, syn_lab = [], []
-    for ci, cnt in enumerate(counts):
-        z = model.sample_embed(cnt, torch.tensor(ci, dtype=torch.long), device, e_dec)
-        syn_sig.append((z * std_t + mean_t).cpu().numpy()); syn_lab.append(np.full(cnt, ci))
-    syn_sig = preprocess_synth_signals(np.concatenate(syn_sig), preprocessing)
-    syn_lab = np.concatenate(syn_lab)
-
-    # features (same top-20; preprocessing applied consistently to real few-shot / test / synth)
-    def feats(sig_df_or_arr, labels=None):
-        if isinstance(sig_df_or_arr, pd.DataFrame):
-            d = preprocess_signals(sig_df_or_arr, preprocessing)
-            dl, y = df_to_df_long(d); return _feat_top(dl, cache, n_jobs), y.values
-        n, _C, T = sig_df_or_arr.shape
-        dl = pd.DataFrame({'id': np.repeat(np.arange(n), T), 'time': np.tile(np.arange(T), n),
-                           'Humidity': sig_df_or_arr[:, 0, :].ravel(), 'Temperature': sig_df_or_arr[:, 1, :].ravel()})
-        return _feat_top(dl, cache, n_jobs), labels
-    X_fs, y_fs = feats(df_fs)
-    X_te, y_te = feats(df_test)
-    X_syn, _ = feats(syn_sig, syn_lab)
-    X_tr, y_tr = cache['X_train_top'], cache['y_train']
-
-    X_base = np.concatenate([X_tr, X_fs]); y_base = np.concatenate([y_tr, y_fs])
-    X_aug = np.concatenate([X_tr, X_fs, X_syn]); y_aug = np.concatenate([y_tr, y_fs, syn_lab])
-    m_base = evaluate_classifier(train_stacking_classifier(X_base, y_base, init_seed, n_jobs=n_jobs), X_te, y_te)
-    m_aug = evaluate_classifier(train_stacking_classifier(X_aug, y_aug, init_seed, n_jobs=n_jobs), X_te, y_te)
-    print(f"[FEWSHOT] k={fewshot_k}/class | fewshot-aug acc={m_aug['accuracy']:.4f} | fewshot-only acc={m_base['accuracy']:.4f} | lift={m_aug['accuracy']-m_base['accuracy']:+.4f}")
-
-    return {'model': f'{model_name}_fewshot', 'region': region, 'cv_mode': 'loso', 'init_seed': init_seed,
-            'split_seed': split_seed, 'fold': fold, 'fewshot_k': fewshot_k, 'n_test': len(y_te),
-            'augmentation_ratio': augmentation_ratio, 'n_synthetic': n_syn,
-            'metrics': m_aug, 'metrics_realonly': m_base, 'trtr_metrics': cache['trtr_metrics']}
-
 def _feat_top(df_long: pd.DataFrame, cache: dict, n_jobs: int) -> np.ndarray:
     """Extract the cached top-20 features from long-format data and return the sanitized-ordered matrix."""
     X = extract_fixed_features(df_long, cache['top_20_features_raw'], n_jobs)
     X.columns = [re.sub(r'[^\w]', '_', c) for c in X.columns]
     return X[cache['top_20_features_sanitized']].values
 
-def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '', phys_residual: bool = False, class_transport: bool = False, parametric_source: bool = False, learn_cir_params: bool = False, ode: bool = False, subj_adv_lambda: float = 0.0, diff_hidden: int = 64, n_steps: int = 200, gan_hidden: int = 64, gan_loss: str = 'bce', gan_lr_d: float = None, lr: float = 1e-3, include_subjects: tuple = (), cir_tag: str = '', preprocessing: str = 'raw', phys_prep: str = 'peakscale', hp_tag: str = '', aug_ratio: float = 1.0, real_fraction: float = 1.0, filter_conf: float = -1.0, filter_div_keep: float = -1.0, fewshot_k: int = 0, ensemble_model: str = '', aug_source: str = 'gen') -> str:
+def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '', phys_residual: bool = False, class_transport: bool = False, parametric_source: bool = False, learn_cir_params: bool = False, ode: bool = False, subj_adv_lambda: float = 0.0, diff_hidden: int = 64, n_steps: int = 200, gan_hidden: int = 64, gan_loss: str = 'bce', gan_lr_d: float = None, lr: float = 1e-3, include_subjects: tuple = (), cir_tag: str = '', preprocessing: str = 'raw', phys_prep: str = 'peakscale', hp_tag: str = '', aug_ratio: float = 1.0, real_fraction: float = 1.0, ensemble_model: str = '', aug_source: str = 'gen') -> str:
     """Build the generator artifact id encoding the model and its config flags.
 
     Assembles a per-model-family base id (region, seed, dims, model-specific markers) and appends
@@ -1061,12 +927,6 @@ def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim:
         run_id += f'_augr{aug_ratio}'
     if real_fraction != 1.0:
         run_id += f'_rf{real_fraction}'
-    if filter_conf >= 0:
-        run_id += f'_filt{filter_conf}'
-    if filter_div_keep >= 0:
-        run_id += f'_fdiv{filter_div_keep}'
-    if fewshot_k > 0:
-        run_id += f'_fsk{fewshot_k}'
     if ensemble_model:
         run_id += f'_ens{ensemble_model}'
     if aug_source != 'gen':
@@ -1120,9 +980,7 @@ def main():
     if args.region is None:
         raise SystemExit('[TSTR] --region is required (except with --aggregate)')
 
-    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=(args.real_fraction if args.mode == 'tstr_plus' else 1.0), filter_conf=(args.filter_conf if args.mode == 'tstr_plus' else -1.0), filter_div_keep=(args.filter_div_keep if args.mode == 'tstr_plus' else -1.0), fewshot_k=(args.fewshot_k if args.mode == 'fewshot' else 0), ensemble_model=args.ensemble_model, aug_source=(args.aug_source if args.mode == 'tstr_plus' else 'gen'))
-    # generator checkpoints are preprocessing-agnostic (trained on raw signals, no prep marker);
-    # locate them with a prep-'raw' id while results are saved under the prep-tagged run_id above.
+    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=(args.real_fraction if args.mode == 'tstr_plus' else 1.0), ensemble_model=args.ensemble_model, aug_source=(args.aug_source if args.mode == 'tstr_plus' else 'gen'))
     ckpt_run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing='raw', phys_prep=args.phys_prep, hp_tag=args.hp_tag)
     # ensemble second-generator checkpoint id (tpinn = tpinn-res @ stdscale, the champion physics model)
     ensemble_ckpt_run_id = None
@@ -1177,15 +1035,8 @@ def main():
         return
 
     # train-synthetic-test-real
-    if args.mode == 'fewshot':
-        result = tstr_fewshot(cache, args.model, args.region, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, ckpt_run_id, fewshot_k=args.fewshot_k, augmentation_ratio=args.augmentation_ratio, dataset_dir=args.dataset_dir, n_folds=args.n_folds, preprocessing=args.preprocessing, include_subjects=include_subjects)
-        result['subset'] = sub_value
-        result['prep'] = args.preprocessing
-        save_result(result, result['model'], run_id)
-        if not args.no_summary:
-            save_summary(result)
-    elif args.mode == 'tstr_plus':
-        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, cv_mode=args.cv_mode, preprocessing=args.preprocessing, ckpt_run_id=ckpt_run_id, real_fraction=args.real_fraction, filter_conf=args.filter_conf, filter_div_keep=args.filter_div_keep, aug_source=args.aug_source, dataset_dir=args.dataset_dir, n_folds=args.n_folds, include_subjects=include_subjects)
+    if args.mode == 'tstr_plus':
+        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, cv_mode=args.cv_mode, preprocessing=args.preprocessing, ckpt_run_id=ckpt_run_id, real_fraction=args.real_fraction, aug_source=args.aug_source, dataset_dir=args.dataset_dir, n_folds=args.n_folds, include_subjects=include_subjects)
         result['subset'] = sub_value
         result['phys_variant'] = phys_variant
         result['cir'] = args.cir_tag

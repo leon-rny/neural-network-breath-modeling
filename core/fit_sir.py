@@ -47,12 +47,7 @@ def preprocess_cir(humidity, temperature):
     return humidity - baseline_h, temperature - baseline_t
 
 def common_time_grid(df):
-    """Build a uniform common time grid shared across all trials in `df`.
-
-    Trial lengths/durations differ slightly, so we use the median per-trial dt
-    and the minimum common end time (so every trial fully covers the grid),
-    starting at the maximum start time (typically 0).
-    """
+    """Build a uniform common time grid shared across all trials in `df`."""
     times = df["time"].values
     dts = [float(np.median(np.diff(t))) for t in times]
     dt = float(np.median(dts))
@@ -62,11 +57,7 @@ def common_time_grid(df):
     return t_start + np.arange(n) * dt
 
 def cir_stats(df, t_grid):
-    """Resample each trial onto `t_grid` (via np.interp) then average over trials.
-
-    Returns (mean_humidity, mean_temperature, std_humidity, std_temperature),
-    each aligned to `t_grid`.
-    """
+    """Resample each trial onto `t_grid` (via np.interp) then average over trials."""
     humidity_all = np.stack([np.interp(t_grid, t, h)
                              for t, h in zip(df["time"].values, df["humidity"].values)])
     temperature_all = np.stack([np.interp(t_grid, t, tp)
@@ -128,9 +119,6 @@ def sensor_kernel_biexp(t, tau_fast, alpha, tau_slow):
 def system_impulse_response(time, A, D, v, t_shift, sensor_fn):
     """Channel response convolved with a sensor kernel, sampled on `time`.
 
-    Convolves advection_diffusion(time, A, D, v, t_shift) with sensor_fn
-    evaluated on a uniform kernel grid, then truncates to the input length.
-
     :param time: uniformly sampled time (s), shape (N,).
     :param A: channel amplitude scale.
     :param D: diffusion coefficient (m^2/s).
@@ -150,11 +138,7 @@ def system_impulse_response(time, A, D, v, t_shift, sensor_fn):
 
 # fitting
 def fit_sir(signal, tau_s_humidity=TAU_S_HUMIDITY):
-    """Fit humidity (A, D, v, t_shift) and temperature (A, tau_fast, alpha, tau_slow).
-
-    Returns (params_humidity, params_temperature, loss_humidity, loss_temperature),
-    where the losses are the final differential_evolution objective (MSE) values.
-    """
+    """Fit humidity (A, D, v, t_shift) and temperature (A, tau_fast, alpha, tau_slow)."""
     time = signal["time"]
     h, t_data = preprocess_cir(signal["humidity"], signal["temperature"])
 
@@ -208,7 +192,7 @@ def _r2(signal, params_h, params_t, tau_s_humidity=TAU_S_HUMIDITY):
 
 # driver
 def fit_group(df_group, label):
-    """Average over trials and fit; print a report; return the humidity 4-vector."""
+    """Average over trials and fit, print a report, return the humidity 4-vector."""
     t_grid = common_time_grid(df_group)
     hum_mean, temp_mean, _, _ = cir_stats(df_group, t_grid)
     signal = dict(time=t_grid, humidity=hum_mean, temperature=temp_mean)
@@ -252,7 +236,7 @@ def main():
     for region in regions:
         df_r = df_long[df_long["region"] == region]
         if df_r.empty:
-            print(f"[warn] no sir_long trials for region={region}; skipping.")
+            print(f"[warn] no sir_long trials for region={region}, skipping.")
             continue
         params_h = fit_group(df_r, f"GENERIC region={region}")
         out_path = os.path.join(out_dir, f"params_{region}.npy")
@@ -265,7 +249,7 @@ def main():
             for cls in CLASSES:
                 df_rc = df_sir[(df_sir["region"] == region) & (df_sir["class"] == cls)]
                 if df_rc.empty:
-                    print(f"[warn] no trials for region={region}, class={cls}; skipping.")
+                    print(f"[warn] no trials for region={region}, class={cls}, skipping.")
                     continue
                 params_h = fit_group(df_rc, f"PER-CLASS region={region} class={cls}")
                 out_path = os.path.join(out_dir, f"params_{region}_{cls}.npy")

@@ -10,8 +10,6 @@ import pandas as pd
 
 from core.data import load_dataset, n_loso_folds, subset_tag
 
-# --- shared config (inlined from the former four-objective sweep) ---
-# objective -> (mode, cv_mode, part_dropout)
 OBJECTIVES = {
     'tstr': ('tstr', 'kfold', 0.0),
     'loso': ('tstr', 'loso', 0.1),
@@ -34,7 +32,6 @@ SPACE = {
 }
 AUGR = [0.5, 1.0, 2.0, 3.0]
 N_CONFIGS = 16
-
 
 def sample_configs(model, objective, mi, oi):
     """Deterministic per (model, objective): config 0 = anchor, rest = seeded random samples from SPACE."""
@@ -60,9 +57,7 @@ def sample_configs(model, objective, mi, oi):
         cfgs.append(c)
     return cfgs
 
-# ---------------------------------------------------------------------------
 # protocol constants
-# ---------------------------------------------------------------------------
 PILOT_SEEDS = [0, 1, 7, 42, 123]   # full seed grid for the noise-floor pilot
 SELECT_SEEDS = [0, 1, 7]           # inner-selection seeds (inner folds already average a lot)
 FULL_SEEDS = [0, 1, 7, 42, 123]    # Stage-B final seed grid
@@ -73,33 +68,28 @@ N_PILOT_CONFIGS = 6                # anchor + 5 diverse, to gauge config sensiti
 N_SEARCH_CONFIGS = 12              # deterministic config shortlist enumerated by the nested search
 HP_KEYS = ('ld', 'ed', 'ped', 'fb', 'bm', 'alpha', 'ncop', 'augr')
 
-# physics flags for the tpinn anchor/search (mirrors experiments/41_tune_four_objectives.sh)
+# physics flags
 TPINN_PHYS = dict(phys_residual=True, phys_prep='stdscale')
-
 
 def _phys_flags(model: str) -> dict:
     """Return the physics build-id flags for `model` ({} for cvae_part, residual+stdscale for tpinn)."""
     return dict(TPINN_PHYS) if model == 'tpinn' else dict(phys_residual=False, phys_prep='peakscale')
-
 
 def _complexity(cfg: dict) -> tuple:
     """Sort key for the 1-SE rule: prefer the simplest (smallest-capacity, most-regularised) config.
     Lower is simpler: small latent+embed capacity, then larger free_bits, then lower cfg_id."""
     return (cfg['ld'] + cfg['ed'] + cfg['ped'], -float(cfg['fb']), int(cfg.get('cfg_id', 0)))
 
-
 def _pilot_configs(model: str, mi: int) -> list[dict]:
     """Anchor (cfg 0) + a diverse spread of configs (with augr) to estimate config sensitivity."""
     oi = list(OBJECTIVES).index('losop')
     return sample_configs(model, 'losop', mi, oi)[:N_PILOT_CONFIGS]
-
 
 def _search_configs(model: str, cv: str, mi: int) -> list[dict]:
     """Deterministic config shortlist for the nested search (uses the augr-bearing '+' sampler)."""
     objective = 'losop' if cv == 'loso' else 'tstrp'
     oi = list(OBJECTIVES).index(objective)
     return sample_configs(model, objective, mi, oi)[:N_SEARCH_CONFIGS]
-
 
 def _anchor_cfg(model: str) -> dict:
     """Committed anchor config dict (augr=1.0, cfg_id=0)."""
@@ -108,10 +98,7 @@ def _anchor_cfg(model: str) -> dict:
     c['cfg_id'] = 0
     return c
 
-
-# ---------------------------------------------------------------------------
 # scoring (one trained checkpoint -> per-draw accuracies for one objective)
-# ---------------------------------------------------------------------------
 def _features_from_long(df_long, cache, extract_fixed_features, n_jobs):
     """Extract the cache's top-20 (sanitised) feature matrix from a tsfresh long-format frame."""
     X_raw = extract_fixed_features(df_long, cache['top_20_features_raw'], n_jobs)
@@ -119,10 +106,7 @@ def _features_from_long(df_long, cache, extract_fixed_features, n_jobs):
     X_san.columns = [re.sub(r'[^\w]', '_', c) for c in X_san.columns]
     return X_san[cache['top_20_features_sanitized']].values
 
-
-def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, cv_mode, part_dropout,
-          ld, ed, ped, fb, alpha, ncop, augr, hp_tag, include_subjects, n_draws, eval_val,
-          outer, inner, cfg_id=-1, n_jobs=1, dataset_dir='dataset', device=None) -> dict:
+def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, cv_mode, part_dropout, ld, ed, ped, fb, alpha, ncop, augr, hp_tag, include_subjects, n_draws, eval_val, outer, inner, cfg_id=-1, n_jobs=1, dataset_dir='dataset', device=None) -> dict:
     """Score one trained generator for one objective over `n_draws` synthetic resamples.
 
     Loads the matching checkpoint (built by `core.train` with the same flags), reuses/builds the
@@ -185,7 +169,7 @@ def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, c
             y_tr = np.concatenate([cache['y_train'], synth_y])
         else:
             X_tr, y_tr = X_synth, synth_y
-        clf = train_stacking_classifier(X_tr, y_tr, init_seed, n_jobs=n_jobs)   # fixed seed -> draw isolates sampling noise
+        clf = train_stacking_classifier(X_tr, y_tr, init_seed, n_jobs=n_jobs) # fixed seed -> draw isolates sampling noise
         m = evaluate_classifier(clf, cache['X_test_top'], cache['y_test'])
         test_acc.append(m['accuracy'])
         test_f1.append(m['f1_weighted'])
@@ -201,7 +185,6 @@ def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, c
             'eval_val': bool(eval_val), 'n_train': cache['n_train'], 'n_synthetic': n_synth,
             'test_acc': test_acc, 'test_f1': test_f1, 'val_acc': val_acc,
             'trtr_acc': cache['trtr_metrics']['accuracy'], 'run_id': run_id}
-
 
 def run_score(args) -> None:
     """CLI: score one checkpoint for one objective and write the result JSON under results/tuning/<stage>/."""
@@ -220,17 +203,13 @@ def run_score(args) -> None:
     print(f"[SCORE] {args.stage} {args.objective} {args.model} {args.region} outer={args.outer} "
           f"inner={args.inner} seed={args.seed} -> test_acc={acc:.4f} (n_draws={args.n_draws}) -> {out}")
 
-
-# ---------------------------------------------------------------------------
 # manifest generation (one row per SLURM array task)
-# ---------------------------------------------------------------------------
 PILOT_COLS = ['model', 'cv', 'region', 'cfg_id', 'hptag', 'ld', 'ed', 'ped', 'fb', 'bm', 'alpha',
               'ncop', 'augr', 'pd', 'seed', 'fold', 'nf', 'n_draws']
 SEARCH_COLS = ['model', 'cv', 'region', 'cfg_id', 'hptag', 'ld', 'ed', 'ped', 'fb', 'bm', 'alpha',
                'ncop', 'augr', 'pd', 'seed', 'outer', 'inner', 'include', 'nf', 'eval_val', 'n_draws']
 FINAL_COLS = ['model', 'objective', 'cv', 'region', 'which', 'cfg_id', 'hptag', 'ld', 'ed', 'ped',
               'fb', 'bm', 'alpha', 'ncop', 'augr', 'pd', 'seed', 'fold', 'nf', 'n_draws']
-
 
 def _write_tsv(cols: list[str], rows: list[list], out: str) -> None:
     """Write a header + tab-separated rows manifest, the format the SLURM array scripts `sed`-read."""
@@ -239,7 +218,6 @@ def _write_tsv(cols: list[str], rows: list[list], out: str) -> None:
         for r in rows:
             f.write('\t'.join(str(x) for x in r) + '\n')
     print(f'[MANIFEST] wrote {len(rows)} rows to {out}')
-
 
 def pilot_manifest(out: str, dataset_dir: str = 'dataset') -> None:
     """Enumerate the pilot grid: models x cv x regions x (anchor+diverse) x seeds x all folds.
@@ -250,7 +228,7 @@ def pilot_manifest(out: str, dataset_dir: str = 'dataset') -> None:
         cfgs = _pilot_configs(model, mi)
         for cv in ('kfold', 'loso'):
             nf = 5 if cv == 'kfold' else nloso
-            pd_ = 0.0 if cv == 'kfold' else 0.1   # null-token dropout required for LOSO generation
+            pd_ = 0.0 if cv == 'kfold' else 0.1 # null-token dropout required for LOSO generation
             for region in REGIONS:
                 for cid, c in enumerate(cfgs):
                     hptag = f'p0{MODEL0[model]}c{cid:02d}'
@@ -260,7 +238,6 @@ def pilot_manifest(out: str, dataset_dir: str = 'dataset') -> None:
                                          c['fb'], c['bm'], c['alpha'], c['ncop'], c['augr'], pd_,
                                          seed, fold, nf, N_DRAWS_PILOT])
     _write_tsv(PILOT_COLS, rows, out)
-
 
 def nsearch_manifest(out: str, dataset_dir: str = 'dataset') -> None:
     """Enumerate the nested Stage-A inner-selection grid (outer test fold NEVER trained on).
@@ -298,7 +275,6 @@ def nsearch_manifest(out: str, dataset_dir: str = 'dataset') -> None:
                                          N_DRAWS_SEL])
     _write_tsv(SEARCH_COLS, rows, out)
 
-
 def nfinal_manifest(winners_path: str, out: str, dataset_dir: str = 'dataset') -> None:
     """Expand a winners JSON (per-outer-fold selected config + anchor) into the Stage-B grid:
     each outer fold's selected config and the fixed anchor, refit on the untouched outer test
@@ -326,10 +302,7 @@ def nfinal_manifest(winners_path: str, out: str, dataset_dir: str = 'dataset') -
                              anc['augr'], pd_, seed, outer, nf, N_DRAWS_FINAL])
     _write_tsv(FINAL_COLS, rows, out)
 
-
-# ---------------------------------------------------------------------------
 # analysis: pilot report (noise floor + MDD + gate)
-# ---------------------------------------------------------------------------
 def _load_jsons(directory: str) -> list[dict]:
     """Load every *.json result written by `run_score` in `directory`."""
     out = []
@@ -337,7 +310,6 @@ def _load_jsons(directory: str) -> list[dict]:
         with open(p) as f:
             out.append(json.load(f))
     return out
-
 
 def pilot_report(directory: str = 'results/tuning/pilot', out: str = 'results/tuning/pilot_report.csv') -> pd.DataFrame:
     """Decompose the pilot variance and emit the noise floor, MDD and gate verdict per (model, objective, region).
@@ -396,17 +368,12 @@ def pilot_report(directory: str = 'results/tuning/pilot', out: str = 'results/tu
         print(df.to_string(index=False))
     return df
 
-
-# ---------------------------------------------------------------------------
-# analysis: nested selection (1-SE rule, per outer fold)
-# ---------------------------------------------------------------------------
+# analysis: nested selection
 def _select_units(r: dict) -> list[float]:
     """Per-draw selection accuracies for a Stage-A row: val_acc for kfold (eval_val), else test_acc."""
     return r['val_acc'] if r['eval_val'] and r['val_acc'] else r['test_acc']
 
-
-def select_nested(directory: str = 'results/tuning/nsearch',
-                  out: str = 'results/tuning/nested_winners.json') -> dict:
+def select_nested(directory: str = 'results/tuning/nsearch', out: str = 'results/tuning/nested_winners.json') -> dict:
     """Pick, per (model, objective, region, outer fold), the config chosen by the 1-SE rule.
 
     Inner score per config = mean over its selection units (kfold: val draws x seeds; loso: test
@@ -414,7 +381,7 @@ def select_nested(directory: str = 'results/tuning/nsearch',
     take the simplest (`_complexity`). Writes a winners JSON consumed by `nfinal_manifest`.
     """
     rows = _load_jsons(directory)
-    # objective is a property of (cv, mode); a Stage-A row covers both objectives of its cv.
+    # objective is a property of (cv, mode), a Stage-A row covers both objectives of its cv.
     winners: dict = {}
     for model in MODELS:
         for region in REGIONS:
@@ -450,7 +417,7 @@ def select_nested(directory: str = 'results/tuning/nsearch',
                                                                'best_score': round(means[best], 4)}
                 if per_fold:
                     anc = _anchor_cfg(model)
-                    if mode == 'tstr_plus':  # keep the anchor's committed augmentation ratio
+                    if mode == 'tstr_plus': # keep the anchor's committed augmentation ratio
                         anc['augr'] = 1.0
                     winners[f'{model}|{objective}|{region}'] = {'per_fold': per_fold, 'anchor': anc}
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -462,10 +429,7 @@ def select_nested(directory: str = 'results/tuning/nsearch',
         print(f'  {k}: per-fold cfg_ids={picks}')
     return winners
 
-
-# ---------------------------------------------------------------------------
-# analysis: final report (headline +/- CI, paired test vs anchor, MDD gate)
-# ---------------------------------------------------------------------------
+# analysis: final report
 def _paired_test(deltas: np.ndarray) -> float:
     """Two-sided p-value that the paired (sel - anchor) differences are non-zero (Wilcoxon, else t)."""
     deltas = np.asarray(deltas, dtype=float)
@@ -482,10 +446,7 @@ def _paired_test(deltas: np.ndarray) -> float:
         z = m / (s / np.sqrt(len(deltas)))
         return float(2 * (1 - NormalDist().cdf(abs(z))))
 
-
-def final_report(directory: str = 'results/tuning/nfinal',
-                 pilot_csv: str = 'results/tuning/pilot_report.csv',
-                 out: str = 'results/tuning/nested_final_report.csv') -> pd.DataFrame:
+def final_report(directory: str = 'results/tuning/nfinal', pilot_csv: str = 'results/tuning/pilot_report.csv', out: str = 'results/tuning/nested_final_report.csv') -> pd.DataFrame:
     """Headline +/- CI for selected vs anchor per (model, objective, region), with a paired test.
 
     Pairs the inner-selected config against the anchor by (outer fold, seed) on the untouched outer
@@ -499,7 +460,7 @@ def final_report(directory: str = 'results/tuning/nfinal',
         for _, r in pdf.iterrows():
             mdd_lookup[(r['model'], r['objective'], r['region'])] = float(r['mdd'])
 
-    # group by (model,objective,region) -> {sel|anchor: {(outer,seed): mean test acc over draws}}
+    # group by (model,objective,region)
     grp = {}
     for r in rows:
         key = (r['model'], r['objective'], r['region'])
@@ -535,16 +496,13 @@ def final_report(directory: str = 'results/tuning/nfinal',
         print(df.to_string(index=False))
     return df
 
-
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the pilot/nested-search/final subcommands."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
 
-    s = sub.add_parser('score', help='score one checkpoint for one objective (called per SLURM task)')
+    s = sub.add_parser('score')
     s.add_argument('--stage', required=True, choices=['pilot', 'nsearch', 'nfinal'])
     s.add_argument('--model', required=True, choices=MODELS)
     s.add_argument('--region', required=True, choices=REGIONS)
@@ -591,7 +549,6 @@ def parse_args() -> argparse.Namespace:
     nr.add_argument('--out', default='results/tuning/nested_final_report.csv')
     return p.parse_args()
 
-
 def main() -> None:
     """Dispatch the requested subcommand."""
     args = parse_args()
@@ -609,7 +566,6 @@ def main() -> None:
         select_nested(args.dir, args.out)
     elif args.cmd == 'nreport':
         final_report(args.dir, args.pilot, args.out)
-
 
 if __name__ == '__main__':
     main()

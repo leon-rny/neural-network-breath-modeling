@@ -111,18 +111,11 @@ def loso_split_dataset(df: pd.DataFrame, fold: int, val_fold: int | None = None,
     """
     Leave-one-subject-out split returning (train, val, test) DataFrames.
 
-    The held-out TEST subject is `subjects[fold]`. The VAL subject is a *different held-out
-    subject* (never trials of the test subject - this is what keeps the split leakage-free):
-    by default the deterministic neighbour `subjects[(fold+1) % n]`, or `subjects[val_fold]`
-    if given (so the nested-LOSO orchestration can sweep it). Train = all remaining subjects.
-
-    With n subjects this yields train=(n-2), val=1, test=1 subjects (n=3 -> 1/1/1; n=6 -> 4/1/1).
-
     :param df: DataFrame containing the dataset.
     :param fold: 0-indexed test-subject position in sorted(participant), in [0, n_subjects).
-    :param val_fold: 0-indexed val-subject position; defaults to the neighbour of `fold`.
+    :param val_fold: 0-indexed val-subject position, defaults to the neighbour of `fold`.
     :param val_size: unused (kept for signature parity with kfold_split_dataset).
-    :param split_seed: unused (subject partition is deterministic); kept for parity.
+    :param split_seed: unused (subject partition is deterministic), kept for parity.
     :return: A tuple of (train_df, val_df, test_df) DataFrames.
     """
     subjects = sorted(df['participant'].unique())
@@ -144,14 +137,6 @@ def loso_split_dataset(df: pd.DataFrame, fold: int, val_fold: int | None = None,
 def loso_split_final(df: pd.DataFrame, test_subject_idx: int, exclude_subject_idxs: tuple = (), val_size: float = 0.15, split_seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Nested-LOSO building block returning (train, earlystop_val, test) DataFrames.
-
-    `test` is the held-out subject `subjects[test_subject_idx]`. `train`+`earlystop_val` come
-    from the *training pool* = all subjects except the test subject and `exclude_subject_idxs`,
-    split at the TRIAL level (subject-mixed) - the early-stop/checkpoint val is only ever trials
-    from the training pool, never the scored subject and never an excluded subject. This single
-    helper expresses both nested stages:
-      - Stage A (select): exclude={outer test t}, test=val subject v  -> train on n-2 subjects.
-      - Stage B (final):  exclude={},            test=t               -> train on n-1 subjects.
 
     :param df: DataFrame containing the dataset.
     :param test_subject_idx: 0-indexed test-subject position in sorted(participant).
@@ -181,8 +166,7 @@ def loso_split_final(df: pd.DataFrame, test_subject_idx: int, exclude_subject_id
     df_val = df_val.reset_index(drop=True)
     df_test = df_test.reset_index(drop=True)
 
-    # leakage assertions (the subtle path): early-stop val must be trials from the pool only,
-    # never the scored subject and never an excluded subject - checked on every call.
+    # leakage assertions
     train_subs, val_subs = set(df_train['participant']), set(df_val['participant'])
     assert val_subs <= set(pool_subjects), f'earlystop_val leaked outside training pool: {val_subs - set(pool_subjects)}'
     assert test_subj not in train_subs and test_subj not in val_subs, f'test subject {test_subj!r} leaked into train/val'
@@ -190,9 +174,7 @@ def loso_split_final(df: pd.DataFrame, test_subject_idx: int, exclude_subject_id
     return df_train, df_val, df_test
 
 def loso_path_tag(loso_trial_val: bool, exclude_subject_idxs: tuple = ()) -> str:
-    """Path-only marker namespacing nested-LOSO artifacts so they never collide with a plain
-    `_loso` run or with each other (Stage A vs Stage B differ by the exclude set). The reported
-    result row still carries cv_mode='loso' - this only disambiguates filenames."""
+    """Path-only marker namespacing nested-LOSO artifacts so they never collide"""
     if not loso_trial_val:
         return ''
     tag = '_nested'
@@ -201,30 +183,25 @@ def loso_path_tag(loso_trial_val: bool, exclude_subject_idxs: tuple = ()) -> str
     return tag
 
 def subset_tag(include_subjects: tuple = ()) -> str:
-    """Path/dedup marker for a participant-subset run; empty -> '' so full-pool runs stay byte-identical."""
+    """Path/dedup marker for a participant-subset run, empty -> '' so full-pool runs stay byte-identical."""
     if not include_subjects:
         return ''
     return '_sub' + ''.join(sorted(str(s) for s in include_subjects))
 
 def cir_marker(cir_tag: str = '') -> str:
-    """run_id/summary marker for an alternate fitted CIR channel (e.g. '300s'); empty = active default channel."""
+    """run_id/summary marker for an alternate fitted CIR channel (e.g. '300s'), empty = active default channel."""
     return '' if not cir_tag else f'_cir{cir_tag}'
 
 def prep_marker(preprocessing: str = 'raw') -> str:
-    """run_id/summary marker for a signal-preprocessing variant before feature extraction; raw = current default."""
+    """run_id/summary marker for a signal-preprocessing variant before feature extraction, raw = current default."""
     return '' if preprocessing in ('', 'raw') else f'_prep{preprocessing}'
 
 def phys_prep_marker(phys_prep: str = 'peakscale') -> str:
-    """run_id/summary marker for the physics-generator input normalization (PhysicsInformedDataset); peakscale = current default."""
+    """run_id/summary marker for the physics-generator input normalization (PhysicsInformedDataset), peakscale = current default."""
     return '' if phys_prep in ('', 'peakscale') else f'_pp{phys_prep}'
 
 def get_split(df: pd.DataFrame, cv_mode: str, fold: int, n_folds: int, split_seed: int = 42, val_size: float = 0.15, exclude_subjects: tuple = (), loso_trial_val: bool = False, include_subjects: tuple = ()) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Dispatch to the k-fold or LOSO splitter. `fold` is 0-indexed in both modes.
-    Under LOSO the fold count is derived from the data (see `n_loso_folds`), so `n_folds`
-    is ignored there. When `loso_trial_val` is set, routes to the nested `loso_split_final`
-    (trial-level early-stop val + subject excludes); otherwise the plain subject-level-val LOSO.
-    `include_subjects` (participant letters) restricts the whole split to a participant subset
-    (empty = full pool); LOSO auto-resizes its fold count to the subset."""
+    """Dispatch to the k-fold or LOSO splitter."""
     if include_subjects:
         df = df[df['participant'].isin(include_subjects)].reset_index(drop=True)
     if cv_mode == 'loso':
@@ -238,11 +215,10 @@ def get_split(df: pd.DataFrame, cv_mode: str, fold: int, n_folds: int, split_see
 class BreathDataset(Dataset):
     """PyTorch Dataset of z-score normalised breath signals (humidity, temperature)."""
 
-    def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None,
-                 alpha: float = 0.0, n_copies: int = 1) -> None:
+    def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None, alpha: float = 0.0, n_copies: int = 1) -> None:
         """
         :param dataframe: DataFrame of trials as returned by load_dataset.
-        :param stats: Normalisation stats dict; computed from this data if None (pass the
+        :param stats: Normalisation stats dict, computed from this data if None (pass the
             train stats to val/test to avoid leakage).
         :param alpha: Std of Gaussian noise added to the signal (0 disables augmentation).
         :param n_copies: Number of times each trial is repeated (>=1) for noise augmentation.
@@ -295,18 +271,17 @@ class BreathDataset(Dataset):
 class PhysicsInformedDataset(Dataset):
     """Dataset for the physics generator: baseline-corrected, rise-from-zero signals with onset index."""
 
-    def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None,
-                 alpha: float = 0.0, n_copies: int = 1, phys_prep: str = 'peakscale') -> None:
+    def __init__(self, dataframe: pd.DataFrame, stats: dict | None = None, alpha: float = 0.0, n_copies: int = 1, phys_prep: str = 'peakscale') -> None:
         """
         :param dataframe: DataFrame of trials as returned by load_dataset.
-        :param stats: Normalisation stats dict; computed from this data if None (pass the
+        :param stats: Normalisation stats dict, computed from this data if None (pass the
             train stats to val/test to avoid leakage).
         :param alpha: Std of Gaussian noise added to the signal (0 disables augmentation).
         :param n_copies: Number of times each trial is repeated (>=1) for noise augmentation.
-        :param phys_prep: Input-normalization mode; overridden by stats['phys_prep'] when stats are passed.
+        :param phys_prep: Input-normalization mode, overridden by stats['phys_prep'] when stats are passed.
         """
         self.records = dataframe.to_dict('records')
-        self.phys_prep = phys_prep   # input-normalization mode; overridden by stats['phys_prep'] when stats are passed
+        self.phys_prep = phys_prep   # input-normalization mode, overridden by stats['phys_prep'] when stats are passed
         self.stats = stats if stats is not None else self._compute_stats()
         self.alpha = alpha
         self.n_copies = max(n_copies, 1)
@@ -327,11 +302,8 @@ class PhysicsInformedDataset(Dataset):
             h_bc.append(hc)
             t_bc.append(tc)
         h_scale = float(np.max(h_peak_devs) * 1.2)
-        # t_scale mirrors h_scale so temperature is baseline-corrected & rise-from-zero like humidity
-        # (matches the non-negative physics transient and balances the per-channel recon loss)
         t_scale = float(np.max(t_peak_devs) * 1.2)
-        # extra scales for the --phys_prep ablation (unused by the default 'peakscale' path)
-        shared_scale = float(max(h_scale, t_scale))                       # one Lewis-coupled scale for both channels
+        shared_scale = float(max(h_scale, t_scale))
         h_bcstd = float(np.concatenate(h_bc).std())
         t_bcstd = float(np.concatenate(t_bc).std())
 
@@ -371,7 +343,7 @@ class PhysicsInformedDataset(Dataset):
                 onset_idx = i
                 break
         
-        # normalize - both channels baseline-corrected; scaling depends on the phys_prep mode
+        # normalize - both channels baseline-corrected
         mode = self.stats.get('phys_prep', 'peakscale')
         t_bc = r['temperature'] - np.mean(r['temperature'][:5])
         if mode == 'shared': # one Lewis-coupled scale for both channels

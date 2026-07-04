@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from core.data import BreathDataset, PhysicsInformedDataset, load_dataset, get_split, subset_tag, cir_marker, phys_prep_marker
 from core.utils import seed_everything, seed_worker, make_generator
-from models.vae import VAE, CVAE, elbo_loss, mmd_rbf, soft_dtw
+from models.vae import VAE, CVAE, elbo_loss
 from models.pinn import PhysicsInformedCVAE, SharedTransportPINN
 from models.diffusion import ConditionalDiffusion
 from models.gan import Generator, Discriminator
@@ -45,11 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--embed_dim', type=int, default=8)     # ablation default
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--free_bits', type=float, default=0.0)
-    p.add_argument('--mmd_lambda', type=float, default=0.0, help='InfoVAE-style latent MMD(q(z),N(0,I)) weight; >0 closes the prior-posterior gap for better generative coverage (research idea #6). Namespace checkpoints with --hp_tag mmd<lambda>.')
-    p.add_argument('--shape_lambda', type=float, default=0.0, help='Shape-aware recon: weight on MSE of the temporal derivative (slope) of x_hat vs x; sharpens the discriminative onset/slope transient (cheap soft-DTW alternative, research idea #3). Namespace with --hp_tag shape<lambda>.')
-    p.add_argument('--coral_lambda', type=float, default=0.0, help='CORAL domain generalization (research #5): penalize per-subject latent covariance mismatch (subject=domain) for subject-invariance -> LOSO. --hp_tag coral<lambda>.')
-    p.add_argument('--vrex_lambda', type=float, default=0.0, help='VREx domain generalization (research #5): penalize variance of per-subject reconstruction loss for equal cross-subject fidelity -> LOSO. --hp_tag vrex<lambda>.')
-    p.add_argument('--sdtw_lambda', type=float, default=0.0, help='Proper soft-DTW reconstruction loss weight (research #3): elastic-alignment term added to recon; tolerant to onset/phase jitter. --hp_tag sdtw<lambda>.')
+    p.add_argument('--shape_lambda', type=float, default=0.0)   # weight on the temporal-derivative (slope) recon term
     p.add_argument('--part_dropout', type=float, default=0.0)
     p.add_argument('--include_subjects', default='')
     p.add_argument('--cir_tag', default='')
@@ -62,10 +58,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--tau_s', type=float, default=15.0)
     p.add_argument('--learn_cir_params', action='store_true')
     p.add_argument('--phys_residual', action='store_true')
-    p.add_argument('--ode', action='store_true', help='tpinn UDE mode: integrate a driven first-order relaxation ODE (known sensor physics) + a learned neural residual over the 36-step grid, instead of the fixed CIR convolution (research idea #7).')
+    p.add_argument('--ode', action='store_true')   # UDE mode: relaxation ODE + neural residual instead of the CIR convolution
     p.add_argument('--class_transport', action='store_true')
     p.add_argument('--parametric_source', action='store_true')
-    # jittering augmentation (training only; defaults = off)
+    # jittering augmentation (training only, defaults = off)
     p.add_argument('--alpha', type=float, default=0.0)
     p.add_argument('--n_copies', type=int, default=1)
     p.add_argument('--hp_tag', default='')
@@ -81,34 +77,12 @@ def beta_capped(epoch: int, warmup_epochs: int, beta_max: float = 0.1) -> float:
     """Linear warmup from 0 -> beta_max over first half of training, then hold."""
     return min(beta_max, (epoch / warmup_epochs) * beta_max)
 
-def dg_penalties(x_hat, signal, z, participant, coral_lambda, vrex_lambda):
-    """Domain-generalization (subject=domain) penalties for subject-invariance -> LOSO (research #5).
-    CORAL = align per-subject latent covariances; VREx = equalize per-subject recon loss. Returns the added term."""
-    add = 0.0
-    subs = participant.unique()
-    if len(subs) < 2:
-        return add
-    if vrex_lambda > 0:
-        per = ((x_hat - signal) ** 2).mean(dim=(1, 2))
-        add = add + vrex_lambda * torch.stack([per[participant == s].mean() for s in subs]).var()
-    if coral_lambda > 0:
-        covs = []
-        for s in subs:
-            zs = z[participant == s]
-            if zs.shape[0] > 1:
-                zc = zs - zs.mean(0)
-                covs.append((zc.t() @ zc) / (zs.shape[0] - 1))
-        if len(covs) > 1:
-            mc = torch.stack(covs).mean(0)
-            add = add + coral_lambda * torch.stack([((c - mc) ** 2).sum() for c in covs]).mean()
-    return add
-
-def train_vae_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1, mmd_lambda=0.0, shape_lambda=0.0, coral_lambda=0.0, vrex_lambda=0.0, sdtw_lambda=0.0):
+def train_vae_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1, shape_lambda=0.0):
     """Train a (C)VAE for one epoch with beta-warmup ELBO.
 
     :param conditional: pass the class label to the model (cvae/cvae_part).
     :param use_participant: also pass the participant index (cvae_part).
-    :param mmd_lambda: if >0, add InfoVAE-style MMD(q(z), N(0,I)) to close the prior-posterior gap (better coverage).
+    :param shape_lambda: if >0, add a shape-aware (temporal-derivative) reconstruction term.
     :return: epoch-mean (loss, recon, kl).
     """
     model.train()
@@ -126,15 +100,8 @@ def train_vae_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, 
         else:
             x_hat, mu, logvar = model(signal)
         loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
-        if mmd_lambda > 0:
-            z = model.reparameterize(mu, logvar)
-            loss = loss + mmd_lambda * mmd_rbf(z, torch.randn_like(z))
         if shape_lambda > 0:
             loss = loss + shape_lambda * F.mse_loss(x_hat[:, :, 1:] - x_hat[:, :, :-1], signal[:, :, 1:] - signal[:, :, :-1])
-        if sdtw_lambda > 0:
-            loss = loss + sdtw_lambda * soft_dtw(x_hat, signal).mean()
-        if coral_lambda > 0 or vrex_lambda > 0:
-            loss = loss + dg_penalties(x_hat, signal, model.reparameterize(mu, logvar), participant.long().to(device), coral_lambda, vrex_lambda)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -241,10 +208,10 @@ def pinn_diag_stats(u_post_softplus, cir_params):
             'logD_mean': log_D.mean().item(), 'logD_std': log_D.std().item(),
             'logv_mean': log_v.mean().item(), 'logv_std': log_v.std().item()}
 
-def train_pinn_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, lambda_phys, beta_max=0.1, mmd_lambda=0.0, shape_lambda=0.0, coral_lambda=0.0, vrex_lambda=0.0, sdtw_lambda=0.0):
+def train_pinn_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, lambda_phys, beta_max=0.1, shape_lambda=0.0):
     """Train a (t)PINN for one epoch: loss = ELBO + lambda_phys * MSE(humidity_phys, x_hat humidity).
 
-    :param mmd_lambda: if >0, add InfoVAE-style MMD(q(z), N(0,I)) to close the prior-posterior gap (better coverage).
+    :param shape_lambda: if >0, add a shape-aware (temporal-derivative) reconstruction term.
     :return: dict of epoch-mean metrics ('total', 'recon', 'kl', 'phys') plus PINN_DIAG_KEYS.
     """
     model.train()
@@ -258,15 +225,8 @@ def train_pinn_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device,
         elbo, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
         phys = F.mse_loss(humidity_phys, x_hat[:, 0, :])
         loss = elbo + lambda_phys * phys
-        if mmd_lambda > 0:
-            z = model.reparameterize(mu, logvar)
-            loss = loss + mmd_lambda * mmd_rbf(z, torch.randn_like(z))
         if shape_lambda > 0:
             loss = loss + shape_lambda * F.mse_loss(x_hat[:, :, 1:] - x_hat[:, :, :-1], signal[:, :, 1:] - signal[:, :, :-1])
-        if sdtw_lambda > 0:
-            loss = loss + sdtw_lambda * soft_dtw(x_hat, signal).mean()
-        if coral_lambda > 0 or vrex_lambda > 0:
-            loss = loss + dg_penalties(x_hat, signal, model.reparameterize(mu, logvar), participant, coral_lambda, vrex_lambda)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -386,7 +346,7 @@ def main():
             if use_participant and args.subj_adv_lambda > 0:
                 train_loss, train_recon, train_kl = train_cvae_adv_one_epoch(model, train_loader, optimizer, epoch, args.beta_warmup_epochs, device, args.free_bits, args.subj_adv_lambda, beta_max=args.beta_max)
             else:
-                train_loss, train_recon, train_kl = train_vae_one_epoch(model, train_loader, optimizer, epoch, args.beta_warmup_epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max, mmd_lambda=args.mmd_lambda, shape_lambda=args.shape_lambda, coral_lambda=args.coral_lambda, vrex_lambda=args.vrex_lambda, sdtw_lambda=args.sdtw_lambda)
+                train_loss, train_recon, train_kl = train_vae_one_epoch(model, train_loader, optimizer, epoch, args.beta_warmup_epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max, shape_lambda=args.shape_lambda)
             val_loss, val_recon, val_kl = evaluate(model, val_loader, epoch, args.beta_warmup_epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max)
             scheduler.step()
 
@@ -414,7 +374,7 @@ def main():
                                    'val': f'{val_loss:.4f}',
                                    'active': n_active})
 
-    # pinn / tpinn branch (tpinn = shared-transport physics-as-decoder; reuses the same train loop with phys=0)
+    # pinn / tpinn branch (tpinn = shared-transport physics-as-decoder
     elif args.model in ('pinn', 'tpinn'):
         params_cir = np.load(f'results/pinn/params_{args.region}{("_" + args.cir_tag) if args.cir_tag else ""}.npy')
         t_grid = np.arange(36) * 2.0
@@ -440,12 +400,12 @@ def main():
 
         epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
         for epoch in epoch_bar:
-            train_m = train_pinn_one_epoch(model, train_loader, optimizer, epoch, args.beta_warmup_epochs, device, args.free_bits, args.lambda_phys, beta_max=args.beta_max, mmd_lambda=args.mmd_lambda, shape_lambda=args.shape_lambda, coral_lambda=args.coral_lambda, vrex_lambda=args.vrex_lambda, sdtw_lambda=args.sdtw_lambda)
+            train_m = train_pinn_one_epoch(model, train_loader, optimizer, epoch, args.beta_warmup_epochs, device, args.free_bits, args.lambda_phys, beta_max=args.beta_max, shape_lambda=args.shape_lambda)
             val_m = evaluate_pinn(model, val_loader, epoch, args.beta_warmup_epochs, device, args.free_bits, args.lambda_phys, beta_max=args.beta_max)
             scheduler.step()
 
             beta = beta_capped(epoch, args.beta_warmup_epochs, beta_max=args.beta_max)
-            # select on the ELBO (recon + beta*KL), excluding the physics penalty - comparable across the lambda_phys sweep and to the CVAE
+            # select on the ELBO (recon + beta*KL), excluding the physics penalty
             val_elbo = val_m['recon'] + beta * val_m['kl']
             if val_elbo < best_val_loss and beta >= args.beta_max:
                 best_val_loss = val_elbo
@@ -469,7 +429,7 @@ def main():
                                    'kl': f'{val_m["kl"]:.4f}',
                                    'ph': f'{val_m["phys"]:.4f}'})
 
-    # diffusion branch (DDPM eps-prediction; BreathDataset z-score; save last epoch - stable training)
+    # diffusion branch
     elif args.model == 'diffusion':
         model = ConditionalDiffusion(num_classes=3, num_participants=num_participants,
                                      embed_dim=args.embed_dim, part_embed_dim=args.part_embed_dim,
@@ -510,7 +470,7 @@ def main():
             history.append({'epoch': epoch, 'train_loss': tr, 'val_loss': vl})
             epoch_bar.set_postfix({'tr': f'{tr:.4f}', 'vl': f'{vl:.4f}'})
 
-    # gan branch (conditional 1D GAN; checkpoint = the generator). Last epoch saved (GAN val is ill-defined).
+    # gan branch
     elif args.model == 'gan':
         z_dim = args.latent_dim
         G = Generator(z_dim=z_dim, num_classes=3, num_participants=num_participants, embed_dim=args.embed_dim,
@@ -533,7 +493,7 @@ def main():
                 participant = participant.long().to(device)
                 B = signal.size(0)
                 p_in = participant.clone()
-                if args.part_dropout > 0:                                    # train the null-token path for LOSO
+                if args.part_dropout > 0:
                     p_in[torch.rand(B, device=device) < args.part_dropout] = G.null_part_idx
                 # D step
                 z = torch.randn(B, z_dim, device=device)
