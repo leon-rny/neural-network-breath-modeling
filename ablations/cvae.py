@@ -286,7 +286,7 @@ def train_config(config: str, region: str, init_seed: int, split_seed: int, fold
     # data
     df = load_dataset(dataset_dir)
     df = df[df["region"] == region].reset_index(drop=True)
-    num_participants = df["participant"].nunique()  # embedding table covers all subjects; derive before split
+    num_participants = df["participant"].nunique()  # embedding table covers all subjects, derive before split
     df_train, df_val, _ = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed, exclude_subjects=exclude_subjects, loso_trial_val=loso_trial_val)
     train_ds = BreathDataset(df_train, alpha=alpha, n_copies=n_copies)
     train_ds_clean = BreathDataset(df_train, stats=train_ds.stats)
@@ -530,7 +530,7 @@ def train_variant(variant: str, region: str, init_seed: int, split_seed: int, fo
     # data
     df = load_dataset(dataset_dir)
     df = df[df["region"] == region].reset_index(drop=True)
-    num_participants = df["participant"].nunique()  # embedding table covers all subjects; derive before split
+    num_participants = df["participant"].nunique()  # embedding table covers all subjects, derive before split
     df_train, df_val, _ = kfold_split_dataset(df, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
     train_ds = BreathDataset(df_train)
     val_ds = BreathDataset(df_val, stats=train_ds.stats)
@@ -719,7 +719,7 @@ def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
 
     Resolves the config/seed/fold/region lists from args (including jitter single-combo
     synthesis and nested-LOSO excludes). In aggregate mode it only collects existing
-    result.json files into the summary; otherwise it builds the TRTR cache, trains (unless
+    result.json files into the summary, otherwise it builds the TRTR cache, trains (unless
     skip_existing finds a checkpoint), runs TSTR, and writes results plus the summary.
 
     :param args: parsed command-line arguments.
@@ -731,7 +731,7 @@ def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
         print(f'Unknown variant "{variant}". Valid: {list(VARIANT_MAP)}')
         sys.exit(1)
 
-    # nested-LOSO: 0-indexed excludes from the 1-indexed CLI; tag namespaces nested artifacts
+    # nested-LOSO: 0-indexed excludes from the 1-indexed CLI, tag namespaces nested artifacts
     exclude_subjects = tuple(int(x) - 1 for x in args.loso_exclude.split(",") if x.strip()) if args.loso_exclude else ()
     loso_tag = loso_path_tag(args.loso_trial_val, exclude_subjects)
 
@@ -827,7 +827,7 @@ def run_architecture(args: argparse.Namespace, device: torch.device) -> None:
     """Drive the architecture family: sweep variants x cond_part, then train/eval/aggregate.
 
     Resolves the variant/seed/fold/region/cond_part lists from args. In aggregate mode it
-    only collects existing result.json files into the summary; otherwise it builds the TRTR
+    only collects existing result.json files into the summary, otherwise it builds the TRTR
     cache, trains each variant (unless skip_existing finds a checkpoint), runs TSTR, and
     writes results plus the summary.
 

@@ -73,7 +73,7 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
     :param df_long: long-format data with id/time/channel columns.
     :param top_features_raw: raw tsfresh feature names to compute (order preserved).
     :param n_jobs: parallel workers for tsfresh.
-    :return: DataFrame with exactly top_features_raw as columns; any feature tsfresh fails
+    :return: DataFrame with exactly top_features_raw as columns, any feature tsfresh fails
         to produce is filled with 0.0.
     """
     kind_to_fc = from_columns(top_features_raw)
@@ -90,7 +90,7 @@ def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_see
     :param X_train: feature matrix.
     :param y_train: integer class labels.
     :param init_seed: random seed for all estimators and SMOTE.
-    :param fix_smote: if True, apply SMOTE inside each base estimator's CV pipeline (no leakage);
+    :param fix_smote: if True, apply SMOTE inside each base estimator's CV pipeline (no leakage),
         if False, oversample globally before stacking (leaks across the stacker's internal folds).
     :param n_jobs: parallel workers for the stacker's cross-validation.
     :return: the fitted StackingClassifier.
@@ -283,7 +283,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
         train_idx, _ = train_test_split(idx_trainval, test_size=val_relative,
                                         stratify=labels_full[idx_trainval], random_state=split_seed)
     else:
-        # fold is 1-indexed at the API boundary; splits list is 0-indexed.
+        # fold is 1-indexed at the API boundary, splits list is 0-indexed.
         skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=split_seed)
         splits = list(skf.split(df, labels_full))
         trainfull_idx, test_idx = splits[fold - 1]
@@ -316,7 +316,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
     X_full_san = X_train_raw.copy()
     X_full_san.columns = [raw_to_san[c] for c in X_full_san.columns]
 
-    # LightGBM for SHAP feature ranking. Inner train/val partition uses split_seed (data partition); LGBM init uses init_seed (model stochasticity).
+    # LightGBM for SHAP feature ranking. Inner train/val partition uses split_seed (data partition), LGBM init uses init_seed (model stochasticity).
     X_tr, X_val_lgbm, y_tr, y_val_lgbm = train_test_split(
         X_full_san, y_train_values, test_size=0.2, stratify=y_train_values, random_state=split_seed)
 
@@ -355,7 +355,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
         X_test_san_all.columns = [re.sub(r"[^\w]", "_", c) for c in X_test_san_all.columns]
         X_test_san_all = X_test_san_all.reindex(columns=X_full_san.columns, fill_value=0.0)
 
-    # SHAP feature ranking. Replication computes SHAP on the test set (information leak); every fix in the chain switches to SHAP on train.
+    # SHAP feature ranking. Replication computes SHAP on the test set (information leak), every fix in the chain switches to SHAP on train.
     explainer = shap.TreeExplainer(best_lgbm)
     if shap_on_test:
         shap_values = explainer.shap_values(X_test_san_all.values)

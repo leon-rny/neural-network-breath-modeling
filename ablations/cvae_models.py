@@ -3,7 +3,7 @@ import torch.nn as nn
 
 def _expand_embedding_with_null(emb: nn.Embedding) -> nn.Embedding:
     """Return a copy of `emb` with one extra (null-token) row appended.
-    Existing rows are copied byte-for-byte; only the new row is freshly initialised.
+    Existing rows are copied byte-for-byte, only the new row is freshly initialised.
     The caller must save/restore the global RNG around this so surrounding inits stay unperturbed."""
     n, d = emb.weight.shape
     new = nn.Embedding(n + 1, d)
@@ -12,7 +12,7 @@ def _expand_embedding_with_null(emb: nn.Embedding) -> nn.Embedding:
     return new
 
 class AblationCVAE(nn.Module):
-    """Base conditional VAE shared by all architecture-ablation variants; subclasses just wire an encoder/decoder pair."""
+    """Base conditional VAE shared by all architecture-ablation variants, subclasses just wire an encoder/decoder pair."""
     def __init__(self, latent_dim: int, num_classes: int, num_participants: int, condition_on_participant: bool, part_dropout: float = 0.0) -> None:
         """Set up latent/class/participant config and CFG-style participant-dropout bookkeeping.
 
@@ -27,8 +27,7 @@ class AblationCVAE(nn.Module):
         self.num_classes = num_classes
         self.num_participants = num_participants
         self._cond_part = condition_on_participant
-        # CFG-style participant dropout: with prob part_dropout swap the batch to a learned null token.
-        # null row sits just past the real participants at index num_participants; the subclass always allocates it (num_participants + 1 rows).
+        # CFG-style participant dropout
         self.part_dropout = part_dropout
         self.null_part_idx = num_participants
         self._null_steps = 0
@@ -53,7 +52,7 @@ class AblationCVAE(nn.Module):
         :param p: Optional (B,) participant labels (required when conditioning on participant).
         :return: x_hat (B, 2, 36), mu, logvar.
         """
-        # training-only participant dropout; guarded so part_dropout==0 draws no RNG (run A stays byte-identical)
+        # training-only participant dropout, guarded so part_dropout==0 draws no RNG (run A stays byte-identical)
         if self.training and self._cond_part and p is not None and self.part_dropout > 0.0:
             self._total_steps += 1
             if torch.rand(1).item() < self.part_dropout:
@@ -69,7 +68,7 @@ class AblationCVAE(nn.Module):
         :param n: number of samples to generate.
         :param y: (n,) class labels (or scalar broadcast to n).
         :param device: device to generate on.
-        :param participant: fixed participant id (e.g. null_part_idx for LOSO); None samples uniformly.
+        :param participant: fixed participant id (e.g. null_part_idx for LOSO), None samples uniformly.
         :return: (n, 2, 36) generated signals.
         """
         z = torch.randn(n, self.latent_dim, device=device)
@@ -103,11 +102,9 @@ class _Enc_ConvBaseline(nn.Module):
     def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
         """Build the Conv-baseline encoder layers."""
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(2, 16, 3, padding=1), nn.ReLU(),
-            nn.Conv1d(16, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv1d(32, 64, 3, padding=1), nn.ReLU(),
-        )
+        self.conv = nn.Sequential(nn.Conv1d(2, 16, 3, padding=1), nn.ReLU(),
+                                  nn.Conv1d(16, 32, 3, padding=1), nn.ReLU(),
+                                  nn.Conv1d(32, 64, 3, padding=1), nn.ReLU())
         self.label_embed = nn.Embedding(num_classes, embed_dim)
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 64 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
@@ -130,11 +127,9 @@ class _Dec_ConvBaseline(nn.Module):
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Linear(128, 64 * 36))
-        self.conv = nn.Sequential(
-            nn.ConvTranspose1d(64, 32, 3, padding=1), nn.ReLU(),
-            nn.ConvTranspose1d(32, 16, 3, padding=1), nn.ReLU(),
-            nn.ConvTranspose1d(16, 2, 3, padding=1),
-        )
+        self.conv = nn.Sequential(nn.ConvTranspose1d(64, 32, 3, padding=1), nn.ReLU(),
+                                  nn.ConvTranspose1d(32, 16, 3, padding=1), nn.ReLU(),
+                                  nn.ConvTranspose1d(16, 2, 3, padding=1))
 
     def forward(self, z, y, p=None):
         """Decode latent + conditioning -> (B, 2, 36)."""
@@ -142,15 +137,13 @@ class _Dec_ConvBaseline(nn.Module):
         return self.conv(h)
 
 class ConvBaseline(AblationCVAE):
-    """1D-conv baseline CVAE (3-layer Conv1d 2->16->32->64, FC 128); the committed architecture."""
+    """1D-conv baseline CVAE (3-layer Conv1d 2->16->32->64, FC 128), the committed architecture."""
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Conv-baseline encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvBaseline(**kw)
-        # append the null-token row last, with RNG save/restore so every other param keeps its exact draw
-        # (part_dropout==0 -> no expansion -> byte-identical to the committed model)
         if condition_on_participant and part_dropout > 0.0:
             rng_state = torch.get_rng_state()
             self.encoder.part_embed = _expand_embedding_with_null(self.encoder.part_embed)
@@ -163,11 +156,9 @@ class _Enc_ConvLargeKernel(nn.Module):
     def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
         """Build the Large-kernel conv encoder layers."""
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(2, 16, 7, padding=3), nn.ReLU(),
-            nn.Conv1d(16, 32, 7, padding=3), nn.ReLU(),
-            nn.Conv1d(32, 64, 7, padding=3), nn.ReLU(),
-        )
+        self.conv = nn.Sequential(nn.Conv1d(2, 16, 7, padding=3), nn.ReLU(),
+                                  nn.Conv1d(16, 32, 7, padding=3), nn.ReLU(),
+                                  nn.Conv1d(32, 64, 7, padding=3), nn.ReLU())
         self.label_embed = nn.Embedding(num_classes, embed_dim)
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 64 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
@@ -190,11 +181,9 @@ class _Dec_ConvLargeKernel(nn.Module):
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Linear(128, 64 * 36))
-        self.conv = nn.Sequential(
-            nn.ConvTranspose1d(64, 32, 7, padding=3), nn.ReLU(),
-            nn.ConvTranspose1d(32, 16, 7, padding=3), nn.ReLU(),
-            nn.ConvTranspose1d(16, 2, 7, padding=3),
-        )
+        self.conv = nn.Sequential(nn.ConvTranspose1d(64, 32, 7, padding=3), nn.ReLU(),
+                                  nn.ConvTranspose1d(32, 16, 7, padding=3), nn.ReLU(),
+                                  nn.ConvTranspose1d(16, 2, 7, padding=3))
 
     def forward(self, z, y, p=None):
         """Decode latent + conditioning -> (B, 2, 36)."""
@@ -210,7 +199,7 @@ class ConvLargeKernel(AblationCVAE):
         self.encoder = _Enc_ConvLargeKernel(**kw)
         self.decoder = _Dec_ConvLargeKernel(**kw)
 
-# conv_tiny: single Conv1d(2->8), FC 16; smallest conv variant
+# conv_tiny: single Conv1d(2->8), FC 16, smallest conv variant
 class _Enc_ConvTiny(nn.Module):
     """Tiny-conv encoder: (B, 2, 36) + conditioning -> (mu, logvar)."""
     def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
@@ -261,10 +250,8 @@ class _Enc_ConvSlim(nn.Module):
     def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
         """Build the Slim-conv encoder layers."""
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(2, 8, 3, padding=1), nn.ReLU(),
-            nn.Conv1d(8, 16, 3, padding=1), nn.ReLU(),
-        )
+        self.conv = nn.Sequential(nn.Conv1d(2, 8, 3, padding=1), nn.ReLU(),
+                                  nn.Conv1d(8, 16, 3, padding=1), nn.ReLU())
         self.label_embed = nn.Embedding(num_classes, embed_dim)
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 16 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
@@ -287,10 +274,8 @@ class _Dec_ConvSlim(nn.Module):
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
         self.fc = nn.Sequential(nn.Linear(in_fc, 64), nn.ReLU(), nn.Linear(64, 16 * 36))
-        self.conv = nn.Sequential(
-            nn.ConvTranspose1d(16, 8, 3, padding=1), nn.ReLU(),
-            nn.ConvTranspose1d(8, 2, 3, padding=1),
-        )
+        self.conv = nn.Sequential(nn.ConvTranspose1d(16, 8, 3, padding=1), nn.ReLU(),
+                                  nn.ConvTranspose1d(8, 2, 3, padding=1))
 
     def forward(self, z, y, p=None):
         """Decode latent + conditioning -> (B, 2, 36)."""
@@ -333,11 +318,9 @@ class _Dec_MLP(nn.Module):
         self.label_embed = nn.Embedding(num_classes, embed_dim)
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
-        self.fc = nn.Sequential(
-            nn.Linear(in_fc, 64), nn.ReLU(),
-            nn.Linear(64, 128), nn.ReLU(),
-            nn.Linear(128, 72),
-        )
+        self.fc = nn.Sequential(nn.Linear(in_fc, 64), nn.ReLU(),
+                                nn.Linear(64, 128), nn.ReLU(),
+                                nn.Linear(128, 72))
 
     def forward(self, z, y, p=None):
         """Decode latent + conditioning -> (B, 2, 36)."""
@@ -385,11 +368,9 @@ class _Dec_MLPSmall(nn.Module):
         self.label_embed = nn.Embedding(num_classes, embed_dim)
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
-        self.fc = nn.Sequential(
-            nn.Linear(in_fc, 32), nn.ReLU(),
-            nn.Linear(32, 64), nn.ReLU(),
-            nn.Linear(64, 72),
-        )
+        self.fc = nn.Sequential(nn.Linear(in_fc, 32), nn.ReLU(),
+                                nn.Linear(32, 64), nn.ReLU(),
+                                nn.Linear(64, 72))
 
     def forward(self, z, y, p=None):
         """Decode latent + conditioning -> (B, 2, 36)."""
@@ -455,11 +436,9 @@ class _Dec_ConvAsym(nn.Module):
         self.label_embed = nn.Embedding(num_classes, embed_dim)
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
-        self.fc = nn.Sequential(
-            nn.Linear(in_fc, 128), nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(128, 64 * 36),
-        )
+        self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(),
+                                nn.Dropout(0.4),
+                                nn.Linear(128, 64 * 36))
         self.conv = nn.ConvTranspose1d(64, 2, 3, padding=1)  # single deconv layer
 
     def forward(self, z, y, p=None):
@@ -508,11 +487,9 @@ class _Enc_ConvBaselineDropout(nn.Module):
     def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
         """Build the Conv-baseline (dropout) encoder layers."""
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(2, 16, 3, padding=1), nn.ReLU(),
-            nn.Conv1d(16, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv1d(32, 64, 3, padding=1), nn.ReLU(),
-        )
+        self.conv = nn.Sequential(nn.Conv1d(2, 16, 3, padding=1), nn.ReLU(),
+                                  nn.Conv1d(16, 32, 3, padding=1), nn.ReLU(),
+                                  nn.Conv1d(32, 64, 3, padding=1), nn.ReLU())
         self.label_embed = nn.Embedding(num_classes, embed_dim)
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = 64 * 36 + _cond_size(embed_dim, cond_part, part_embed_dim)
@@ -534,15 +511,11 @@ class _Dec_ConvBaselineDropout(nn.Module):
         self.label_embed = nn.Embedding(num_classes, embed_dim)
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None  # +1 row for the null token (null_part_idx == num_participants)
         in_fc = latent_dim + _cond_size(embed_dim, cond_part, part_embed_dim)
-        self.fc = nn.Sequential(
-            nn.Linear(in_fc, 128), nn.ReLU(), nn.Dropout(0.4),
-            nn.Linear(128, 64 * 36),
-        )
-        self.conv = nn.Sequential(
-            nn.ConvTranspose1d(64, 32, 3, padding=1), nn.ReLU(),
-            nn.ConvTranspose1d(32, 16, 3, padding=1), nn.ReLU(),
-            nn.ConvTranspose1d(16, 2, 3, padding=1),
-        )
+        self.fc = nn.Sequential(nn.Linear(in_fc, 128), nn.ReLU(), nn.Dropout(0.4),
+                                nn.Linear(128, 64 * 36))
+        self.conv = nn.Sequential(nn.ConvTranspose1d(64, 32, 3, padding=1), nn.ReLU(),
+                                  nn.ConvTranspose1d(32, 16, 3, padding=1), nn.ReLU(),
+                                  nn.ConvTranspose1d(16, 2, 3, padding=1))
 
     def forward(self, z, y, p=None):
         """Decode latent + conditioning -> (B, 2, 36)."""
@@ -558,7 +531,7 @@ class ConvBaselineDropout(AblationCVAE):
         self.encoder = _Enc_ConvBaselineDropout(**kw)
         self.decoder = _Dec_ConvBaselineDropout(**kw)
 
-# transformer: small attention-based variant; non-autoregressive seed-sequence decoder
+# transformer: small attention-based variant, non-autoregressive seed-sequence decoder
 class _Enc_Transformer(nn.Module):
     """Transformer encoder: (B, 2, 36) + conditioning -> (mu, logvar)."""
     def __init__(self, latent_dim, num_classes, embed_dim, cond_part, num_participants, part_embed_dim):
