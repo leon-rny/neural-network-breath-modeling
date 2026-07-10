@@ -20,6 +20,7 @@ import shap
 from sklearn.ensemble import RandomForestClassifier, StackingClassifier
 from sklearn.metrics import accuracy_score, classification_report, f1_score, log_loss, roc_auc_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.neighbors import NearestNeighbors
 
 from core.data import CLASSES, CLASS_TO_IDX, BreathDataset, load_dataset, get_split, loso_path_tag, subset_tag, cir_marker, prep_marker, phys_prep_marker
 from core.utils import seed_everything
@@ -45,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--region', choices=['mouth', 'nose'], default=None)
     p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
     p.add_argument('--ensemble_model', type=str, default='')   # tstr: mix synthetic from a 2nd generator (e.g. tpinn) for a two-generator ensemble
-    p.add_argument('--aug_source', choices=['gen', 'mixup'], default='gen')   # tstr_plus: gen = generator synthetic; mixup = real-signal mixup
+    p.add_argument('--aug_source', choices=['gen', 'mixup', 'jitter', 'smote'], default='gen')   # tstr_plus non-generator controls: gen=generator synthetic; mixup=same-class convex combo; jitter=§4.4.1 Gaussian jitter of real trials; smote=signal-space k-NN SMOTE
     p.add_argument('--channel', choices=['humidity', 'temperature', 'both'], default='both')
     p.add_argument('--n_synthetic', type=int, default=None)
     p.add_argument('--augmentation_ratio', type=float, default=1.0)
@@ -319,6 +320,7 @@ def save_summary(result: dict) -> None:
                'n_synthetic': result.get('n_synthetic', result['n_train_real']),
                'n_train_real': result.get('n_train_real'),
                'augmentation_ratio': result.get('augmentation_ratio'),
+               'aug_source': result.get('aug_source', 'gen'),
                'subset': result.get('subset', ''),
                'phys_variant': result.get('phys_variant', ''),
                'cir': result.get('cir', ''),
@@ -339,6 +341,8 @@ def save_summary(result: dict) -> None:
         df_old = pd.read_csv(csv_path)
         if 'cv_mode' not in df_old.columns:
             df_old['cv_mode'] = 'kfold'
+        if 'aug_source' not in df_old.columns:
+            df_old['aug_source'] = 'gen'   # backfill default so re-runs dedup against legacy rows
         for col in df_row.columns:
             if col not in df_old.columns:
                 df_old[col] = pd.NA
@@ -349,7 +353,12 @@ def save_summary(result: dict) -> None:
                 df_row[col] = df_row[col].astype(df_old[col].dtype)
             except (ValueError, TypeError):
                 pass
-        df_new = pd.concat([df_old, df_row], ignore_index=True).drop_duplicates(subset=['model', 'region', 'channel', 'cv_mode', 'init_seed', 'split_seed', 'fold', 'latent_dim', 'embed_dim', 'part_embed_dim', 'free_bits', 'lambda_phys', 'alpha', 'n_copies', 'augmentation_ratio', 'subset', 'phys_variant', 'cir', 'prep', 'phys_prep'], keep='last')
+        combined = pd.concat([df_old, df_row], ignore_index=True)
+        # empty-string keys round-trip through CSV as NaN; unify so '' (fresh) and NaN (stored) dedup
+        for c in ('subset', 'phys_variant', 'cir'):
+            if c in combined.columns:
+                combined[c] = combined[c].fillna('')
+        df_new = combined.drop_duplicates(subset=['model', 'region', 'channel', 'cv_mode', 'init_seed', 'split_seed', 'fold', 'latent_dim', 'embed_dim', 'part_embed_dim', 'free_bits', 'lambda_phys', 'alpha', 'n_copies', 'augmentation_ratio', 'aug_source', 'subset', 'phys_variant', 'cir', 'prep', 'phys_prep'], keep='last')
     else:
         df_new = df_row
     df_new.to_csv(csv_path, index=False)
@@ -789,6 +798,85 @@ def generate_real_aug(df_train: pd.DataFrame, n_aug: int, seed: int) -> tuple[np
         labs.append(c)
     return np.stack(sigs), np.array(labs)
 
+def generate_jitter_aug(df_train: pd.DataFrame, n_aug: int, alpha: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Non-generator control: Gaussian-jittered copies of REAL trials, replicating the *exact*
+    training-time jitter of §4.4.1 (BreathDataset) with NO generative model.
+
+    BreathDataset augments in z-score space: z = (x-mean)/std; z += alpha*N(0,1). Denormalised back
+    to physical units this is x + alpha*std_channel*N(0,1), so the perturbation seen by the classifier
+    is identical to the one the generator was trained under. Stats are the per-channel std of the
+    training fold (matching BreathDataset._compute_stats); sampling is class-balanced like the generator.
+
+    :param df_train: training trials with humidity/temperature/class columns.
+    :param n_aug: number of jittered signals to produce.
+    :param alpha: Gaussian noise std in z-score space (pass the generator's --alpha, e.g. 0.05).
+    :param seed: RNG seed.
+    :return: (n_aug, 2, 36) physical-unit signals and their integer class labels.
+    """
+    rng = np.random.RandomState(seed)
+    records = df_train.to_dict('records')
+    # per-channel z-score std over the training fold (BreathDataset._compute_stats)
+    h_std = np.concatenate([r['humidity'] for r in records]).std()
+    t_std = np.concatenate([r['temperature'] for r in records]).std()
+    std = np.array([h_std, t_std], dtype=np.float32).reshape(2, 1)
+    by_class = defaultdict(list)
+    for r in records:
+        by_class[CLASS_TO_IDX[r['class']]].append(np.stack([r['humidity'], r['temperature']]).astype(np.float32))
+    classes = sorted(by_class)
+    sigs, labs = [], []
+    for i in range(n_aug):
+        c = classes[i % len(classes)]
+        pool = by_class[c]
+        base = pool[rng.randint(len(pool))]
+        s = base + alpha * std * rng.standard_normal(base.shape).astype(np.float32)
+        sigs.append(s.astype(np.float32))
+        labs.append(c)
+    return np.stack(sigs), np.array(labs)
+
+def generate_smote_aug(df_train: pd.DataFrame, n_aug: int, seed: int, k: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    """Non-generator control: signal-space SMOTE. Interpolate each new sample toward one of a real
+    trial's k nearest same-class neighbours in raw signal space, x_new = x_i + u*(x_nn - x_i), u~U(0,1).
+
+    This is distinct from the feature-space SMOTE already inside the classifier (train_stacking_classifier
+    balances the fixed top-20 features): interpolating raw signals and re-extracting features yields points
+    off the real-data feature manifold. Class-balanced like the generator; k is clipped to the class size.
+
+    :param df_train: training trials with humidity/temperature/class columns.
+    :param n_aug: number of synthetic signals to produce.
+    :param seed: RNG seed.
+    :param k: neighbourhood size (clipped to per-class count - 1).
+    :return: (n_aug, 2, 36) physical-unit signals and their integer class labels.
+    """
+    rng = np.random.RandomState(seed)
+    by_class = defaultdict(list)
+    for r in df_train.to_dict('records'):
+        by_class[CLASS_TO_IDX[r['class']]].append(np.stack([r['humidity'], r['temperature']]).astype(np.float32))
+    classes = sorted(by_class)
+    # precompute per-class same-class neighbour indices (self excluded)
+    neigh = {}
+    for c in classes:
+        pool = np.stack(by_class[c])                      # (m, 2, 36)
+        kc = min(k, len(pool) - 1)
+        if kc >= 1:
+            nn = NearestNeighbors(n_neighbors=kc + 1).fit(pool.reshape(len(pool), -1))
+            neigh[c] = nn.kneighbors(pool.reshape(len(pool), -1), return_distance=False)[:, 1:]
+        else:
+            neigh[c] = None
+    sigs, labs = [], []
+    for i in range(n_aug):
+        c = classes[i % len(classes)]
+        pool = by_class[c]
+        j = rng.randint(len(pool))
+        base = pool[j]
+        if neigh[c] is not None:
+            nn_j = neigh[c][j][rng.randint(neigh[c].shape[1])]
+            s = base + rng.rand() * (pool[nn_j] - base)
+        else:
+            s = base
+        sigs.append(s.astype(np.float32))
+        labs.append(c)
+    return np.stack(sigs), np.array(labs)
+
 # train synthetic/real test real
 def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, cv_mode: str = 'kfold', preprocessing: str = 'raw', ckpt_run_id: str | None = None, real_fraction: float = 1.0, aug_source: str = 'gen', dataset_dir: str = 'dataset', n_folds: int = 5, include_subjects: tuple = ()) -> dict:
     """Run augmentation TSTR+: train the classifier on real + synthetic data, test on the real fold.
@@ -826,12 +914,21 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
         participant_idx = model.null_part_idx if (cv_mode == 'loso' and getattr(model, '_cond_part', False)) else None
         synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed, participant_idx=participant_idx)
     else:
-        # non-generator REAL-signal augmentation: same-class mixup of real training trials
+        # non-generator REAL-signal augmentation controls (no generative model, no checkpoint loaded)
         df = load_dataset(dataset_dir)
         df = df[df['region'] == region].reset_index(drop=True)
         df_tr, _, _ = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed, include_subjects=include_subjects)
-        synth_signals, synth_labels = generate_real_aug(df_tr, n_synthetic, init_seed)
-        print(f'[TSTR+] real-aug mixup, n={n_synthetic}, n_real_used={n_real_used}, preprocessing={preprocessing}')
+        if aug_source == 'mixup':
+            synth_signals, synth_labels = generate_real_aug(df_tr, n_synthetic, init_seed)
+        elif aug_source == 'jitter':
+            if alpha <= 0:
+                raise ValueError("aug_source='jitter' needs --alpha > 0 (the §4.4.1 jitter magnitude, e.g. 0.05)")
+            synth_signals, synth_labels = generate_jitter_aug(df_tr, n_synthetic, alpha, init_seed)
+        elif aug_source == 'smote':
+            synth_signals, synth_labels = generate_smote_aug(df_tr, n_synthetic, init_seed)
+        else:
+            raise ValueError(f'unknown aug_source: {aug_source!r}')
+        print(f'[TSTR+] real-aug {aug_source} (alpha={alpha}), n={n_synthetic}, n_real_used={n_real_used}, preprocessing={preprocessing}')
     # match the real-data feature space (cache X_train/X_test are already preprocessed in trtr)
     synth_signals = preprocess_synth_signals(synth_signals, preprocessing)
 
@@ -880,6 +977,7 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
             'n_synthetic': n_synthetic,
             'n_synth_kept': n_synth_kept,
             'augmentation_ratio': augmentation_ratio,
+            'aug_source': aug_source,
             'metrics_realonly': metrics_realonly,
             'top_20_features': cache['top_20_features_sanitized'],
             'metrics': metrics,

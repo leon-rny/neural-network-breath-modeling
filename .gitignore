@@ -8,13 +8,11 @@ __pycache__/
 .python-version
 .vscode/
 .claude/
+CLAUDE.md
 
 # results
 experiments/
 results/
-test.*
-*.pdf
-*.md
 backups/
 
 # evaluation
