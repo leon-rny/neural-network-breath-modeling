@@ -12,7 +12,10 @@ __pycache__/
 experiments/
 results/
 backups/
+reproduction/
+docs/
 
 # evaluation
 plotting.py
 *.ipynb
+*.pdf
