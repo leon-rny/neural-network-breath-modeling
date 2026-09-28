@@ -1,7 +1,9 @@
 import math
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
+
 
 def _timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     """Sinusoidal timestep embedding.
@@ -32,7 +34,7 @@ class _Denoiser(nn.Module):
         super().__init__()
         self._cond_part = cond_part
         self.tdim = tdim
-        self.label_embed = nn.Embedding(num_classes + 1, embed_dim) # +1 row = null class (CFG uncond)
+        self.label_embed = nn.Embedding(num_classes + 1, embed_dim)  # +1 row = null class (CFG uncond)
         self.part_embed = nn.Embedding(num_participants + 1, part_embed_dim) if cond_part else None
         self.null_part_idx = num_participants
         self.tproj = nn.Sequential(nn.Linear(tdim, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
@@ -80,21 +82,20 @@ class ConditionalDiffusion(nn.Module):
         :param cfg_dropout: Probability of dropping class conditioning to the null token during training for classifier-free guidance (default 0.1).
         :param guidance_scale: Guidance scale (w) for classifier-free guidance during sampling (default 3.0). Higher values increase fidelity to the class condition at the cost of diversity. Set to 1.0 to disable CFG.
         """
-        
         super().__init__()
         self._cond_part = condition_on_participant
         self.num_participants = num_participants
         self.null_part_idx = num_participants
         self.part_dropout = part_dropout
         self.num_classes = num_classes
-        self.null_class_idx = num_classes # classifier-free guidance: null/uncond class token
-        self.cfg_dropout = cfg_dropout # prob of dropping class to null during training
-        self.guidance_scale = guidance_scale # w at sampling: eps = eps_uncond + w*(eps_cond-eps_uncond)
+        self.null_class_idx = num_classes  # classifier-free guidance: null/uncond class token
+        self.cfg_dropout = cfg_dropout  # prob of dropping class to null during training
+        self.guidance_scale = guidance_scale  # w at sampling: eps = eps_uncond + w*(eps_cond-eps_uncond)
         self.n_steps = n_steps
         self.n_samples = n_samples
         self.channels = channels
         self.net = _Denoiser(channels, num_classes, embed_dim, num_participants, part_embed_dim, condition_on_participant, hidden)
-        betas = torch.linspace(1e-4, 0.02, n_steps) # linear schedule
+        betas = torch.linspace(1e-4, 0.02, n_steps)  # linear schedule
         alphas = 1.0 - betas
         acp = torch.cumprod(alphas, dim=0)
         self.register_buffer('betas', betas)
@@ -112,9 +113,8 @@ class ConditionalDiffusion(nn.Module):
         :return: Scalar tensor containing the MSE loss between the predicted noise and the true noise.
         """
         B = x.shape[0]
-        if self.training and self._cond_part and p is not None and self.part_dropout > 0.0:
-            if torch.rand(1).item() < self.part_dropout:
-                p = torch.full_like(p, self.null_part_idx)
+        if self.training and self._cond_part and p is not None and self.part_dropout > 0.0 and torch.rand(1).item() < self.part_dropout:
+            p = torch.full_like(p, self.null_part_idx)
         if self.training and self.cfg_dropout > 0.0 and torch.rand(1).item() < self.cfg_dropout:
             y = torch.full_like(y, self.null_class_idx)  # CFG: train the unconditional path too
         t = torch.randint(0, self.n_steps, (B,), device=x.device)
@@ -138,7 +138,7 @@ class ConditionalDiffusion(nn.Module):
         y = y.to(device)
         if not self._cond_part:
             p = None
-        elif participant is not None: # null_part_idx for LOSO unseen-subject gen
+        elif participant is not None:  # null_part_idx for LOSO unseen-subject gen
             p = torch.full((n,), participant, dtype=torch.long, device=device)
         else:
             p = torch.randint(0, self.num_participants, (n,), device=device)

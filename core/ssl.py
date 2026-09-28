@@ -4,11 +4,12 @@ import os
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import wilcoxon
+from torch import nn
 
 from core.data import load_dataset, n_loso_folds
+
 
 class SSLEncoder(nn.Module):
     """1D-conv encoder -> embedding, with a projection head used only during contrastive pretraining."""
@@ -28,7 +29,7 @@ def _augment(x: torch.Tensor) -> torch.Tensor:
     x = x + 0.1 * torch.randn_like(x)
     x = x * (1 + 0.1 * torch.randn(x.shape[0], x.shape[1], 1, device=x.device))
     # random time-mask
-    B, C, T = x.shape
+    B, _C, T = x.shape
     starts = torch.randint(0, T - 5, (B,))
     mask = torch.ones(B, 1, T, device=x.device)
     for b in range(B):
@@ -106,8 +107,8 @@ def run_eval(args: argparse.Namespace) -> None:
     base, ssl = [], []
     for seed in seeds:
         for fold in range(1, nf + 1):
-            kw = dict(dataset_dir='dataset', region=args.region, n_jobs=args.n_jobs, init_seed=seed,
-                      split_seed=args.split_seed, fold=fold, n_folds=nf, cv_mode=args.cv_mode, preprocessing='baseline')
+            kw = {'dataset_dir': 'dataset', 'region': args.region, 'n_jobs': args.n_jobs, 'init_seed': seed,
+                  'split_seed': args.split_seed, 'fold': fold, 'n_folds': nf, 'cv_mode': args.cv_mode, 'preprocessing': 'baseline'}
             b = trtr(**kw)['trtr_metrics']['accuracy']
             s = trtr(**kw, ssl_ckpt=args.ssl_ckpt)['trtr_metrics']['accuracy']
             base.append(b)
@@ -118,7 +119,8 @@ def run_eval(args: argparse.Namespace) -> None:
     pv = wilcoxon(ssl, base).pvalue if np.any(ssl != base) else float('nan')
     print(f'{args.region} {args.cv_mode}: TRTR base={base.mean():.3f} ssl={ssl.mean():.3f} d{ssl.mean() - base.mean():+.3f} p={pv:.4f} (n={len(base)})', flush=True)
     if args.out:
-        json.dump({'region': args.region, 'cv_mode': args.cv_mode, 'base': base.tolist(), 'ssl': ssl.tolist(), 'base_mean': float(base.mean()), 'ssl_mean': float(ssl.mean()), 'p': float(pv)}, open(args.out, 'w'))
+        with open(args.out, 'w') as f:
+            json.dump({'region': args.region, 'cv_mode': args.cv_mode, 'base': base.tolist(), 'ssl': ssl.tolist(), 'base_mean': float(base.mean()), 'ssl_mean': float(ssl.mean()), 'p': float(pv)}, f)
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()

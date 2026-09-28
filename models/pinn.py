@@ -1,9 +1,10 @@
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from models.vae import CVAE
+
 
 # physics cvae
 class CIRConvolution(nn.Module):
@@ -20,17 +21,14 @@ class CIRConvolution(nn.Module):
         super().__init__()
         self.d0 = d0
         self.tau_s = tau_s
-
         # time grid
         t = torch.tensor(t_grid, dtype=torch.float32)
         self.register_buffer('t', t)
         self.dt = float(t[1] - t[0])
         self.T = len(t_grid)
-
         # fixed sensor kernel
         s = torch.where(t > 0, (1.0 / tau_s) * torch.exp(-t / tau_s), torch.zeros_like(t))
         self.register_buffer('s', s)
-
         # baseline mask
         mask = torch.ones(self.T)
         mask[:baseline_samples] = 0.0
@@ -57,14 +55,12 @@ class CIRConvolution(nn.Module):
         D = torch.exp(log_D).unsqueeze(1)
         v = torch.exp(log_v).unsqueeze(1)
         t = self.t.unsqueeze(0)
-
         # advection-diffusion
         t_pos = torch.clamp(t, min=1e-9)
         prefactor = A / torch.sqrt(4 * np.pi * D * t_pos)
         exponent = -(self.d0 - v * t_pos) ** 2 / (4 * D * t_pos)
         h_channel = prefactor * torch.exp(exponent)
         h_channel = torch.where(t > 1e-9, h_channel, torch.zeros_like(h_channel))
-
         # convolve with sensor (fixed buffer or learnable tau_s)
         s = self._sensor_kernel(log_tau_s)
         B = h_channel.shape[0]
@@ -74,10 +70,8 @@ class CIRConvolution(nn.Module):
         h_full = F.conv1d(padded, s_kernel, groups=B)
         h_full = h_full.squeeze(0) * self.dt
         h_full = h_full[:, :self.T]
-
         # normalize to unit integral
         h_full = h_full / (h_full.sum(dim=1, keepdim=True) + 1e-8)
-
         return h_full
 
     def forward(self, u, log_A, log_D, log_v, log_tau_s=None, apply_softplus=True):
@@ -93,17 +87,14 @@ class CIRConvolution(nn.Module):
         """
         # apply softplus (free source) or pass through (already-non-negative parametric source) + baseline mask
         u_clean = (F.softplus(u) if apply_softplus else u) * self.baseline_mask
-
         # per-sample kernels
         kernels = self.compute_kernels(log_A, log_D, log_v, log_tau_s)  # (B, T)
-
         # per-sample convolution (channels-as-batch trick for groups=B)
         B, T = u_clean.shape
         u_in = u_clean.unsqueeze(0)
         k = kernels.flip(1).unsqueeze(1)
         padded = F.pad(u_in, (T - 1, 0))
         y = F.conv1d(padded, k, groups=B).squeeze(0)
-
         return y, u_clean
 
 class PhysicsInformedCVAE(CVAE):
@@ -124,17 +115,14 @@ class PhysicsInformedCVAE(CVAE):
         self.cir_conv = CIRConvolution(t_grid, tau_s=tau_s, d0=d0, baseline_samples=baseline_samples)
         T = len(t_grid)
         self.learn_cir_params = learn_cir_params
-
         # u_head
         self.u_head = nn.Sequential(nn.Linear(self.latent_dim, 64),
                                     nn.ReLU(),
                                     nn.Linear(64, T))
-
         A_init, D_init, v_init, _ = cir_params_init
         log_A_init = float(np.log(A_init))
         log_D_init = float(np.log(D_init))
         log_v_init = float(np.log(v_init))
-
         if learn_cir_params:
             self.cir_param_head = nn.Sequential(nn.Linear(self.latent_dim, 32),
                                                 nn.ReLU(),
@@ -146,7 +134,6 @@ class PhysicsInformedCVAE(CVAE):
             self.register_buffer('log_A_fixed', torch.tensor(log_A_init, dtype=torch.float32))
             self.register_buffer('log_D_fixed', torch.tensor(log_D_init, dtype=torch.float32))
             self.register_buffer('log_v_fixed', torch.tensor(log_v_init, dtype=torch.float32))
-
         # restore so the global RNG state
         torch.set_rng_state(rng_state)
 
@@ -172,11 +159,9 @@ class PhysicsInformedCVAE(CVAE):
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
         x_hat = self.decoder(z, y, p)
-
         u_raw = self.u_head(z)
         log_A, log_D, log_v = self._cir_params(z)
         humidity_phys, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
-
         return x_hat, mu, logvar, u_post_softplus, (log_A, log_D, log_v), humidity_phys
 
     def sample(self, n, y, device, return_aux: bool = False, participant: int | None = None):
@@ -198,13 +183,11 @@ class PhysicsInformedCVAE(CVAE):
             p = torch.full((n,), participant, dtype=torch.long, device=device)
         else:
             p = torch.randint(0, self.num_participants, (n,), device=device)
-
         self.eval()
         with torch.no_grad():
             x_hat = self.decoder(z, y.to(device), p)
             if not return_aux:
                 return x_hat
-
             u_raw = self.u_head(z)
             log_A, log_D, log_v = self._cir_params(z)
             humidity_phys, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
@@ -235,8 +218,8 @@ class SharedTransportPINN(CVAE):
         self.class_transport = class_transport
         self.parametric_source = parametric_source
         if parametric_source:
-            self.src_base = nn.Embedding(self.num_classes, 4) # [t0_raw, rate_raw, A_H_raw, A_T_raw] per class
-            self.src_pert = nn.Linear(self.latent_dim, 4) # within-class variation from z
+            self.src_base = nn.Embedding(self.num_classes, 4)  # [t0_raw, rate_raw, A_H_raw, A_T_raw] per class
+            self.src_pert = nn.Linear(self.latent_dim, 4)  # within-class variation from z
             nn.init.zeros_(self.src_base.weight)
             nn.init.zeros_(self.src_pert.weight)
             nn.init.zeros_(self.src_pert.bias)
@@ -245,16 +228,14 @@ class SharedTransportPINN(CVAE):
         cond_dim = self.latent_dim + emb + (self.decoder.part_embed.embedding_dim if self._cond_part else 0)
         self.uH_head = nn.Sequential(nn.Linear(cond_dim, 64), nn.ReLU(), nn.Linear(64, T))
         self.uT_head = nn.Sequential(nn.Linear(cond_dim, 64), nn.ReLU(), nn.Linear(64, T))
-
         # UDE: integrate a driven first-order relaxation ODE (known sensor physics)
         self.ode = ode
         self.T = T
         if ode:
-            self.log_k = nn.Parameter(torch.log(torch.tensor([0.3, 0.3]))) # per-channel relaxation rate
+            self.log_k = nn.Parameter(torch.log(torch.tensor([0.3, 0.3])))  # per-channel relaxation rate
             self.res_net = nn.Sequential(nn.Linear(2 + cond_dim, 32), nn.Tanh(), nn.Linear(32, 2))
-            nn.init.zeros_(self.res_net[-1].weight) # start as pure physics
+            nn.init.zeros_(self.res_net[-1].weight)  # start as pure physics
             nn.init.zeros_(self.res_net[-1].bias)
-
         _, D_init, v_init, _ = cir_params_init
         log_D_init = float(np.log(D_init))
         log_v_init = float(np.log(v_init))
@@ -292,7 +273,7 @@ class SharedTransportPINN(CVAE):
         :return: x_hat (B, 2, 36), the humidity/temperature sources u_H and u_T, and (zero_A, log_D, log_v).
         """
         B = z.shape[0]
-        zero_A = torch.zeros(B, device=z.device) # A is normalised out of the unit-integral kernel
+        zero_A = torch.zeros(B, device=z.device)  # A is normalised out of the unit-integral kernel
         if self.ode:
             # UDE
             c = self._cond(z, y, p)
@@ -301,7 +282,7 @@ class SharedTransportPINN(CVAE):
             x = torch.zeros(B, 2, device=z.device)
             traj = []
             for t in range(self.T):
-                x = x + k * (u[:, :, t] - x) + self.res_net(torch.cat([x, c], dim=1)) # Euler step (dt=1)
+                x = x + k * (u[:, :, t] - x) + self.res_net(torch.cat([x, c], dim=1))  # Euler step (dt=1)
                 traj.append(x)
             x_hat = torch.stack(traj, dim=2)
             if self.residual:
@@ -322,11 +303,11 @@ class SharedTransportPINN(CVAE):
             log_tau_s = None
         # sources
         if self.parametric_source:
-            raw = self.src_base(y) + 0.1 * self.src_pert(z) # per-class base + small z variation
+            raw = self.src_base(y) + 0.1 * self.src_pert(z)  # per-class base + small z variation
             T = self.cir_conv.T
             idx = torch.arange(T, device=z.device, dtype=torch.float32).unsqueeze(0)
-            t0 = torch.sigmoid(raw[:, 0:1]) * T # onset in [0,T] samples
-            rate = F.softplus(raw[:, 1:2]) + 0.5 # ramp width
+            t0 = torch.sigmoid(raw[:, 0:1]) * T  # onset in [0,T] samples
+            rate = F.softplus(raw[:, 1:2]) + 0.5  # ramp width
             A_H = F.softplus(raw[:, 2:3])
             A_T = F.softplus(raw[:, 3:4])
             uH_src = A_H * torch.sigmoid((idx - t0) / rate)  # interpretable analytic injection
@@ -339,7 +320,7 @@ class SharedTransportPINN(CVAE):
             temperature_phys, uT = self.cir_conv(self.uT_head(c), zero_A, log_D, log_v, log_tau_s)
         x_hat = torch.stack([humidity_phys, temperature_phys], dim=1)
         if self.residual:
-            x_hat = x_hat + self.decoder(z, y, p) # class-discriminative residual on the physics envelope
+            x_hat = x_hat + self.decoder(z, y, p)  # class-discriminative residual on the physics envelope
         return x_hat, uH, uT, (zero_A, log_D, log_v)
 
     def forward(self, x, y, p=None):
@@ -359,7 +340,6 @@ class SharedTransportPINN(CVAE):
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
         x_hat, uH, _uT, cir = self._physics(z, y, p)
-
         return x_hat, mu, logvar, uH, cir, x_hat[:, 0, :]
 
     def sample(self, n, y, device, return_aux: bool = False, participant: int | None = None):

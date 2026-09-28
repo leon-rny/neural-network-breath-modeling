@@ -1,5 +1,6 @@
 import torch
-import torch.nn as nn
+from torch import nn
+
 
 def _expand_embedding_with_null(emb: nn.Embedding) -> nn.Embedding:
     """Return a copy of `emb` with one extra (null-token) row appended.
@@ -24,7 +25,7 @@ def elbo_loss(x: torch.Tensor, x_hat: torch.Tensor, mu: torch.Tensor, logvar: to
     """
     recon = nn.functional.mse_loss(x_hat, x, reduction='mean')
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, latent_dim)
-    kl_per_dim = kl_per_dim.mean(dim=0) # (latent_dim,)
+    kl_per_dim = kl_per_dim.mean(dim=0)  # (latent_dim,)
     kl = torch.clamp(kl_per_dim, min=free_bits).mean()
     return recon + beta * kl, recon, kl
 
@@ -46,9 +47,8 @@ class Encoder(nn.Module):
                                   nn.ReLU(),
                                   nn.Conv1d(32, 64, kernel_size=3, padding=1),
                                   nn.ReLU())
-
         # define fully connected bottleneck
-        self.fc = nn.Sequential(nn.Linear(64*36, 128),
+        self.fc = nn.Sequential(nn.Linear(64 * 36, 128),
                                 nn.ReLU())
         self.mu_head = nn.Linear(128, latent_dim)
         self.logvar_head = nn.Linear(128, latent_dim)
@@ -59,9 +59,9 @@ class Encoder(nn.Module):
         :param x: (B, 2, 36) input signals
         :return: (B, latent_dim) mean and log-variance of latent distribution
         """
-        h = self.conv(x) # (B, 64, 36)
-        h = h.flatten(1) # (B, 64*36)
-        h = self.fc(h) # (B, 128)
+        h = self.conv(x)  # (B, 64, 36)
+        h = h.flatten(1)  # (B, 64*36)
+        h = self.fc(h)  # (B, 128)
         return self.mu_head(h), self.logvar_head(h)
 
 class Decoder(nn.Module):
@@ -75,13 +75,12 @@ class Decoder(nn.Module):
         self.fc = nn.Sequential(nn.Linear(latent_dim, 128),
                                 nn.ReLU(),
                                 nn.Linear(128, 64 * 36))
-
         # use transposed convolutions to "deconvolve"
         self.conv = nn.Sequential(nn.ConvTranspose1d(64, 32, kernel_size=3, padding=1),
                                   nn.ReLU(),
                                   nn.ConvTranspose1d(32, 16, kernel_size=3, padding=1),
                                   nn.ReLU(),
-                                  nn.ConvTranspose1d(16, 2, kernel_size=3, padding=1)) # no activation on final layer
+                                  nn.ConvTranspose1d(16, 2, kernel_size=3, padding=1))  # no activation on final layer
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """Defines forward pass through decoder
@@ -89,9 +88,9 @@ class Decoder(nn.Module):
         :param z: (B, latent_dim) latent vectors
         :return: (B, 2, 36) reconstructed signals
         """
-        h = self.fc(z) # (B, 64*36)
-        h = h.view(h.size(0), 64, 36) # (B, 64, 36)
-        return self.conv(h) # (B, 2, 36)
+        h = self.fc(z)  # (B, 64*36)
+        h = h.view(h.size(0), 64, 36)  # (B, 64, 36)
+        return self.conv(h)  # (B, 2, 36)
 
 class VAE(nn.Module):
     """Combines the encoder and decoder, implements the reparameterization trick and defines a sampling method."""

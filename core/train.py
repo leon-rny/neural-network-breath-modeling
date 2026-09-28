@@ -8,12 +8,21 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from core.data import BreathDataset, PhysicsInformedDataset, load_dataset, get_split, subset_tag, cir_marker, phys_prep_marker
-from core.utils import seed_everything, seed_worker, make_generator
-from models.vae import VAE, CVAE, elbo_loss
-from models.pinn import PhysicsInformedCVAE, SharedTransportPINN
+from core.data import (
+    BreathDataset,
+    PhysicsInformedDataset,
+    cir_marker,
+    get_split,
+    load_dataset,
+    phys_prep_marker,
+    subset_tag,
+)
+from core.utils import make_generator, seed_everything, seed_worker
 from models.diffusion import ConditionalDiffusion
-from models.gan import Generator, Discriminator
+from models.gan import Discriminator, Generator
+from models.pinn import PhysicsInformedCVAE, SharedTransportPINN
+from models.vae import CVAE, VAE, elbo_loss
+
 
 def _cv_marker(cv_mode: str) -> str:
     """Run-id suffix for the cross-validation mode ('' for kfold)."""
@@ -41,11 +50,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--epochs', type=int, default=500)
     p.add_argument('--batch_size', type=int, default=32)
     # model-specific
-    p.add_argument('--latent_dim', type=int, default=16)   # ablation default
-    p.add_argument('--embed_dim', type=int, default=8)     # ablation default
+    p.add_argument('--latent_dim', type=int, default=16)  # ablation default
+    p.add_argument('--embed_dim', type=int, default=8)  # ablation default
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--free_bits', type=float, default=0.0)
-    p.add_argument('--shape_lambda', type=float, default=0.0)   # weight on the temporal-derivative (slope) recon term
+    p.add_argument('--shape_lambda', type=float, default=0.0)  # weight on the temporal-derivative (slope) recon term
     p.add_argument('--part_dropout', type=float, default=0.0)
     p.add_argument('--include_subjects', default='')
     p.add_argument('--cir_tag', default='')
@@ -58,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--tau_s', type=float, default=15.0)
     p.add_argument('--learn_cir_params', action='store_true')
     p.add_argument('--phys_residual', action='store_true')
-    p.add_argument('--ode', action='store_true')   # UDE mode: relaxation ODE + neural residual instead of the CIR convolution
+    p.add_argument('--ode', action='store_true')  # UDE mode: relaxation ODE + neural residual instead of the CIR convolution
     p.add_argument('--class_transport', action='store_true')
     p.add_argument('--parametric_source', action='store_true')
     # jittering augmentation (training only, defaults = off)
@@ -106,8 +115,8 @@ def train_vae_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, 
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
-        recon_sum  += recon.item()
-        kl_sum     += kl.item()
+        recon_sum += recon.item()
+        kl_sum += kl.item()
     n = len(loader)
     return total_loss / n, recon_sum / n, kl_sum / n
 
@@ -187,7 +196,7 @@ def active_dims(model, dataset, device, threshold=0.1, conditional=False, use_pa
             mu, logvar = model.encoder(signal)
         mus.append(mu.squeeze(0).cpu())
         logvars.append(logvar.squeeze(0).cpu())
-    mus     = torch.stack(mus)
+    mus = torch.stack(mus)
     logvars = torch.stack(logvars)
     kl_per_dim = -0.5 * (1 + logvars - mus.pow(2) - logvars.exp()).mean(dim=0)
     return int((kl_per_dim > threshold).sum().item())
@@ -276,7 +285,6 @@ def main():
         args.beta_warmup_epochs = args.epochs // 2
     device = torch.device('cpu')
     print(f'[TRAIN] init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold} cv={args.cv_mode} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
-
     include_subjects = tuple(x.strip() for x in args.include_subjects.split(',') if x.strip())
     os.makedirs(f'results/{args.model}', exist_ok=True)
     if args.model == 'vae':
@@ -300,11 +308,9 @@ def main():
         run_id += f'_{args.hp_tag}'
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
     history_path = f'results/{args.model}/{run_id}_train_history.csv'
-
     # reproducibility
     seed_everything(args.init_seed)
     g = make_generator(args.init_seed)
-
     # dataset
     df = load_dataset(args.dataset_dir)
     df = df[df['region'] == args.region].reset_index(drop=True)
@@ -324,7 +330,6 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     if args.alpha > 0 and args.n_copies > 1:
         print(f'[TRAIN] Jitter: alpha={args.alpha}, n_copies={args.n_copies} ({len(train_ds_clean)} -> {len(train_ds)} samples)')
-
     # vae, cvae, and cvae_part branch
     if args.model in ('vae', 'cvae', 'cvae_part'):
         use_participant = args.model == 'cvae_part'
@@ -337,10 +342,8 @@ def main():
             model = VAE(latent_dim=args.latent_dim).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
         best_val_loss = torch.inf
         history = []
-
         epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
         for epoch in epoch_bar:
             if use_participant and args.subj_adv_lambda > 0:
@@ -349,7 +352,6 @@ def main():
                 train_loss, train_recon, train_kl = train_vae_one_epoch(model, train_loader, optimizer, epoch, args.beta_warmup_epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max, shape_lambda=args.shape_lambda)
             val_loss, val_recon, val_kl = evaluate(model, val_loader, epoch, args.beta_warmup_epochs, device, args.free_bits, conditional, use_participant, beta_max=args.beta_max)
             scheduler.step()
-
             if val_loss < best_val_loss and beta_capped(epoch, args.beta_warmup_epochs, beta_max=args.beta_max) >= args.beta_max:
                 best_val_loss = val_loss
                 ckpt = {'epoch': epoch, 'model_state': model.state_dict(),
@@ -362,7 +364,6 @@ def main():
                     ckpt['part_embed_dim'] = args.part_embed_dim
                     ckpt['subj_adv'] = args.subj_adv_lambda > 0
                 torch.save(ckpt, ckpt_path)
-
             beta = beta_capped(epoch, args.beta_warmup_epochs, beta_max=args.beta_max)
             n_active = active_dims(model, train_ds_clean, device, conditional=conditional, use_participant=use_participant) if epoch % args.log_every == 0 or epoch == 1 else history[-1]['active_dims'] if history else 0
             history.append({'epoch': epoch, 'beta': beta,
@@ -373,7 +374,6 @@ def main():
                                    'train': f'{train_loss:.4f}',
                                    'val': f'{val_loss:.4f}',
                                    'active': n_active})
-
     # pinn / tpinn branch (tpinn = shared-transport physics-as-decoder
     elif args.model in ('pinn', 'tpinn'):
         params_cir = np.load(f'results/pinn/params_{args.region}{("_" + args.cir_tag) if args.cir_tag else ""}.npy')
@@ -394,16 +394,13 @@ def main():
                                         part_dropout=args.part_dropout).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
         best_val_loss = torch.inf
         history = []
-
         epoch_bar = tqdm(range(1, args.epochs + 1), desc=f'[TRAIN] {args.model}', unit='epoch')
         for epoch in epoch_bar:
             train_m = train_pinn_one_epoch(model, train_loader, optimizer, epoch, args.beta_warmup_epochs, device, args.free_bits, args.lambda_phys, beta_max=args.beta_max, shape_lambda=args.shape_lambda)
             val_m = evaluate_pinn(model, val_loader, epoch, args.beta_warmup_epochs, device, args.free_bits, args.lambda_phys, beta_max=args.beta_max)
             scheduler.step()
-
             beta = beta_capped(epoch, args.beta_warmup_epochs, beta_max=args.beta_max)
             # select on the ELBO (recon + beta*KL), excluding the physics penalty
             val_elbo = val_m['recon'] + beta * val_m['kl']
@@ -418,7 +415,6 @@ def main():
                             'parametric_source': args.parametric_source, 'ode': args.ode,
                             'condition_on_participant': True, 'num_participants': num_participants,
                             'part_dropout': args.part_dropout, 'cv_mode': args.cv_mode}, ckpt_path)
-
             history.append({'epoch': epoch, 'beta': beta,
                             **{f'train_{k}': train_m[k] for k in ('total', 'recon', 'kl', 'phys')},
                             **{f'val_{k}': val_m[k] for k in ('total', 'recon', 'kl', 'phys')},
@@ -428,7 +424,6 @@ def main():
                                    'vr': f'{val_m["recon"]:.4f}',
                                    'kl': f'{val_m["kl"]:.4f}',
                                    'ph': f'{val_m["phys"]:.4f}'})
-
     # diffusion branch
     elif args.model == 'diffusion':
         model = ConditionalDiffusion(num_classes=3, num_participants=num_participants,
@@ -469,7 +464,6 @@ def main():
                         'part_dropout': args.part_dropout, 'cv_mode': args.cv_mode}, ckpt_path)
             history.append({'epoch': epoch, 'train_loss': tr, 'val_loss': vl})
             epoch_bar.set_postfix({'tr': f'{tr:.4f}', 'vl': f'{vl:.4f}'})
-
     # gan branch
     elif args.model == 'gan':
         z_dim = args.latent_dim
@@ -524,7 +518,6 @@ def main():
                         'num_participants': num_participants, 'part_dropout': args.part_dropout, 'cv_mode': args.cv_mode}, ckpt_path)
             history.append({'epoch': epoch, 'lossD': dl / n, 'lossG': gl / n})
             epoch_bar.set_postfix({'D': f'{dl / n:.3f}', 'G': f'{gl / n:.3f}'})
-
     # save training history
     with open(history_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=history[0].keys())

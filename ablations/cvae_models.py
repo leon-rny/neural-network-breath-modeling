@@ -1,5 +1,6 @@
 import torch
-import torch.nn as nn
+from torch import nn
+
 
 def _expand_embedding_with_null(emb: nn.Embedding) -> nn.Embedding:
     """Return a copy of `emb` with one extra (null-token) row appended.
@@ -141,7 +142,7 @@ class ConvBaseline(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Conv-baseline encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvBaseline(**kw)
         if condition_on_participant and part_dropout > 0.0:
@@ -195,7 +196,7 @@ class ConvLargeKernel(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
         """Wire the Large-kernel conv encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvLargeKernel(**kw)
         self.decoder = _Dec_ConvLargeKernel(**kw)
 
@@ -240,7 +241,7 @@ class ConvTiny(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
         """Wire the Tiny-conv encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvTiny(**kw)
         self.decoder = _Dec_ConvTiny(**kw)
 
@@ -287,7 +288,7 @@ class ConvSlim(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
         """Wire the Slim-conv encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvSlim(**kw)
         self.decoder = _Dec_ConvSlim(**kw)
 
@@ -331,7 +332,7 @@ class MLP(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the MLP encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_MLP(**kw)
         self.decoder = _Dec_MLP(**kw)
         # match ConvBaseline: append null-token row only when part_dropout>0 (no-op for the grid, which uses 0)
@@ -381,7 +382,7 @@ class MLPSmall(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
         """Wire the Small-MLP encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_MLPSmall(**kw)
         self.decoder = _Dec_MLPSmall(**kw)
 
@@ -423,7 +424,7 @@ class MLPTiny(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
         """Wire the Tiny-MLP encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_MLPTiny(**kw)
         self.decoder = _Dec_MLPTiny(**kw)
 
@@ -451,7 +452,7 @@ class ConvAsym(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
         """Wire the Asymmetric-conv encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvAsym(**kw)
 
@@ -477,7 +478,7 @@ class ConvAsymNoDropout(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
         """Wire the Asymmetric-conv (no-dropout) encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvAsymNoDropout(**kw)
 
@@ -527,7 +528,7 @@ class ConvBaselineDropout(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
         """Wire the Conv-baseline (dropout) encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvBaselineDropout(**kw)
         self.decoder = _Dec_ConvBaselineDropout(**kw)
 
@@ -583,22 +584,22 @@ class Transformer(AblationCVAE):
     def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
         """Wire the Transformer encoder/decoder pair into AblationCVAE."""
         super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
-        kw = dict(latent_dim=latent_dim, num_classes=num_classes, embed_dim=embed_dim, cond_part=condition_on_participant, num_participants=num_participants, part_embed_dim=part_embed_dim)
+        kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_Transformer(**kw)
         self.decoder = _Dec_Transformer(**kw)
 
 VARIANT_MAP: dict[str, type] = {
-    "conv_baseline": ConvBaseline,
-    "conv_slim": ConvSlim,
-    "conv_tiny": ConvTiny,
-    "conv_large_kernel": ConvLargeKernel,
-    "conv_asym": ConvAsym,
-    "conv_asym_no_dropout": ConvAsymNoDropout,
-    "conv_baseline_dropout": ConvBaselineDropout,
-    "mlp": MLP,
-    "mlp_small": MLPSmall,
-    "mlp_tiny": MLPTiny,
-    "transformer": Transformer,
+    'conv_baseline': ConvBaseline,
+    'conv_slim': ConvSlim,
+    'conv_tiny': ConvTiny,
+    'conv_large_kernel': ConvLargeKernel,
+    'conv_asym': ConvAsym,
+    'conv_asym_no_dropout': ConvAsymNoDropout,
+    'conv_baseline_dropout': ConvBaselineDropout,
+    'mlp': MLP,
+    'mlp_small': MLPSmall,
+    'mlp_tiny': MLPTiny,
+    'transformer': Transformer,
 }
 
 def count_parameters(variant_name: str) -> int:

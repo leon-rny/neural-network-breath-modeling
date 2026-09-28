@@ -21,14 +21,14 @@ MODEL0 = {'cvae_part': 'c', 'tpinn': 't'}
 REGIONS = ['mouth', 'nose']
 # committed anchors (config 0)
 ANCHOR = {
-    'cvae_part': dict(ld=16, ed=8, ped=8, fb=0.0, bm=0.01, alpha=0.05, ncop=10),
-    'tpinn': dict(ld=16, ed=8, ped=8, fb=0.0, bm=0.01, alpha=0.05, ncop=10),
+    'cvae_part': {'ld': 16, 'ed': 8, 'ped': 8, 'fb': 0.0, 'bm': 0.01, 'alpha': 0.05, 'ncop': 10},
+    'tpinn': {'ld': 16, 'ed': 8, 'ped': 8, 'fb': 0.0, 'bm': 0.01, 'alpha': 0.05, 'ncop': 10},
 }
 SPACE = {
-    'cvae_part': dict(ld=[8, 16, 32], ed=[4, 8, 16], ped=[4, 8, 16], fb=[0.0, 0.1, 0.5],
-                      bm=[0.003, 0.01, 0.03, 0.1], alpha=[0.0, 0.05, 0.1], ncop=[1, 5, 10, 20]),
-    'tpinn': dict(ld=[8, 16, 32], ed=[8], ped=[8], fb=[0.0, 0.5],
-                  bm=[0.003, 0.01, 0.03], alpha=[0.0, 0.05, 0.1], ncop=[1, 5, 10, 20]),
+    'cvae_part': {'ld': [8, 16, 32], 'ed': [4, 8, 16], 'ped': [4, 8, 16], 'fb': [0.0, 0.1, 0.5],
+                  'bm': [0.003, 0.01, 0.03, 0.1], 'alpha': [0.0, 0.05, 0.1], 'ncop': [1, 5, 10, 20]},
+    'tpinn': {'ld': [8, 16, 32], 'ed': [8], 'ped': [8], 'fb': [0.0, 0.5],
+              'bm': [0.003, 0.01, 0.03], 'alpha': [0.0, 0.05, 0.1], 'ncop': [1, 5, 10, 20]},
 }
 AUGR = [0.5, 1.0, 2.0, 3.0]
 N_CONFIGS = 16
@@ -58,22 +58,22 @@ def sample_configs(model, objective, mi, oi):
     return cfgs
 
 # protocol constants
-PILOT_SEEDS = [0, 1, 7, 42, 123]   # full seed grid for the noise-floor pilot
-SELECT_SEEDS = [0, 1, 7]           # inner-selection seeds (inner folds already average a lot)
-FULL_SEEDS = [0, 1, 7, 42, 123]    # Stage-B final seed grid
-N_DRAWS_PILOT = 5                  # synthetic resample draws per trained model (cheap, no retrain)
+PILOT_SEEDS = [0, 1, 7, 42, 123]  # full seed grid for the noise-floor pilot
+SELECT_SEEDS = [0, 1, 7]  # inner-selection seeds (inner folds already average a lot)
+FULL_SEEDS = [0, 1, 7, 42, 123]  # Stage-B final seed grid
+N_DRAWS_PILOT = 5  # synthetic resample draws per trained model (cheap, no retrain)
 N_DRAWS_SEL = 3
 N_DRAWS_FINAL = 5
-N_PILOT_CONFIGS = 6                # anchor + 5 diverse, to gauge config sensitivity
-N_SEARCH_CONFIGS = 12              # deterministic config shortlist enumerated by the nested search
+N_PILOT_CONFIGS = 6  # anchor + 5 diverse, to gauge config sensitivity
+N_SEARCH_CONFIGS = 12  # deterministic config shortlist enumerated by the nested search
 HP_KEYS = ('ld', 'ed', 'ped', 'fb', 'bm', 'alpha', 'ncop', 'augr')
 
 # physics flags
-TPINN_PHYS = dict(phys_residual=True, phys_prep='stdscale')
+TPINN_PHYS = {'phys_residual': True, 'phys_prep': 'stdscale'}
 
 def _phys_flags(model: str) -> dict:
     """Return the physics build-id flags for `model` ({} for cvae_part, residual+stdscale for tpinn)."""
-    return dict(TPINN_PHYS) if model == 'tpinn' else dict(phys_residual=False, phys_prep='peakscale')
+    return dict(TPINN_PHYS) if model == 'tpinn' else {'phys_residual': False, 'phys_prep': 'peakscale'}
 
 def _complexity(cfg: dict) -> tuple:
     """Sort key for the 1-SE rule: prefer the simplest (smallest-capacity, most-regularised) config.
@@ -121,29 +121,33 @@ def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, c
     import torch
 
     from core.data import get_split
-    from core.tstr import (build_run_id, df_to_df_long, evaluate_classifier, extract_fixed_features,
-                           generate_synthetic_signals, load_cache, load_model,
-                           train_stacking_classifier, trtr)
+    from core.tstr import (
+        build_run_id,
+        df_to_df_long,
+        evaluate_classifier,
+        extract_fixed_features,
+        generate_synthetic_signals,
+        load_cache,
+        load_model,
+        train_stacking_classifier,
+        trtr,
+    )
 
     device = device or torch.device('cpu')
-    mode = OBJECTIVES[objective][0]   # 'tstr' or 'tstr_plus'
+    mode = OBJECTIVES[objective][0]  # 'tstr' or 'tstr_plus'
     phys = _phys_flags(model_name)
-
     run_id = build_run_id(model_name, region, init_seed, fold, ld, ed, ped, fb, alpha, ncop,
                           cv_mode=cv_mode, part_dropout=part_dropout,
                           phys_residual=phys['phys_residual'], phys_prep=phys['phys_prep'],
                           include_subjects=include_subjects, hp_tag=hp_tag)
-
     sub_tag = subset_tag(include_subjects)
     cache = load_cache(region, init_seed, split_seed, fold, n_folds, cv_mode=cv_mode, sub_tag=sub_tag)
     if cache is None:
         cache = trtr(dataset_dir, region, n_jobs, init_seed, split_seed, fold, n_folds=n_folds,
                      cv_mode=cv_mode, include_subjects=include_subjects)
-
     model, ckpt_stats = load_model(model_name, run_id, device)
     participant_idx = model.null_part_idx if (cv_mode == 'loso' and getattr(model, '_cond_part', False)) else None
     n_synth = int(cache['n_train'] * augr) if mode == 'tstr_plus' else cache['n_train']
-
     # held-out validation features for kfold inner selection (test fold stays untouched)
     val_feats = None
     if eval_val:
@@ -154,10 +158,9 @@ def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, c
         df_long_val, y_val = df_to_df_long(df_val)
         X_val = _features_from_long(df_long_val, cache, extract_fixed_features, n_jobs)
         val_feats = (X_val, y_val.values)
-
     test_acc, test_f1, val_acc = [], [], []
     for d in range(n_draws):
-        draw_seed = init_seed + 1000 * d   # vary only the draw; offset keeps it off the seed grid
+        draw_seed = init_seed + 1000 * d  # vary only the draw; offset keeps it off the seed grid
         synth, synth_y = generate_synthetic_signals(model, model_name, n_synth, ckpt_stats, device,
                                                     draw_seed, participant_idx=participant_idx)
         n, _C, T = synth.shape
@@ -169,13 +172,12 @@ def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, c
             y_tr = np.concatenate([cache['y_train'], synth_y])
         else:
             X_tr, y_tr = X_synth, synth_y
-        clf = train_stacking_classifier(X_tr, y_tr, init_seed, n_jobs=n_jobs) # fixed seed -> draw isolates sampling noise
+        clf = train_stacking_classifier(X_tr, y_tr, init_seed, n_jobs=n_jobs)  # fixed seed -> draw isolates sampling noise
         m = evaluate_classifier(clf, cache['X_test_top'], cache['y_test'])
         test_acc.append(m['accuracy'])
         test_f1.append(m['f1_weighted'])
         if val_feats is not None:
             val_acc.append(evaluate_classifier(clf, val_feats[0], val_feats[1])['accuracy'])
-
     return {'model': model_name, 'objective': objective, 'mode': mode, 'region': region,
             'cv_mode': cv_mode, 'init_seed': init_seed, 'split_seed': split_seed, 'fold': fold,
             'n_folds': n_folds, 'part_dropout': part_dropout, 'outer': outer, 'inner': inner,
@@ -200,8 +202,8 @@ def run_score(args) -> None:
     with open(out, 'w') as f:
         json.dump(result, f, indent=2)
     acc = float(np.mean(result['test_acc']))
-    print(f"[SCORE] {args.stage} {args.objective} {args.model} {args.region} outer={args.outer} "
-          f"inner={args.inner} seed={args.seed} -> test_acc={acc:.4f} (n_draws={args.n_draws}) -> {out}")
+    print(f'[SCORE] {args.stage} {args.objective} {args.model} {args.region} outer={args.outer} '
+          f'inner={args.inner} seed={args.seed} -> test_acc={acc:.4f} (n_draws={args.n_draws}) -> {out}')
 
 # manifest generation (one row per SLURM array task)
 PILOT_COLS = ['model', 'cv', 'region', 'cfg_id', 'hptag', 'ld', 'ed', 'ped', 'fb', 'bm', 'alpha',
@@ -215,8 +217,7 @@ def _write_tsv(cols: list[str], rows: list[list], out: str) -> None:
     """Write a header + tab-separated rows manifest, the format the SLURM array scripts `sed`-read."""
     with open(out, 'w') as f:
         f.write('\t'.join(cols) + '\n')
-        for r in rows:
-            f.write('\t'.join(str(x) for x in r) + '\n')
+        f.writelines('\t'.join(str(x) for x in r) + '\n' for r in rows)
     print(f'[MANIFEST] wrote {len(rows)} rows to {out}')
 
 def pilot_manifest(out: str, dataset_dir: str = 'dataset') -> None:
@@ -228,7 +229,7 @@ def pilot_manifest(out: str, dataset_dir: str = 'dataset') -> None:
         cfgs = _pilot_configs(model, mi)
         for cv in ('kfold', 'loso'):
             nf = 5 if cv == 'kfold' else nloso
-            pd_ = 0.0 if cv == 'kfold' else 0.1 # null-token dropout required for LOSO generation
+            pd_ = 0.0 if cv == 'kfold' else 0.1  # null-token dropout required for LOSO generation
             for region in REGIONS:
                 for cid, c in enumerate(cfgs):
                     hptag = f'p0{MODEL0[model]}c{cid:02d}'
@@ -280,7 +281,8 @@ def nfinal_manifest(winners_path: str, out: str, dataset_dir: str = 'dataset') -
     each outer fold's selected config and the fixed anchor, refit on the untouched outer test
     fold over the full seed grid."""
     nloso = n_loso_folds(load_dataset(dataset_dir))
-    winners = json.load(open(winners_path))
+    with open(winners_path) as f:
+        winners = json.load(f)
     rows = []
     for key, w in winners.items():
         model, objective, region = key.split('|')
@@ -324,7 +326,6 @@ def pilot_report(directory: str = 'results/tuning/pilot', out: str = 'results/tu
     by = {}
     for r in rows:
         by.setdefault((r['model'], r['objective'], r['region']), []).append(r)
-
     for (model, objective, region), rs in sorted(by.items()):
         # headline per config = mean over folds of (mean over seeds of (mean over draws))
         cfg_headline = {}
@@ -338,7 +339,7 @@ def pilot_report(directory: str = 'results/tuning/pilot', out: str = 'results/tu
                 if len(r['test_acc']) > 1:
                     draw_sds.append(float(np.std(r['test_acc'], ddof=1)))
             fold_means = []
-            for fold, seedmap in cell.items():
+            for seedmap in cell.values():
                 vals = list(seedmap.values())
                 fold_means.append(np.mean(vals))
                 if len(vals) > 1:
@@ -346,7 +347,6 @@ def pilot_report(directory: str = 'results/tuning/pilot', out: str = 'results/tu
             if len(fold_means) > 1:
                 fold_sds.append(float(np.std(fold_means, ddof=1)))
             cfg_headline[cid] = (float(np.mean(fold_means)), fold_means)
-
         anchor_head, anchor_folds = cfg_headline.get(0, (np.nan, []))
         se_headline = float(np.std(anchor_folds, ddof=1) / np.sqrt(len(anchor_folds))) if len(anchor_folds) > 1 else np.nan
         mdd = float(1.96 * np.sqrt(2) * se_headline) if not np.isnan(se_headline) else np.nan
@@ -417,7 +417,7 @@ def select_nested(directory: str = 'results/tuning/nsearch', out: str = 'results
                                                                'best_score': round(means[best], 4)}
                 if per_fold:
                     anc = _anchor_cfg(model)
-                    if mode == 'tstr_plus': # keep the anchor's committed augmentation ratio
+                    if mode == 'tstr_plus':  # keep the anchor's committed augmentation ratio
                         anc['augr'] = 1.0
                     winners[f'{model}|{objective}|{region}'] = {'per_fold': per_fold, 'anchor': anc}
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -438,7 +438,7 @@ def _paired_test(deltas: np.ndarray) -> float:
     try:
         from scipy.stats import wilcoxon
         return float(wilcoxon(deltas).pvalue)
-    except Exception:
+    except (ImportError, ValueError):
         from statistics import NormalDist
         m, s = float(np.mean(deltas)), float(np.std(deltas, ddof=1))
         if s == 0:
@@ -459,7 +459,6 @@ def final_report(directory: str = 'results/tuning/nfinal', pilot_csv: str = 'res
         pdf = pd.read_csv(pilot_csv)
         for _, r in pdf.iterrows():
             mdd_lookup[(r['model'], r['objective'], r['region'])] = float(r['mdd'])
-
     # group by (model,objective,region)
     grp = {}
     for r in rows:
@@ -467,7 +466,6 @@ def final_report(directory: str = 'results/tuning/nfinal', pilot_csv: str = 'res
         which = 'anchor' if r['hp_tag'].startswith('nfa') else 'sel'
         grp.setdefault(key, {'sel': {}, 'anchor': {}})
         grp[key][which][(r['outer'], r['init_seed'])] = float(np.mean(r['test_acc']))
-
     recs = []
     for key, d in sorted(grp.items()):
         sel, anc = d['sel'], d['anchor']
@@ -501,7 +499,6 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the pilot/nested-search/final subcommands."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
-
     s = sub.add_parser('score')
     s.add_argument('--stage', required=True, choices=['pilot', 'nsearch', 'nfinal'])
     s.add_argument('--model', required=True, choices=MODELS)
@@ -528,7 +525,6 @@ def parse_args() -> argparse.Namespace:
     s.add_argument('--eval_val', type=int, default=0)
     s.add_argument('--n_jobs', type=int, default=1)
     s.add_argument('--dataset_dir', default='dataset')
-
     m = sub.add_parser('pilot-manifest')
     m.add_argument('--out', required=True)
     se = sub.add_parser('nsearch-manifest')
@@ -536,7 +532,6 @@ def parse_args() -> argparse.Namespace:
     fi = sub.add_parser('nfinal-manifest')
     fi.add_argument('--winners', required=True)
     fi.add_argument('--out', required=True)
-
     pr = sub.add_parser('pilot-report')
     pr.add_argument('--dir', default='results/tuning/pilot')
     pr.add_argument('--out', default='results/tuning/pilot_report.csv')

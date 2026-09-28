@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class Generator(nn.Module):
@@ -65,7 +65,6 @@ class Generator(nn.Module):
             p = torch.randint(0, self.num_participants, (n,), device=device)
         self.eval()
         return self.forward(z, y.to(device), p)
-
 
 class Discriminator(nn.Module):
     """Class-conditional 1D conv discriminator: (x, class) -> real/fake logit. (Conditions on class only;
