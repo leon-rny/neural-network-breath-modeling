@@ -193,9 +193,9 @@ class _Dec_ConvLargeKernel(nn.Module):
 
 class ConvLargeKernel(AblationCVAE):
     """Conv CVAE with kernel-7 convolutions throughout (wider receptive field)."""
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Large-kernel conv encoder/decoder pair into AblationCVAE."""
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvLargeKernel(**kw)
         self.decoder = _Dec_ConvLargeKernel(**kw)
@@ -238,9 +238,9 @@ class _Dec_ConvTiny(nn.Module):
 
 class ConvTiny(AblationCVAE):
     """Smallest conv CVAE (single Conv1d 2->8, FC 16)."""
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Tiny-conv encoder/decoder pair into AblationCVAE."""
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvTiny(**kw)
         self.decoder = _Dec_ConvTiny(**kw)
@@ -285,9 +285,9 @@ class _Dec_ConvSlim(nn.Module):
 
 class ConvSlim(AblationCVAE):
     """Slim conv CVAE (2-layer Conv1d 2->8->16, FC 64)."""
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Slim-conv encoder/decoder pair into AblationCVAE."""
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvSlim(**kw)
         self.decoder = _Dec_ConvSlim(**kw)
@@ -379,9 +379,9 @@ class _Dec_MLPSmall(nn.Module):
 
 class MLPSmall(AblationCVAE):
     """Smaller fully-connected CVAE (72->64->32)."""
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Small-MLP encoder/decoder pair into AblationCVAE."""
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_MLPSmall(**kw)
         self.decoder = _Dec_MLPSmall(**kw)
@@ -421,9 +421,9 @@ class _Dec_MLPTiny(nn.Module):
 
 class MLPTiny(AblationCVAE):
     """Minimal fully-connected CVAE (single hidden layer, no pre-output nonlinearity)."""
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Tiny-MLP encoder/decoder pair into AblationCVAE."""
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_MLPTiny(**kw)
         self.decoder = _Dec_MLPTiny(**kw)
@@ -449,9 +449,9 @@ class _Dec_ConvAsym(nn.Module):
 
 class ConvAsym(AblationCVAE):
     """Asymmetric CVAE: full conv encoder with a single-layer dropout decoder."""
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Asymmetric-conv encoder/decoder pair into AblationCVAE."""
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvAsym(**kw)
@@ -475,9 +475,9 @@ class _Dec_ConvAsymNoDropout(nn.Module):
 
 class ConvAsymNoDropout(AblationCVAE):
     """Asymmetric CVAE: weak single-layer decoder, no dropout (isolates decoder weakness)."""
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Asymmetric-conv (no-dropout) encoder/decoder pair into AblationCVAE."""
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvBaseline(**kw)
         self.decoder = _Dec_ConvAsymNoDropout(**kw)
@@ -525,9 +525,9 @@ class _Dec_ConvBaselineDropout(nn.Module):
 
 class ConvBaselineDropout(AblationCVAE):
     """Conv baseline CVAE with dropout (0.4) in both encoder and decoder FCs."""
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Conv-baseline (dropout) encoder/decoder pair into AblationCVAE."""
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_ConvBaselineDropout(**kw)
         self.decoder = _Dec_ConvBaselineDropout(**kw)
@@ -581,9 +581,9 @@ class _Dec_Transformer(nn.Module):
 
 class Transformer(AblationCVAE):
     """Attention-based CVAE: 2-layer transformer encoder/decoder (non-autoregressive)."""
-    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8):
+    def __init__(self, latent_dim=16, num_classes=3, embed_dim=8, condition_on_participant=False, num_participants=3, part_embed_dim=8, part_dropout=0.0):
         """Wire the Transformer encoder/decoder pair into AblationCVAE."""
-        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant)
+        super().__init__(latent_dim, num_classes, num_participants, condition_on_participant, part_dropout)
         kw = {'latent_dim': latent_dim, 'num_classes': num_classes, 'embed_dim': embed_dim, 'cond_part': condition_on_participant, 'num_participants': num_participants, 'part_embed_dim': part_embed_dim}
         self.encoder = _Enc_Transformer(**kw)
         self.decoder = _Dec_Transformer(**kw)

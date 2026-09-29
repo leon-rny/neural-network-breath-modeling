@@ -62,7 +62,8 @@ class Generator(nn.Module):
         elif participant is not None:
             p = torch.full((n,), participant, dtype=torch.long, device=device)
         else:
-            p = torch.randint(0, self.num_participants, (n,), device=device)
+            pool = torch.tensor(getattr(self, 'trained_participants', list(range(self.num_participants))), device=device)
+            p = pool[torch.randint(len(pool), (n,), device=device)]
         self.eval()
         return self.forward(z, y.to(device), p)
 

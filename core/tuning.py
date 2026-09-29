@@ -7,6 +7,7 @@ import re
 
 import numpy as np
 import pandas as pd
+from scipy.stats import t, wilcoxon
 
 from core.data import load_dataset, n_loso_folds, subset_tag
 
@@ -101,7 +102,7 @@ def _anchor_cfg(model: str) -> dict:
 # scoring (one trained checkpoint -> per-draw accuracies for one objective)
 def _features_from_long(df_long, cache, extract_fixed_features, n_jobs):
     """Extract the cache's top-20 (sanitised) feature matrix from a tsfresh long-format frame."""
-    X_raw = extract_fixed_features(df_long, cache['top_20_features_raw'], n_jobs)
+    X_raw = extract_fixed_features(df_long, cache['top_20_features_raw'], n_jobs, cache['imputation'])
     X_san = X_raw.copy()
     X_san.columns = [re.sub(r'[^\w]', '_', c) for c in X_san.columns]
     return X_san[cache['top_20_features_sanitized']].values
@@ -129,8 +130,11 @@ def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, c
         generate_synthetic_signals,
         load_cache,
         load_model,
+        preprocess_signals,
+        preprocess_synth_signals,
         train_stacking_classifier,
         trtr,
+        validate_generator,
     )
 
     device = device or torch.device('cpu')
@@ -141,11 +145,12 @@ def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, c
                           phys_residual=phys['phys_residual'], phys_prep=phys['phys_prep'],
                           include_subjects=include_subjects, hp_tag=hp_tag)
     sub_tag = subset_tag(include_subjects)
-    cache = load_cache(region, init_seed, split_seed, fold, n_folds, cv_mode=cv_mode, sub_tag=sub_tag)
+    cache = load_cache(region, init_seed, split_seed, fold, n_folds, cv_mode=cv_mode, sub_tag=sub_tag, prep_tag='_prepbaseline', dataset_dir=dataset_dir)
     if cache is None:
         cache = trtr(dataset_dir, region, n_jobs, init_seed, split_seed, fold, n_folds=n_folds,
-                     cv_mode=cv_mode, include_subjects=include_subjects)
+                     cv_mode=cv_mode, include_subjects=include_subjects, preprocessing='baseline')
     model, ckpt_stats = load_model(model_name, run_id, device)
+    validate_generator(model, cache, model_name, 'baseline')
     participant_idx = model.null_part_idx if (cv_mode == 'loso' and getattr(model, '_cond_part', False)) else None
     n_synth = int(cache['n_train'] * augr) if mode == 'tstr_plus' else cache['n_train']
     # held-out validation features for kfold inner selection (test fold stays untouched)
@@ -155,7 +160,7 @@ def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, c
         df = df[df['region'] == region].reset_index(drop=True)
         _, df_val, _ = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds,
                                  split_seed=split_seed, include_subjects=include_subjects)
-        df_long_val, y_val = df_to_df_long(df_val)
+        df_long_val, y_val = df_to_df_long(preprocess_signals(df_val, 'baseline'))
         X_val = _features_from_long(df_long_val, cache, extract_fixed_features, n_jobs)
         val_feats = (X_val, y_val.values)
     test_acc, test_f1, val_acc = [], [], []
@@ -163,6 +168,7 @@ def score(model_name, region, objective, init_seed, split_seed, fold, n_folds, c
         draw_seed = init_seed + 1000 * d  # vary only the draw; offset keeps it off the seed grid
         synth, synth_y = generate_synthetic_signals(model, model_name, n_synth, ckpt_stats, device,
                                                     draw_seed, participant_idx=participant_idx)
+        synth = preprocess_synth_signals(synth, 'baseline')
         n, _C, T = synth.shape
         df_long = pd.DataFrame({'id': np.repeat(np.arange(n), T), 'time': np.tile(np.arange(T), n),
                                 'Humidity': synth[:, 0, :].ravel(), 'Temperature': synth[:, 1, :].ravel()})
@@ -376,8 +382,7 @@ def _select_units(r: dict) -> list[float]:
 def select_nested(directory: str = 'results/tuning/nsearch', out: str = 'results/tuning/nested_winners.json') -> dict:
     """Pick, per (model, objective, region, outer fold), the config chosen by the 1-SE rule.
 
-    Inner score per config = mean over its selection units (kfold: val draws x seeds; loso: test
-    draws x inner subjects x seeds). Keep all configs within one standard error of the best, then
+    Average draws and seeds within each inner validation unit before estimating uncertainty. Keep all configs within one standard error of the best, then
     take the simplest (`_complexity`). Writes a winners JSON consumed by `nfinal_manifest`.
     """
     rows = _load_jsons(directory)
@@ -398,9 +403,10 @@ def select_nested(directory: str = 'results/tuning/nsearch', out: str = 'results
                     ors = [r for r in rs if r['outer'] == outer]
                     cfg_units, cfg_meta = {}, {}
                     for cid in sorted({r['cfg_id'] for r in ors}):
-                        units = []
+                        by_unit = {}
                         for r in [x for x in ors if x['cfg_id'] == cid]:
-                            units.extend(_select_units(r))
+                            by_unit.setdefault(r['inner'], []).append(float(np.mean(_select_units(r))))
+                        units = [float(np.mean(values)) for values in by_unit.values()]
                         if units:
                             cfg_units[cid] = np.asarray(units, dtype=float)
                             cfg_meta[cid] = cfg_table[cid]
@@ -431,20 +437,11 @@ def select_nested(directory: str = 'results/tuning/nsearch', out: str = 'results
 
 # analysis: final report
 def _paired_test(deltas: np.ndarray) -> float:
-    """Two-sided p-value that the paired (sel - anchor) differences are non-zero (Wilcoxon, else t)."""
+    """Two-sided Wilcoxon p-value for paired participant-level differences."""
     deltas = np.asarray(deltas, dtype=float)
     if len(deltas) < 2 or np.allclose(deltas, 0):
         return float('nan')
-    try:
-        from scipy.stats import wilcoxon
-        return float(wilcoxon(deltas).pvalue)
-    except (ImportError, ValueError):
-        from statistics import NormalDist
-        m, s = float(np.mean(deltas)), float(np.std(deltas, ddof=1))
-        if s == 0:
-            return float('nan')
-        z = m / (s / np.sqrt(len(deltas)))
-        return float(2 * (1 - NormalDist().cdf(abs(z))))
+    return float(wilcoxon(deltas).pvalue)
 
 def final_report(directory: str = 'results/tuning/nfinal', pilot_csv: str = 'results/tuning/pilot_report.csv', out: str = 'results/tuning/nested_final_report.csv') -> pd.DataFrame:
     """Headline +/- CI for selected vs anchor per (model, objective, region), with a paired test.
@@ -470,14 +467,19 @@ def final_report(directory: str = 'results/tuning/nfinal', pilot_csv: str = 'res
     for key, d in sorted(grp.items()):
         sel, anc = d['sel'], d['anchor']
         common = sorted(set(sel) & set(anc))
-        sel_all = list(sel.values())
-        anc_all = list(anc.values())
-        deltas = np.array([sel[k] - anc[k] for k in common]) if common else np.array([])
-        sel_mean = float(np.mean(sel_all)) if sel_all else np.nan
-        anc_mean = float(np.mean(anc_all)) if anc_all else np.nan
+        if set(sel) != set(anc):
+            raise ValueError(f'Incomplete selected/anchor pairing for {key}')
+        folds = sorted({fold for fold, _ in common})
+        selected = [np.mean([sel[k] for k in common if k[0] == fold]) for fold in folds]
+        anchors = [np.mean([anc[k] for k in common if k[0] == fold]) for fold in folds]
+        deltas = np.asarray(selected) - np.asarray(anchors)
+        sel_mean = float(np.mean(selected)) if selected else np.nan
+        anc_mean = float(np.mean(anchors)) if anchors else np.nan
         delta = float(np.mean(deltas)) if len(deltas) else np.nan
-        ci = float(1.96 * np.std(deltas, ddof=1) / np.sqrt(len(deltas))) if len(deltas) > 1 else np.nan
-        p = _paired_test(deltas)
+        # k-fold training sets overlap; report descriptive differences only
+        loso = key[1] in ('loso', 'losop')
+        ci = float(t.ppf(0.975, len(deltas) - 1) * np.std(deltas, ddof=1) / np.sqrt(len(deltas))) if loso and len(deltas) > 1 else np.nan
+        p = _paired_test(deltas) if loso else np.nan
         mdd = mdd_lookup.get(key, np.nan)
         improved = bool(delta > 0 and (not np.isnan(p) and p < 0.05) and (np.isnan(mdd) or delta > mdd))
         recs.append({'model': key[0], 'objective': key[1], 'region': key[2],

@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import os
 import re
 
@@ -23,7 +25,7 @@ def load_sir(dataset_dir='dataset'):
     dataset = []
     folder = os.path.join(dataset_dir, 'sir')
     for fname in sorted(os.listdir(folder)):
-        m = re.compile(r'^(sir|bradypnea|eupnea|tachypnea)_(mouth|nose)_trial_(\d+)\.dat$').match(fname)
+        m = re.compile(r'^(sir_long|sir|bradypnea|eupnea|tachypnea)_(mouth|nose)_trial_(\d+)\.dat$').match(fname)
         if m is None:
             continue
         df = pd.read_csv(os.path.join(folder, fname))
@@ -201,6 +203,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--dataset_dir', default='dataset')
     parser.add_argument('--per_class', action='store_true')
+    parser.add_argument('--calibration', choices=['sir', 'sir_long'], default='sir')
     parser.add_argument('--region', choices=REGIONS, default=None)
     args = parser.parse_args()
     out_dir = os.path.join('results', 'pinn')
@@ -210,15 +213,20 @@ def main():
         raise SystemExit(f"No SIR files matched in {os.path.join(args.dataset_dir, 'sir')}")
     regions = [args.region] if args.region else REGIONS
     # generic fit: sir_long step-input, per region
-    df_long = df_sir[df_sir['class'] == 'sir_long']
+    df_long = df_sir[df_sir['class'] == args.calibration]
     for region in regions:
         df_r = df_long[df_long['region'] == region]
         if df_r.empty:
-            print(f'[warn] no sir_long trials for region={region}, skipping.')
-            continue
+            raise ValueError(f'No {args.calibration} calibration trials for region={region}')
         params_h = fit_group(df_r, f'GENERIC region={region}')
         out_path = os.path.join(out_dir, f'params_{region}.npy')
         np.save(out_path, params_h)
+        inputs = {}
+        for filename in df_r['filename']:
+            with open(os.path.join(args.dataset_dir, 'sir', filename), 'rb') as source:
+                inputs[filename] = hashlib.sha256(source.read()).hexdigest()
+        with open(out_path + '.json', 'w') as manifest:
+            json.dump({'calibration': args.calibration, 'files': inputs, 'seed': SEED}, manifest, indent=2)
         print(f'  saved -> {out_path}')
     # optional per-class fits
     if args.per_class:

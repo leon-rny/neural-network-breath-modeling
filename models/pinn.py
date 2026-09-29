@@ -156,6 +156,14 @@ class PhysicsInformedCVAE(CVAE):
         :param p: Optional (B,) participant labels (required when conditioning on participant).
         :return: x_hat, mu, logvar, softplus source, (log_A, log_D, log_v), physics humidity.
         """
+        if self.training and self._cond_part and p is not None and self.part_dropout > 0.0:
+            self._total_steps += 1
+            if torch.rand(1).item() < self.part_dropout:
+                p = torch.full_like(p, self.null_part_idx)
+                self._null_steps += 1
+        if not self.training and self._cond_part and p is not None and hasattr(self, 'trained_participants'):
+            known = torch.tensor(self.trained_participants, device=p.device)
+            p = torch.where(torch.isin(p, known), p, self.null_part_idx)
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
         x_hat = self.decoder(z, y, p)
@@ -182,7 +190,8 @@ class PhysicsInformedCVAE(CVAE):
         elif participant is not None:  # e.g. null_part_idx for LOSO generation of an unseen subject
             p = torch.full((n,), participant, dtype=torch.long, device=device)
         else:
-            p = torch.randint(0, self.num_participants, (n,), device=device)
+            pool = torch.tensor(getattr(self, 'trained_participants', list(range(self.num_participants))), device=device)
+            p = pool[torch.randint(len(pool), (n,), device=device)]
         self.eval()
         with torch.no_grad():
             x_hat = self.decoder(z, y.to(device), p)
@@ -337,6 +346,9 @@ class SharedTransportPINN(CVAE):
             if torch.rand(1).item() < self.part_dropout:
                 p = torch.full_like(p, self.null_part_idx)
                 self._null_steps += 1
+        if not self.training and self._cond_part and p is not None and hasattr(self, 'trained_participants'):
+            known = torch.tensor(self.trained_participants, device=p.device)
+            p = torch.where(torch.isin(p, known), p, self.null_part_idx)
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
         x_hat, uH, _uT, cir = self._physics(z, y, p)
@@ -360,7 +372,8 @@ class SharedTransportPINN(CVAE):
         elif participant is not None:
             p = torch.full((n,), participant, dtype=torch.long, device=device)
         else:
-            p = torch.randint(0, self.num_participants, (n,), device=device)
+            pool = torch.tensor(getattr(self, 'trained_participants', list(range(self.num_participants))), device=device)
+            p = pool[torch.randint(len(pool), (n,), device=device)]
         self.eval()
         with torch.no_grad():
             x_hat, uH, uT, cir = self._physics(z, y.to(device), p)

@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from core.data import (
+    PARTICIPANT_TO_IDX,
+    PARTICIPANTS,
     BreathDataset,
     PhysicsInformedDataset,
     cir_marker,
@@ -17,11 +19,12 @@ from core.data import (
     phys_prep_marker,
     subset_tag,
 )
+from core.provenance import file_digest, fingerprint, reserve_training
 from core.utils import make_generator, seed_everything, seed_worker
 from models.diffusion import ConditionalDiffusion
 from models.gan import Discriminator, Generator
 from models.pinn import PhysicsInformedCVAE, SharedTransportPINN
-from models.vae import CVAE, VAE, elbo_loss
+from models.vae import CVAE, VAE, ClasswiseVAE, elbo_loss
 
 
 def _cv_marker(cv_mode: str) -> str:
@@ -50,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--epochs', type=int, default=500)
     p.add_argument('--batch_size', type=int, default=32)
     # model-specific
+    p.add_argument('--classwise_vae', action='store_true')
     p.add_argument('--latent_dim', type=int, default=16)  # ablation default
     p.add_argument('--embed_dim', type=int, default=8)  # ablation default
     p.add_argument('--part_embed_dim', type=int, default=8)
@@ -84,7 +88,9 @@ def parse_args() -> argparse.Namespace:
 # vae and cvae training
 def beta_capped(epoch: int, warmup_epochs: int, beta_max: float = 0.1) -> float:
     """Linear warmup from 0 -> beta_max over first half of training, then hold."""
-    return min(beta_max, (epoch / warmup_epochs) * beta_max)
+    if warmup_epochs < 0:
+        raise ValueError('warmup_epochs must be nonnegative')
+    return beta_max if warmup_epochs == 0 else min(beta_max, (epoch / warmup_epochs) * beta_max)
 
 def train_vae_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, conditional=False, use_participant=False, beta_max=0.1, shape_lambda=0.0):
     """Train a (C)VAE for one epoch with beta-warmup ELBO.
@@ -114,10 +120,10 @@ def train_vae_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
-        recon_sum += recon.item()
-        kl_sum += kl.item()
-    n = len(loader)
+        total_loss += loss.item() * signal.size(0)
+        recon_sum += recon.item() * signal.size(0)
+        kl_sum += kl.item() * signal.size(0)
+    n = len(loader.dataset)
     return total_loss / n, recon_sum / n, kl_sum / n
 
 def train_cvae_adv_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, adv_lambda, beta_max=0.1):
@@ -143,10 +149,10 @@ def train_cvae_adv_one_epoch(model, loader, optimizer, epoch, warmup_epochs, dev
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        total += loss.item()
-        recon_sum += recon.item()
-        kl_sum += kl.item()
-    n = len(loader)
+        total += loss.item() * signal.size(0)
+        recon_sum += recon.item() * signal.size(0)
+        kl_sum += kl.item() * signal.size(0)
+    n = len(loader.dataset)
     return total / n, recon_sum / n, kl_sum / n
 
 @torch.no_grad()
@@ -172,10 +178,10 @@ def evaluate(model, loader, epoch, warmup_epochs, device, free_bits, conditional
         else:
             x_hat, mu, logvar = model(signal)
         loss, recon, kl = elbo_loss(signal, x_hat, mu, logvar, beta, free_bits)
-        total_loss += loss.item()
-        recon_sum += recon.item()
-        kl_sum += kl.item()
-    n = len(loader)
+        total_loss += loss.item() * signal.size(0)
+        recon_sum += recon.item() * signal.size(0)
+        kl_sum += kl.item() * signal.size(0)
+    n = len(loader.dataset)
     return total_loss / n, recon_sum / n, kl_sum / n
 
 @torch.no_grad()
@@ -213,9 +219,9 @@ def pinn_diag_stats(u_post_softplus, cir_params):
     """
     log_A, log_D, log_v = cir_params
     return {'u_norm': u_post_softplus.norm(dim=1).mean().item(),
-            'logA_mean': log_A.mean().item(), 'logA_std': log_A.std().item(),
-            'logD_mean': log_D.mean().item(), 'logD_std': log_D.std().item(),
-            'logv_mean': log_v.mean().item(), 'logv_std': log_v.std().item()}
+            'logA_mean': log_A.mean().item(), 'logA_std': log_A.std(unbiased=False).item(),
+            'logD_mean': log_D.mean().item(), 'logD_std': log_D.std(unbiased=False).item(),
+            'logv_mean': log_v.mean().item(), 'logv_std': log_v.std(unbiased=False).item()}
 
 def train_pinn_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device, free_bits, lambda_phys, beta_max=0.1, shape_lambda=0.0):
     """Train a (t)PINN for one epoch: loss = ELBO + lambda_phys * MSE(humidity_phys, x_hat humidity).
@@ -225,7 +231,7 @@ def train_pinn_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device,
     """
     model.train()
     beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
-    totals = {k: 0.0 for k in ('total', 'recon', 'kl', 'phys') + PINN_DIAG_KEYS}
+    totals = dict.fromkeys(('total', 'recon', 'kl', 'phys') + PINN_DIAG_KEYS, 0.0)
     for signal, _time, label, participant, _onset in loader:
         signal = signal.to(device)
         label = label.long().to(device)
@@ -241,13 +247,13 @@ def train_pinn_one_epoch(model, loader, optimizer, epoch, warmup_epochs, device,
         optimizer.step()
         with torch.no_grad():
             diag = pinn_diag_stats(u_post_softplus, cir_params)
-        totals['total'] += loss.item()
-        totals['recon'] += recon.item()
-        totals['kl'] += kl.item()
-        totals['phys'] += phys.item()
+        totals['total'] += loss.item() * signal.size(0)
+        totals['recon'] += recon.item() * signal.size(0)
+        totals['kl'] += kl.item() * signal.size(0)
+        totals['phys'] += phys.item() * signal.size(0)
         for k in PINN_DIAG_KEYS:
-            totals[k] += diag[k]
-    n = len(loader)
+            totals[k] += diag[k] * signal.size(0)
+    n = len(loader.dataset)
     return {k: v / n for k, v in totals.items()}
 
 @torch.no_grad()
@@ -258,7 +264,7 @@ def evaluate_pinn(model, loader, epoch, warmup_epochs, device, free_bits, lambda
     """
     model.eval()
     beta = beta_capped(epoch, warmup_epochs, beta_max=beta_max)
-    totals = {k: 0.0 for k in ('total', 'recon', 'kl', 'phys') + PINN_DIAG_KEYS}
+    totals = dict.fromkeys(('total', 'recon', 'kl', 'phys') + PINN_DIAG_KEYS, 0.0)
     for signal, _time, label, participant, _onset in loader:
         signal = signal.to(device)
         label = label.long().to(device)
@@ -268,13 +274,13 @@ def evaluate_pinn(model, loader, epoch, warmup_epochs, device, free_bits, lambda
         phys = F.mse_loss(humidity_phys, x_hat[:, 0, :])
         loss = elbo + lambda_phys * phys
         diag = pinn_diag_stats(u_post_softplus, cir_params)
-        totals['total'] += loss.item()
-        totals['recon'] += recon.item()
-        totals['kl'] += kl.item()
-        totals['phys'] += phys.item()
+        totals['total'] += loss.item() * signal.size(0)
+        totals['recon'] += recon.item() * signal.size(0)
+        totals['kl'] += kl.item() * signal.size(0)
+        totals['phys'] += phys.item() * signal.size(0)
         for k in PINN_DIAG_KEYS:
-            totals[k] += diag[k]
-    n = len(loader)
+            totals[k] += diag[k] * signal.size(0)
+    n = len(loader.dataset)
     return {k: v / n for k, v in totals.items()}
 
 # main loop
@@ -283,6 +289,10 @@ def main():
     args = parse_args()
     if args.beta_warmup_epochs is None:
         args.beta_warmup_epochs = args.epochs // 2
+    if args.epochs < 1 or not 0 <= args.beta_warmup_epochs <= args.epochs:
+        raise ValueError('Require epochs >= 1 and 0 <= beta_warmup_epochs <= epochs')
+    if args.cv_mode == 'loso' and args.model in ('cvae_part', 'pinn', 'tpinn', 'diffusion', 'gan') and args.part_dropout <= 0:
+        raise ValueError('Participant-conditioned LOSO requires positive part_dropout to train the null token')
     device = torch.device('cpu')
     print(f'[TRAIN] init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold} cv={args.cv_mode} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
     include_subjects = tuple(x.strip() for x in args.include_subjects.split(',') if x.strip())
@@ -302,23 +312,33 @@ def main():
     elif args.model == 'gan':
         run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_gan_h{args.gan_hidden}_{args.gan_loss}_lrd{args.gan_lr_d if args.gan_lr_d is not None else args.lr}'
     run_id += f'_f{args.fold}{_cv_marker(args.cv_mode)}{_drop_marker(args.part_dropout)}{subset_tag(include_subjects)}{cir_marker(args.cir_tag)}{phys_prep_marker(args.phys_prep)}'
-    if args.alpha > 0 and args.n_copies > 1:
+    if args.alpha > 0:
         run_id += f'_a{args.alpha}_n{args.n_copies}'
     if args.hp_tag:
         run_id += f'_{args.hp_tag}'
+    if args.classwise_vae:
+        if args.model != 'vae':
+            raise ValueError('classwise_vae is only valid for model=vae')
+        run_id += '_classwise'
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
     history_path = f'results/{args.model}/{run_id}_train_history.csv'
+    inputs = fingerprint(args.dataset_dir)
+    if args.model in ('pinn', 'tpinn'):
+        calibration = f'results/pinn/params_{args.region}{("_" + args.cir_tag) if args.cir_tag else ""}.npy'
+        inputs['calibration_sha256'] = file_digest(calibration)
+    provenance = reserve_training(ckpt_path, vars(args), inputs)
     # reproducibility
     seed_everything(args.init_seed)
     g = make_generator(args.init_seed)
     # dataset
     df = load_dataset(args.dataset_dir)
     df = df[df['region'] == args.region].reset_index(drop=True)
-    num_participants = df['participant'].nunique()
+    num_participants = len(PARTICIPANTS)
     if include_subjects:
         df = df[df['participant'].isin(include_subjects)].reset_index(drop=True)
     # args.fold is 1-indexed
     df_train, df_val, _ = get_split(df, cv_mode=args.cv_mode, fold=args.fold - 1, n_folds=args.n_folds, split_seed=args.split_seed)
+    trained_participants = sorted(PARTICIPANT_TO_IDX[p] for p in df_train['participant'].unique())
     DatasetCls = PhysicsInformedDataset if args.model in ('pinn', 'tpinn') else BreathDataset
     ds_kwargs = {'alpha': args.alpha, 'n_copies': args.n_copies}
     if args.model in ('pinn', 'tpinn'):
@@ -328,18 +348,19 @@ def main():
     val_ds = DatasetCls(df_val, stats=train_ds.stats)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-    if args.alpha > 0 and args.n_copies > 1:
+    if args.alpha > 0:
         print(f'[TRAIN] Jitter: alpha={args.alpha}, n_copies={args.n_copies} ({len(train_ds_clean)} -> {len(train_ds)} samples)')
     # vae, cvae, and cvae_part branch
     if args.model in ('vae', 'cvae', 'cvae_part'):
         use_participant = args.model == 'cvae_part'
-        conditional = args.model in ('cvae', 'cvae_part')
+        conditional = args.model in ('cvae', 'cvae_part') or args.classwise_vae
         if args.model == 'cvae_part':
             model = CVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim, condition_on_participant=True, num_participants=num_participants, part_embed_dim=args.part_embed_dim, part_dropout=args.part_dropout, subj_adv=(args.subj_adv_lambda > 0)).to(device)
         elif args.model == 'cvae':
             model = CVAE(latent_dim=args.latent_dim, embed_dim=args.embed_dim).to(device)
         else:
-            model = VAE(latent_dim=args.latent_dim).to(device)
+            model = (ClasswiseVAE(args.latent_dim) if args.classwise_vae else VAE(args.latent_dim)).to(device)
+        model.trained_participants = trained_participants
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         best_val_loss = torch.inf
@@ -392,6 +413,7 @@ def main():
                                         num_classes=3, embed_dim=args.embed_dim, condition_on_participant=True,
                                         num_participants=num_participants, part_embed_dim=args.part_embed_dim,
                                         part_dropout=args.part_dropout).to(device)
+        model.trained_participants = trained_participants
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         best_val_loss = torch.inf
@@ -430,6 +452,7 @@ def main():
                                      embed_dim=args.embed_dim, part_embed_dim=args.part_embed_dim,
                                      condition_on_participant=True, part_dropout=args.part_dropout,
                                      n_steps=args.n_steps, hidden=args.diff_hidden).to(device)
+        model.trained_participants = trained_participants
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         history = []
@@ -445,9 +468,9 @@ def main():
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                tr += loss.item()
+                tr += loss.item() * signal.size(0)
             scheduler.step()
-            tr /= len(train_loader)
+            tr /= len(train_loader.dataset)
             model.eval()
             vl = 0.0
             with torch.no_grad():
@@ -455,8 +478,9 @@ def main():
                     signal = signal.to(device)
                     label = label.long().to(device)
                     participant = participant.long().to(device)
-                    vl += model.loss(signal, label, participant).item()
-            vl /= max(len(val_loader), 1)
+                    participant = torch.full_like(participant, model.null_part_idx) if args.cv_mode == 'loso' else participant
+                    vl += model.loss(signal, label, participant).item() * signal.size(0)
+            vl /= len(val_loader.dataset)
             torch.save({'epoch': epoch, 'model_state': model.state_dict(), 'stats': train_ds.stats,
                         'embed_dim': args.embed_dim, 'part_embed_dim': args.part_embed_dim, 'n_steps': args.n_steps,
                         'hidden': args.diff_hidden,
@@ -508,9 +532,9 @@ def main():
                 optG.zero_grad()
                 lossG.backward()
                 optG.step()
-                dl += lossD.item()
-                gl += lossG.item()
-            n = len(train_loader)
+                dl += lossD.item() * B
+                gl += lossG.item() * B
+            n = len(train_loader.dataset)
             torch.save({'epoch': epoch, 'model_state': G.state_dict(), 'stats': train_ds.stats,
                         'embed_dim': args.embed_dim, 'part_embed_dim': args.part_embed_dim, 'z_dim': z_dim,
                         'hidden': args.gan_hidden,
@@ -518,6 +542,9 @@ def main():
                         'num_participants': num_participants, 'part_dropout': args.part_dropout, 'cv_mode': args.cv_mode}, ckpt_path)
             history.append({'epoch': epoch, 'lossD': dl / n, 'lossG': gl / n})
             epoch_bar.set_postfix({'D': f'{dl / n:.3f}', 'G': f'{gl / n:.3f}'})
+    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    checkpoint.update({'classwise_vae': args.classwise_vae, 'provenance': provenance, 'trained_participants': trained_participants})
+    torch.save(checkpoint, ckpt_path)
     # save training history
     with open(history_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=history[0].keys())

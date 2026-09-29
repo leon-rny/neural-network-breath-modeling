@@ -15,6 +15,11 @@ TARGET_LEN = 36
 
 def _to_target_len(t: np.ndarray, h: np.ndarray, temp: np.ndarray, n: int = TARGET_LEN):
     """Resample a single trial to n points over its own time span (identity when already n samples)."""
+    arrays = (t, h, temp)
+    if any(np.asarray(a).ndim != 1 for a in arrays) or len(t) < 2 or not len(t) == len(h) == len(temp):
+        raise ValueError('Each trial needs matching one-dimensional time, humidity and temperature arrays')
+    if any(not np.isfinite(a).all() for a in arrays) or np.any(np.diff(t) <= 0):
+        raise ValueError('Trial values must be finite and timestamps strictly increasing')
     if len(h) == n:
         return t, h, temp
     tg = np.linspace(t[0], t[-1], n)
@@ -34,7 +39,7 @@ def load_dataset(dataset_dir: str = 'dataset') -> pd.DataFrame:
         for fname in sorted(os.listdir(folder)):
             if not fname.endswith('.dat'):
                 continue
-            m = re.match(r'^(([bcdefgp])_)?(mouth|nose)_trial_(\d+)\.dat$', fname)
+            m = re.match(r'^(([abcdefgp])_)?(mouth|nose)_trial_(\d+)\.dat$', fname)
             if m is None:
                 continue
             df = pd.read_csv(os.path.join(folder, fname))
@@ -227,7 +232,7 @@ class BreathDataset(Dataset):
         return {'max': np.array([h_all.max(), t_all.max()], dtype=np.float32),
                 'min': np.array([h_all.min(), t_all.min()], dtype=np.float32),
                 'mean': np.array([h_all.mean(), t_all.mean()], dtype=np.float32),
-                'std': np.array([h_all.std(), t_all.std()], dtype=np.float32)}
+                'std': np.maximum(np.array([h_all.std(), t_all.std()], dtype=np.float32), 1e-8)}
 
     def __len__(self) -> int:
         """Number of records times n_copies."""
@@ -287,15 +292,15 @@ class PhysicsInformedDataset(Dataset):
             t_peak_devs.append(tc.max())
             h_bc.append(hc)
             t_bc.append(tc)
-        h_scale = float(np.max(h_peak_devs) * 1.2)
-        t_scale = float(np.max(t_peak_devs) * 1.2)
+        h_scale = max(float(np.max(h_peak_devs) * 1.2), 1e-8)
+        t_scale = max(float(np.max(t_peak_devs) * 1.2), 1e-8)
         shared_scale = float(max(h_scale, t_scale))
-        h_bcstd = float(np.concatenate(h_bc).std())
-        t_bcstd = float(np.concatenate(t_bc).std())
+        h_bcstd = max(float(np.concatenate(h_bc).std()), 1e-8)
+        t_bcstd = max(float(np.concatenate(t_bc).std()), 1e-8)
         h_all = np.concatenate([r['humidity'] for r in self.records])
         t_all = np.concatenate([r['temperature'] for r in self.records])
         return {'mean': np.array([h_all.mean(), t_all.mean()], dtype=np.float32),
-                'std': np.array([h_all.std(), t_all.std()], dtype=np.float32),
+                'std': np.maximum(np.array([h_all.std(), t_all.std()], dtype=np.float32), 1e-8),
                 'h_scale': h_scale, 't_scale': t_scale,
                 'shared_scale': shared_scale, 'h_bcstd': h_bcstd, 't_bcstd': t_bcstd,
                 'phys_prep': self.phys_prep}

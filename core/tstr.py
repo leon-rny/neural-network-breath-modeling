@@ -10,7 +10,7 @@ import pandas as pd
 import shap
 import torch
 from catboost import CatBoostClassifier
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import SMOTE, RandomOverSampler
 from imblearn.pipeline import Pipeline as ImbPipeline
 from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 from sklearn.ensemble import RandomForestClassifier, StackingClassifier
@@ -23,9 +23,11 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.neighbors import NearestNeighbors
-from tsfresh import extract_features, extract_relevant_features
+from tsfresh import extract_features
 from tsfresh.feature_extraction.settings import from_columns
-from tsfresh.utilities.dataframe_functions import impute
+from tsfresh.utilities.dataframe_functions import (
+    impute_dataframe_range,
+)
 from xgboost import XGBClassifier
 
 from core.data import (
@@ -40,11 +42,13 @@ from core.data import (
     prep_marker,
     subset_tag,
 )
+from core.features import TrainingFeatureSelector
+from core.provenance import artifact_lock, atomic_json, digest, fingerprint
 from core.utils import seed_everything
 from models.diffusion import ConditionalDiffusion
 from models.gan import Generator as GANGenerator
 from models.pinn import PhysicsInformedCVAE, SharedTransportPINN
-from models.vae import CVAE, VAE
+from models.vae import CVAE, VAE, ClasswiseVAE
 
 
 def _cv_marker(cv_mode: str) -> str:
@@ -83,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--loso_exclude', default='')
     # model-specific
     p.add_argument('--free_bits', type=float, default=0.0)
+    p.add_argument('--classwise_vae', action='store_true')
     p.add_argument('--latent_dim', type=int, default=16)
     p.add_argument('--embed_dim', type=int, default=8)
     p.add_argument('--part_embed_dim', type=int, default=8)
@@ -196,7 +201,7 @@ def filter_features(features, channel: str):
         return features[[c for c in features.columns if c.startswith(prefix)]]
     return [c for c in features if c.startswith(prefix)]
 
-def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n_jobs: int = 4) -> pd.DataFrame:
+def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n_jobs: int = 4, imputation: dict | None = None) -> pd.DataFrame:
     """Extract a fixed set of tsfresh features from long-format data.
 
     :param df_long: long-format data with id/time/channel columns.
@@ -207,12 +212,30 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
     """
     kind_to_fc = from_columns(top_features_raw)
     X = extract_features(df_long, column_id='id', column_sort='time', kind_to_fc_parameters=kind_to_fc, n_jobs=n_jobs)
-    impute(X)
+    if imputation is None:
+        raise ValueError('Training-fitted imputation values are required; rebuild the real-data cache')
+    for col in top_features_raw:
+        if col not in X:
+            X[col] = np.nan
+    impute_dataframe_range(X, imputation['max'], imputation['min'], imputation['median'])
     missing = [c for c in top_features_raw if c not in X.columns]
     if missing:
         for c in missing:
             X[c] = 0.0
     return X[top_features_raw]
+
+class FoldSMOTE(SMOTE):
+    """Adapt SMOTE to the training rows available in each inner cross-validation fit."""
+
+    def fit_resample(self, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Use random oversampling when a class has only one available training sample."""
+        _, counts = np.unique(y, return_counts=True)
+        if len(counts) < 2:
+            raise ValueError('Classification needs at least two training classes')
+        if counts.min() < 2:
+            return RandomOverSampler(random_state=self.random_state).fit_resample(X, y)
+        sampler = SMOTE(random_state=self.random_state, k_neighbors=min(5, int(counts.min()) - 1))
+        return sampler.fit_resample(X, y)
 
 def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_seed: int, n_jobs: int = -1) -> StackingClassifier:
     """Fit a SMOTE + XGB/CatBoost stacking classifier with a random-forest meta-learner.
@@ -225,18 +248,18 @@ def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_see
     """
     def make_base(clf):
         """Wrap a base estimator in a SMOTE pipeline, or return it unchanged if SMOTE is infeasible."""
-        if k_neighbors < 1:  # too few samples in minority class for SMOTE
-            return clf
-        return ImbPipeline([('smote', SMOTE(random_state=init_seed, k_neighbors=k_neighbors)),
+        return ImbPipeline([('smote', FoldSMOTE(random_state=init_seed)),
                             ('clf', clf)])
 
     min_class = int(np.bincount(y_train).min())
-    k_neighbors = min(5, min_class - 1)
+    if min_class < 2:
+        raise ValueError('Stacking cross-validation needs at least two samples per class')
+    n_splits = min(5, min_class)
     # create clf and use smote
-    xgb_clf = make_base(XGBClassifier(eval_metric='mlogloss', random_state=init_seed, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300))
-    cat_clf = make_base(CatBoostClassifier(logging_level='Silent', random_state=init_seed, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20, allow_writing_files=False))
-    meta_clf = RandomForestClassifier(n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=init_seed)
-    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=init_seed), n_jobs=n_jobs)
+    xgb_clf = make_base(XGBClassifier(n_jobs=1, eval_metric='mlogloss', random_state=init_seed, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300))
+    cat_clf = make_base(CatBoostClassifier(thread_count=1, logging_level='Silent', random_state=init_seed, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20, allow_writing_files=False))
+    meta_clf = RandomForestClassifier(n_jobs=1, n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=init_seed)
+    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=init_seed), n_jobs=n_jobs)
     stacker.fit(X_train, y_train)
     return stacker
 
@@ -290,10 +313,22 @@ def save_result(result: dict, model: str, run_id: str) -> None:
         if isinstance(obj, list):
             return [_json_safe(v) for v in obj]
         return obj
-    with open(path, 'w') as f:
-        json.dump(_json_safe(result), f, indent=2)
+    result['artifact_id'] = run_id
+    identity = {k: v for k, v in result.items() if k not in ('metrics', 'metrics_val', 'metrics_realonly', 'trtr_metrics', 'feature_overlap', 'top_20_synth_features')}
+    result['evaluation_id'] = digest(identity)
+    with artifact_lock(path):
+        if os.path.exists(path):
+            with open(path) as previous:
+                if json.load(previous).get('evaluation_id') != result['evaluation_id']:
+                    raise ValueError(f'Evaluation identity conflict at {path}; use a new hp_tag or run directory')
+        atomic_json(path, _json_safe(result))
 
 def save_summary(result: dict) -> None:
+    """Serialize summary updates and deduplicate by complete evaluation identity."""
+    with artifact_lock('results/summary.csv'):
+        _save_summary(result)
+
+def _save_summary(result: dict) -> None:
     """Append a flattened result row to results/summary.csv, deduping by config keys.
 
     Reconciles columns with any existing file and keeps the last row per unique
@@ -305,7 +340,9 @@ def save_summary(result: dict) -> None:
     """
     csv_path = 'results/summary.csv'
     m = result['metrics']
-    new_row = {'model': result['model'],
+    new_row = {'evaluation_id': result.get('evaluation_id', digest(result)),
+               'artifact_id': result.get('artifact_id'),
+               'model': result['model'],
                'region': result['region'],
                'channel': result.get('channel', 'both'),
                'cv_mode': result.get('cv_mode', 'kfold'),
@@ -349,6 +386,11 @@ def save_summary(result: dict) -> None:
     df_row = pd.DataFrame([new_row])
     if os.path.exists(csv_path):
         df_old = pd.read_csv(csv_path)
+        if 'evaluation_id' not in df_old:
+            df_old['evaluation_id'] = pd.NA
+        for index in df_old.index[df_old['evaluation_id'].isna()]:
+            legacy = df_old.loc[index].drop(labels=['evaluation_id']).to_dict()
+            df_old.at[index, 'evaluation_id'] = 'legacy_' + digest(legacy)
         if 'cv_mode' not in df_old.columns:
             df_old['cv_mode'] = 'kfold'
         if 'aug_source' not in df_old.columns:
@@ -368,10 +410,12 @@ def save_summary(result: dict) -> None:
         for c in ('subset', 'phys_variant', 'cir'):
             if c in combined.columns:
                 combined[c] = combined[c].fillna('')
-        df_new = combined.drop_duplicates(subset=['model', 'region', 'channel', 'cv_mode', 'init_seed', 'split_seed', 'fold', 'latent_dim', 'embed_dim', 'part_embed_dim', 'free_bits', 'lambda_phys', 'alpha', 'n_copies', 'augmentation_ratio', 'aug_source', 'subset', 'phys_variant', 'cir', 'prep', 'phys_prep'], keep='last')
+        df_new = combined.drop_duplicates(subset=['evaluation_id'], keep='last')
     else:
         df_new = df_row
-    df_new.to_csv(csv_path, index=False)
+    temporary = csv_path + f'.{os.getpid()}.tmp'
+    df_new.to_csv(temporary, index=False)
+    os.replace(temporary, csv_path)
 
 # train real test real
 def _cache_path(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both', cv_mode: str = 'kfold', loso_tag: str = '', sub_tag: str = '', prep_tag: str = '') -> str:
@@ -379,12 +423,15 @@ def _cache_path(region: str, init_seed: int, split_seed: int, fold: int, n_folds
     suffix = f'_ch{channel}' if channel != 'both' else ''
     return f'results/trtr/{region}_is{init_seed}_ss{split_seed}_fold{fold}of{n_folds}{_cv_marker(cv_mode)}{loso_tag}{sub_tag}{prep_tag}{suffix}_checkpoint.pkl'
 
-def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both', cv_mode: str = 'kfold', loso_tag: str = '', sub_tag: str = '', prep_tag: str = '') -> dict | None:
+def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds: int, channel: str = 'both', cv_mode: str = 'kfold', loso_tag: str = '', sub_tag: str = '', prep_tag: str = '', dataset_dir: str = 'dataset') -> dict | None:
     """Load the cached trtr checkpoint for a configuration, or None if it does not exist."""
     path = _cache_path(region, init_seed, split_seed, fold, n_folds, channel, cv_mode, loso_tag, sub_tag, prep_tag)
     if os.path.exists(path):
         with open(path, 'rb') as f:
-            return pickle.load(f)
+            cache = pickle.load(f)
+        if cache.get('provenance') != fingerprint(dataset_dir):
+            raise ValueError(f'Stale or unversioned cache: {path}; rebuild in a new run directory')
+        return cache
     return None
 
 _SSL_CACHE: dict = {}
@@ -426,6 +473,8 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
         X_test_top, y_train, y_test, stats, n_train, trtr_metrics, channel, cv_mode, init_seed,
         split_seed, fold, n_folds.
     """
+    if ssl_ckpt:
+        raise ValueError('SSL evaluation requires a fold-specific pretraining manifest; all-data checkpoints are not valid here')
     # load dataset
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
@@ -436,8 +485,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
     ## train real
     df_long_train, y_train = df_to_df_long(df_train)
     # feature extraction
-    X_train_raw = extract_relevant_features(df_long_train, y_train, column_id='id', column_sort='time', n_jobs=n_jobs)
-    impute(X_train_raw)
+    X_train_raw = extract_features(df_long_train, column_id='id', column_sort='time', n_jobs=n_jobs)
     X_train_raw = filter_features(X_train_raw, channel)
     if X_train_raw.shape[1] == 0:
         raise ValueError(f'No relevant features remain after filtering by channel={channel!r}.')
@@ -452,10 +500,18 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
                   'reg_alpha': [0.1, 1.0],
                   'reg_lambda': [0.5, 1.0],
                   'colsample_bytree': [0.8, 1.0]}
-    base_lgbm = LGBMClassifier(n_estimators=1000, learning_rate=0.05, random_state=init_seed, verbose=-1)
-    gs = GridSearchCV(base_lgbm, param_grid, cv=StratifiedKFold(3, shuffle=True, random_state=split_seed), scoring='accuracy', n_jobs=n_jobs, verbose=0)
+    base_lgbm = LGBMClassifier(n_jobs=1, n_estimators=1000, learning_rate=0.05, random_state=init_seed, verbose=-1)
+    pipeline = ImbPipeline([('features', TrainingFeatureSelector(n_jobs=n_jobs)), ('model', base_lgbm)])
+    grid = {f'model__{key}': value for key, value in param_grid.items()}
+    gs = GridSearchCV(pipeline, grid, cv=StratifiedKFold(3, shuffle=True, random_state=split_seed), scoring='accuracy', n_jobs=n_jobs, verbose=0)
     gs.fit(X_tr, y_tr)
-    best_lgbm = LGBMClassifier(**gs.best_params_, n_estimators=1000, learning_rate=0.05, random_state=init_seed, verbose=-1)
+    selector = gs.best_estimator_.named_steps['features']
+    X_tr, X_val = selector.transform(X_tr), selector.transform(X_val)
+    X_full_san = selector.transform(X_full_san)
+    imputation = {key: {san_to_raw[col]: value for col, value in values.items()}
+                  for key, values in (('max', selector.max_), ('min', selector.min_), ('median', selector.median_))}
+    best_params = {key.removeprefix('model__'): value for key, value in gs.best_params_.items()}
+    best_lgbm = LGBMClassifier(**best_params, n_jobs=1, n_estimators=1000, learning_rate=0.05, random_state=init_seed, verbose=-1)
     best_lgbm.fit(X_tr.values, y_tr.values, eval_set=[(X_val.values, y_val.values)], eval_metric='multi_logloss', callbacks=[early_stopping(50, verbose=False), log_evaluation(0)])
     explainer = shap.TreeExplainer(best_lgbm)
     shap_values = explainer.shap_values(X_full_san.values)
@@ -468,7 +524,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
         X_train_top = np.hstack([X_train_top, _ssl_embeddings(df_train, ssl_ckpt)])
     ## test real
     df_long_test, y_test = df_to_df_long(df_test)
-    X_test_raw_top = extract_fixed_features(df_long_test, top_20_raw, n_jobs)
+    X_test_raw_top = extract_fixed_features(df_long_test, top_20_raw, n_jobs, imputation)
     X_test_san = X_test_raw_top.copy()
     X_test_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_test_san.columns]
     X_test_top = X_test_san[top_20_san].values
@@ -479,7 +535,9 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
     # evaluate classifier
     trtr_metrics = evaluate_classifier(clf, X_test_top, y_test.values)
     # build cache
-    cache = {'top_20_features_raw': top_20_raw,
+    cache = {'provenance': fingerprint(dataset_dir),
+             'imputation': imputation,
+             'top_20_features_raw': top_20_raw,
              'top_20_features_sanitized': top_20_san,
              'X_train_top': X_train_top,
              'X_test_top': X_test_top,
@@ -516,7 +574,7 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     # init model
     if model_name == 'vae':
-        model = VAE(latent_dim=ckpt['latent_dim'])
+        model = (ClasswiseVAE(ckpt['latent_dim']) if ckpt.get('classwise_vae') else VAE(ckpt['latent_dim']))
     elif model_name == 'cvae':
         model = CVAE(latent_dim=ckpt['latent_dim'], embed_dim=ckpt['embed_dim'])
     elif model_name == 'cvae_part':
@@ -572,6 +630,8 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
     else:
         raise ValueError(f'Unknown model: {model_name}')
     model.load_state_dict(ckpt['model_state'])
+    model.trained_participants = ckpt.get('trained_participants', list(range(getattr(model, 'num_participants', 0))))
+    model.provenance = ckpt.get('provenance', {})
     model.to(device).eval()
     return model, ckpt['stats']
 
@@ -592,6 +652,8 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
         labels is the int class-index array.
     """
     # determine num per class
+    if n_synthetic < len(CLASSES):
+        raise ValueError('n_synthetic must cover every class')
     n_classes = len(CLASSES)
     n_per_class = n_synthetic // n_classes
     remainder = n_synthetic % n_classes
@@ -601,12 +663,9 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
     # deterministic pre-sampling seed
     torch.manual_seed(init_seed)
     # generate synthetic signals
-    if model_name == 'vae':
-        with torch.no_grad():
-            z = model.sample(n_synthetic, device)
-        signals_phys = (z * std_t + mean_t).cpu().numpy()
-        labels = np.concatenate([np.full(c, i) for i, c in enumerate(counts)])
-    elif model_name in ('cvae', 'cvae_part', 'diffusion', 'gan'):
+    if model_name == 'vae' and not isinstance(model, ClasswiseVAE):
+        raise ValueError('An unconditional VAE cannot supply class labels; train with --classwise_vae for TSTR')
+    if model_name in ('vae', 'cvae', 'cvae_part', 'diffusion', 'gan'):
         all_signals, all_labels = [], []
         for cls_idx, count in enumerate(counts):
             y_cls = torch.tensor(cls_idx, dtype=torch.long)
@@ -644,6 +703,20 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
         labels = np.concatenate(all_labels, axis=0)
     return signals_phys, labels
 
+def validate_generator(model: torch.nn.Module, cache: dict, model_name: str, preprocessing: str) -> None:
+    """Reject incompatible data/code, untrained null tokens and mismatched signal spaces."""
+    provenance = getattr(model, 'provenance', {})
+    if any(provenance.get(key) != value for key, value in cache['provenance'].items()):
+        raise ValueError('Generator and real-data cache must use the same versioned data and scientific code')
+    settings = provenance['training_config']
+    for key in ('init_seed', 'split_seed', 'fold', 'n_folds', 'cv_mode'):
+        if settings[key] != cache[key]:
+            raise ValueError(f'Generator/cache split mismatch: {key}')
+    if model_name in ('pinn', 'tpinn') and preprocessing == 'raw':
+        raise ValueError('Physics generators require baseline or peaknorm classifier preprocessing')
+    if cache['cv_mode'] == 'loso' and getattr(model, '_cond_part', False) and model.part_dropout <= 0:
+        raise ValueError('LOSO generation requires a trained null participant token')
+
 def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 16, embed_dim: int = 8, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, eval_val: bool = False, dataset_dir: str = 'dataset', n_folds: int = 5, cv_mode: str = 'kfold', guidance: float = -1.0, include_subjects: tuple = (), preprocessing: str = 'raw', ckpt_run_id: str | None = None, ensemble_model: str = '', ensemble_ckpt_run_id: str | None = None) -> dict:
     """Run train-synthetic-test-real: train the classifier on generated data, test on the real fold.
 
@@ -673,6 +746,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
         (val scores or None), 'feature_overlap', 'top_20_synth_features', and 'trtr_metrics'.
     """
     model, ckpt_stats = load_model(model_name, ckpt_run_id or run_id, device)
+    validate_generator(model, cache, model_name, preprocessing)
     if guidance >= 0 and model_name == 'diffusion':
         model.guidance_scale = guidance
     print(f'[TSTR] model={model_name}, n_synthetic={n_synthetic}, preprocessing={preprocessing}')
@@ -685,6 +759,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     # ensemble: mix in synthetic from a second generator
     if ensemble_model and ensemble_ckpt_run_id:
         m2, stats2 = load_model(ensemble_model, ensemble_ckpt_run_id, device)
+        validate_generator(m2, cache, ensemble_model, preprocessing)
         p2 = m2.null_part_idx if (cv_mode == 'loso' and getattr(m2, '_cond_part', False)) else None
         s2_sig, s2_lab = generate_synthetic_signals(m2, ensemble_model, n_synthetic, stats2, device, init_seed, participant_idx=p2)
         s2_sig = preprocess_synth_signals(s2_sig, preprocessing)
@@ -697,7 +772,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     df_long_synth = pd.DataFrame({'id': ids, 'time': times,
                                   'Humidity': synth_signals[:, 0, :].ravel(),
                                   'Temperature': synth_signals[:, 1, :].ravel()})
-    X_synth_raw = extract_fixed_features(df_long_synth, cache['top_20_features_raw'], n_jobs)
+    X_synth_raw = extract_fixed_features(df_long_synth, cache['top_20_features_raw'], n_jobs, cache['imputation'])
     X_san = X_synth_raw.copy()
     X_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_san.columns]
     X_synth_top = X_san[cache['top_20_features_sanitized']].values
@@ -711,7 +786,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
         df_val = preprocess_signals(df_val, preprocessing)
         _, df_val, _ = get_split(df_val, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed, include_subjects=include_subjects)
         df_long_val, y_val = df_to_df_long(df_val)
-        X_val_raw = extract_fixed_features(df_long_val, cache['top_20_features_raw'], n_jobs)
+        X_val_raw = extract_fixed_features(df_long_val, cache['top_20_features_raw'], n_jobs, cache['imputation'])
         X_val_san = X_val_raw.copy()
         X_val_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_val_san.columns]
         X_val_top = X_val_san[cache['top_20_features_sanitized']].values
@@ -730,7 +805,8 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
     top_k_synth = [cache['top_20_features_sanitized'][i] for i in top_idx]
     top_k_real = cache['top_20_features_sanitized'][:k]
     overlap = len(set(top_k_real) & set(top_k_synth)) / k
-    return {'model': model_name,
+    return {'training_provenance': model.provenance,
+            'model': model_name,
             'region': region,
             'channel': cache.get('channel', 'both'),
             'cv_mode': cv_mode,
@@ -863,7 +939,7 @@ def generate_smote_aug(df_train: pd.DataFrame, n_aug: int, seed: int, k: int = 5
     return np.stack(sigs), np.array(labs)
 
 # train synthetic/real test real
-def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, cv_mode: str = 'kfold', preprocessing: str = 'raw', ckpt_run_id: str | None = None, real_fraction: float = 1.0, aug_source: str = 'gen', dataset_dir: str = 'dataset', n_folds: int = 5, include_subjects: tuple = ()) -> dict:
+def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, cv_mode: str = 'kfold', preprocessing: str = 'raw', ckpt_run_id: str | None = None, real_fraction: float = 1.0, aug_source: str = 'gen', dataset_dir: str = 'dataset', n_folds: int = 5, include_subjects: tuple = (), guidance: float = -1.0) -> dict:
     """Run augmentation TSTR+: train the classifier on real + synthetic data, test on the real fold.
 
     Generates int(n_train * augmentation_ratio) synthetic signals, concatenates their cached
@@ -886,6 +962,8 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     :return: result dict with config fields plus 'augmentation_ratio', 'metrics' (test scores),
         'feature_overlap' (None), 'top_20_synth_features' (None), and 'trtr_metrics'.
     """
+    if real_fraction != 1.0:
+        raise ValueError('Scarcity evaluation requires retraining the generator and feature selector on the same subset; real_fraction must be 1')
     X_real, y_real = cache['X_train_top'], cache['y_train']
     if real_fraction < 1.0:
         idx = np.arange(len(y_real))
@@ -895,6 +973,9 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     n_synthetic = int(n_real_used * augmentation_ratio)
     if aug_source == 'gen':
         model, ckpt_stats = load_model(model_name, ckpt_run_id or run_id, device)
+        validate_generator(model, cache, model_name, preprocessing)
+        if model_name == 'diffusion' and guidance >= 0:
+            model.guidance_scale = guidance
         print(f'[TSTR+] model={model_name}, n_synthetic={n_synthetic}, n_real_used={n_real_used} (frac={real_fraction}), preprocessing={preprocessing}')
         participant_idx = model.null_part_idx if (cv_mode == 'loso' and getattr(model, '_cond_part', False)) else None
         synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed, participant_idx=participant_idx)
@@ -922,7 +1003,7 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     df_long_synth = pd.DataFrame({'id': ids, 'time': times,
                                   'Humidity': synth_signals[:, 0, :].ravel(),
                                   'Temperature': synth_signals[:, 1, :].ravel()})
-    X_synth_raw = extract_fixed_features(df_long_synth, cache['top_20_features_raw'], n_jobs)
+    X_synth_raw = extract_fixed_features(df_long_synth, cache['top_20_features_raw'], n_jobs, cache['imputation'])
     X_san = X_synth_raw.copy()
     X_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_san.columns]
     X_synth_top = X_san[cache['top_20_features_sanitized']].values
@@ -935,7 +1016,8 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     stacker_ro = train_stacking_classifier(X_real, y_real, init_seed, n_jobs=n_jobs)
     metrics_realonly = evaluate_classifier(stacker_ro, cache['X_test_top'], cache['y_test'])
     print(f"[TSTR+] aug acc={metrics['accuracy']:.4f} | real-only@frac acc={metrics_realonly['accuracy']:.4f} | lift={metrics['accuracy']-metrics_realonly['accuracy']:+.4f}")
-    return {'model': f'{model_name}_plus',
+    return {'training_provenance': model.provenance if aug_source == 'gen' else None,
+            'model': f'{model_name}_plus',
             'region': region,
             'channel': cache.get('channel', 'both'),
             'cv_mode': cv_mode,
@@ -965,11 +1047,11 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
 
 def _feat_top(df_long: pd.DataFrame, cache: dict, n_jobs: int) -> np.ndarray:
     """Extract the cached top-20 features from long-format data and return the sanitized-ordered matrix."""
-    X = extract_fixed_features(df_long, cache['top_20_features_raw'], n_jobs)
+    X = extract_fixed_features(df_long, cache['top_20_features_raw'], n_jobs, cache['imputation'])
     X.columns = [re.sub(r'[^\w]', '_', c) for c in X.columns]
     return X[cache['top_20_features_sanitized']].values
 
-def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '', phys_residual: bool = False, class_transport: bool = False, parametric_source: bool = False, learn_cir_params: bool = False, ode: bool = False, subj_adv_lambda: float = 0.0, diff_hidden: int = 64, n_steps: int = 200, gan_hidden: int = 64, gan_loss: str = 'bce', gan_lr_d: float | None = None, lr: float = 1e-3, include_subjects: tuple = (), cir_tag: str = '', preprocessing: str = 'raw', phys_prep: str = 'peakscale', hp_tag: str = '', aug_ratio: float = 1.0, real_fraction: float = 1.0, ensemble_model: str = '', aug_source: str = 'gen') -> str:
+def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '', phys_residual: bool = False, class_transport: bool = False, parametric_source: bool = False, learn_cir_params: bool = False, ode: bool = False, subj_adv_lambda: float = 0.0, diff_hidden: int = 64, n_steps: int = 200, gan_hidden: int = 64, gan_loss: str = 'bce', gan_lr_d: float | None = None, lr: float = 1e-3, include_subjects: tuple = (), cir_tag: str = '', preprocessing: str = 'raw', phys_prep: str = 'peakscale', hp_tag: str = '', aug_ratio: float = 1.0, real_fraction: float = 1.0, ensemble_model: str = '', aug_source: str = 'gen', guidance: float = -1.0, n_synthetic: int | None = None, classwise_vae: bool = False) -> str:
     """Build the generator artifact id encoding the model and its config flags.
 
     Assembles a per-model-family base id (region, seed, dims, model-specific markers) and appends
@@ -995,7 +1077,7 @@ def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim:
     else:
         run_id = f'{region}_s{init_seed}'
     run_id += f'_f{fold}{_cv_marker(cv_mode)}{loso_tag}{_drop_marker(part_dropout)}{subset_tag(include_subjects)}{cir_marker(cir_tag)}{prep_marker(preprocessing)}{phys_prep_marker(phys_prep)}'
-    if alpha > 0 and n_copies > 1:
+    if alpha > 0:
         run_id += f'_a{alpha}_n{n_copies}'
     # eval-only marker: augmentation ratio (tstr_plus). Default 1.0 -> no marker (checkpoint id keeps 1.0,
     # so committed generators are reused; only the result run_id / json filename is namespaced by ratio).
@@ -1009,8 +1091,14 @@ def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim:
         run_id += f'_aug{aug_source}'
     if channel != 'both':
         run_id += f'_ch{channel}'
+    if guidance >= 0:
+        run_id += f'_g{guidance}'
+    if n_synthetic is not None:
+        run_id += f'_ns{n_synthetic}'
     if hp_tag:
         run_id += f'_{hp_tag}'
+    if classwise_vae:
+        run_id += '_classwise'
     return run_id
 
 # main
@@ -1035,8 +1123,9 @@ def main():
         for region in regions:
             for init_seed in init_seeds:
                 for fold in folds:
-                    rid = build_run_id(args.model, region, init_seed, fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag)
-                    path = f'results/{args.model}/{rid}_tstr.json'
+                    rid = build_run_id(args.model, region, init_seed, fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=args.real_fraction, ensemble_model=args.ensemble_model, aug_source=args.aug_source, guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae)
+                    model_dir = args.model + ('_plus' if args.mode == 'tstr_plus' else '')
+                    path = f'results/{model_dir}/{rid}_tstr.json'
                     if not os.path.exists(path):
                         print(f'  [AGGREGATE] missing {path}, skipping')
                         continue
@@ -1052,12 +1141,12 @@ def main():
         return
     if args.region is None:
         raise SystemExit('[TSTR] --region is required (except with --aggregate)')
-    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=(args.real_fraction if args.mode == 'tstr_plus' else 1.0), ensemble_model=args.ensemble_model, aug_source=(args.aug_source if args.mode == 'tstr_plus' else 'gen'))
-    ckpt_run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing='raw', phys_prep=args.phys_prep, hp_tag=args.hp_tag)
+    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=(args.real_fraction if args.mode == 'tstr_plus' else 1.0), ensemble_model=args.ensemble_model, aug_source=(args.aug_source if args.mode == 'tstr_plus' else 'gen'), guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae)
+    ckpt_run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, 'both', args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing='raw', phys_prep=args.phys_prep, hp_tag=args.hp_tag, classwise_vae=args.classwise_vae)
     # ensemble second-generator checkpoint id (tpinn = tpinn-res @ stdscale, the champion physics model)
     ensemble_ckpt_run_id = None
     if args.ensemble_model == 'tpinn':
-        ensemble_ckpt_run_id = build_run_id('tpinn', args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, cv_mode=args.cv_mode, part_dropout=args.part_dropout, loso_tag=loso_tag, phys_residual=True, phys_prep='stdscale', preprocessing='raw', include_subjects=include_subjects, hp_tag=args.hp_tag)
+        ensemble_ckpt_run_id = build_run_id('tpinn', args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, 'both', cv_mode=args.cv_mode, part_dropout=args.part_dropout, loso_tag=loso_tag, phys_residual=True, phys_prep='stdscale', preprocessing='raw', include_subjects=include_subjects, hp_tag=args.hp_tag)
     # reproducibility
     seed_everything(args.init_seed)
     tag = '[TRTR]' if args.model == 'trtr' else '[TSTR]'
@@ -1070,7 +1159,7 @@ def main():
             os.remove(path)
             print('[TRTR] Removed cache.')
     # load cache
-    cache = load_cache(args.region, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel, args.cv_mode, loso_tag, sub_tag, prep_tag)
+    cache = load_cache(args.region, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel, args.cv_mode, loso_tag, sub_tag, prep_tag, args.dataset_dir)
     if cache is None:
         cache = trtr(args.dataset_dir, args.region, args.n_jobs, args.init_seed, args.split_seed, args.fold, args.n_folds, args.channel, args.cv_mode, exclude_subjects, args.loso_trial_val, include_subjects, args.preprocessing)
         print('[TRTR] Built cache.')
@@ -1097,18 +1186,22 @@ def main():
         result['cir'] = args.cir_tag
         result['prep'] = args.preprocessing
         result['phys_prep'] = args.phys_prep
+        result['provenance'] = cache['provenance']
+        result['evaluation_config'] = {k: v for k, v in vars(args).items() if k not in ('dataset_dir', 'force_rebuild', 'no_summary', 'aggregate')}
         save_result(result, args.model, run_id)
         if not args.no_summary:
             save_summary(result)
         return
     # train-synthetic-test-real
     if args.mode == 'tstr_plus':
-        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, cv_mode=args.cv_mode, preprocessing=args.preprocessing, ckpt_run_id=ckpt_run_id, real_fraction=args.real_fraction, aug_source=args.aug_source, dataset_dir=args.dataset_dir, n_folds=args.n_folds, include_subjects=include_subjects)
+        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, cv_mode=args.cv_mode, preprocessing=args.preprocessing, ckpt_run_id=ckpt_run_id, real_fraction=args.real_fraction, aug_source=args.aug_source, dataset_dir=args.dataset_dir, n_folds=args.n_folds, include_subjects=include_subjects, guidance=args.guidance)
         result['subset'] = sub_value
         result['phys_variant'] = phys_variant
         result['cir'] = args.cir_tag
         result['prep'] = args.preprocessing
         result['phys_prep'] = args.phys_prep
+        result['provenance'] = cache['provenance']
+        result['evaluation_config'] = {k: v for k, v in vars(args).items() if k not in ('dataset_dir', 'force_rebuild', 'no_summary', 'aggregate')}
         save_result(result, result['model'], run_id)
         if not args.no_summary:
             save_summary(result)
@@ -1121,6 +1214,8 @@ def main():
         result['cir'] = args.cir_tag
         result['prep'] = args.preprocessing
         result['phys_prep'] = args.phys_prep
+        result['provenance'] = cache['provenance']
+        result['evaluation_config'] = {k: v for k, v in vars(args).items() if k not in ('dataset_dir', 'force_rebuild', 'no_summary', 'aggregate')}
         save_result(result, args.model, run_id)
         if not args.no_summary:
             save_summary(result)

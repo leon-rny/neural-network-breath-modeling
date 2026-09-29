@@ -138,6 +138,46 @@ class VAE(nn.Module):
         with torch.no_grad():
             return self.decoder(z)
 
+class ClasswiseVAE(nn.Module):
+    """Train three independent VAE networks on their respective class samples."""
+
+    def __init__(self, latent_dim: int = 16, num_classes: int = 3) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.models = nn.ModuleList([VAE(latent_dim) for _ in range(num_classes)])
+
+    def encoder(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode each example using only its class-specific network."""
+        mu = x.new_zeros((len(x), self.latent_dim))
+        logvar = torch.zeros_like(mu)
+        for label, model in enumerate(self.models):
+            idx = torch.where(y == label)[0]
+            if len(idx):
+                m, v = model.encoder(x[idx])
+                mu = mu.index_copy(0, idx, m)
+                logvar = logvar.index_copy(0, idx, v)
+        return mu, logvar
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return reconstructions and latent parameters in the original batch order."""
+        reconstruction = torch.zeros_like(x)
+        mu = x.new_zeros((len(x), self.latent_dim))
+        logvar = torch.zeros_like(mu)
+        for label, model in enumerate(self.models):
+            idx = torch.where(y == label)[0]
+            if len(idx):
+                r, m, v = model(x[idx])
+                reconstruction = reconstruction.index_copy(0, idx, r)
+                mu = mu.index_copy(0, idx, m)
+                logvar = logvar.index_copy(0, idx, v)
+        return reconstruction, mu, logvar
+
+    def sample(self, n: int, y: torch.Tensor, device: torch.device, participant: int | None = None) -> torch.Tensor:
+        """Draw from the network trained on the requested class."""
+        if y.numel() != 1:
+            raise ValueError('Classwise sampling expects one class per call')
+        return self.models[int(y.item())].sample(n, device)
+
 # cvae
 class ConditionalEncoder(nn.Module):
     """Conditional variant of Encoder: conditions the latent distribution on a class label.
@@ -309,6 +349,9 @@ class CVAE(nn.Module):
             if torch.rand(1).item() < self.part_dropout:
                 p = torch.full_like(p, self.null_part_idx)
                 self._null_steps += 1
+        if not self.training and self._cond_part and p is not None and hasattr(self, 'trained_participants'):
+            known = torch.tensor(self.trained_participants, device=p.device)
+            p = torch.where(torch.isin(p, known), p, self.null_part_idx)
         mu, logvar = self.encoder(x, y, p)
         z = self.reparameterize(mu, logvar)
         x_hat = self.decoder(z, y, p)
@@ -333,7 +376,8 @@ class CVAE(nn.Module):
         elif participant is not None:
             p = torch.full((n,), participant, dtype=torch.long, device=device)
         else:
-            p = torch.randint(0, self.num_participants, (n,), device=device)
+            pool = torch.tensor(getattr(self, 'trained_participants', list(range(self.num_participants))), device=device)
+            p = pool[torch.randint(len(pool), (n,), device=device)]
         self.eval()
         with torch.no_grad():
             return self.decoder(z, y.to(device), p)

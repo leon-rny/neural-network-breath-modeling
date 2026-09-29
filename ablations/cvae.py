@@ -222,7 +222,7 @@ def _tstr_score(model, stats: dict, cache: dict, device: torch.device, n_jobs: i
                             'time': np.tile(np.arange(T), n),
                             'Humidity': synth_signals[:, 0, :].ravel(),
                             'Temperature': synth_signals[:, 1, :].ravel()})
-    X_raw = extract_fixed_features(df_long, cache['top_20_features_raw'], n_jobs)
+    X_raw = extract_fixed_features(df_long, cache['top_20_features_raw'], n_jobs, cache['imputation'])
     X_san = X_raw.copy()
     X_san.columns = [re.sub(r'[^\w]', '_', c) for c in X_san.columns]
     X_synth = X_san[cache['top_20_features_sanitized']].values
@@ -765,7 +765,7 @@ def run_ablation(args: argparse.Namespace, device: torch.device) -> None:
         for config in configs:
             for init_seed in init_seeds:
                 for fold in folds:
-                    cache = load_cache(region, init_seed, args.split_seed, fold, args.n_folds, channel='both', cv_mode=args.cv_mode, loso_tag=loso_tag)
+                    cache = load_cache(region, init_seed, args.split_seed, fold, args.n_folds, channel='both', cv_mode=args.cv_mode, loso_tag=loso_tag, dataset_dir=args.dataset_dir)
                     if cache is None:
                         print(f'[{TAG}] Building TRTR cache region={region}, init_seed={init_seed}, fold={fold}, cv={args.cv_mode}{loso_tag} ...')
                         cache = trtr(args.dataset_dir, region, args.n_jobs, init_seed, args.split_seed, fold, args.n_folds, channel='both', cv_mode=args.cv_mode, exclude_subjects=exclude_subjects, loso_trial_val=args.loso_trial_val)
@@ -839,10 +839,10 @@ def run_architecture(args: argparse.Namespace, device: torch.device) -> None:
         for variant in variants:
             for init_seed in init_seeds:
                 for fold in folds:
-                    cache = load_cache(region, init_seed, args.split_seed, fold, args.n_folds, channel='both')
+                    cache = load_cache(region, init_seed, args.split_seed, fold, args.n_folds, channel='both', dataset_dir=args.dataset_dir)
                     if cache is None:
                         print(f'[{TAG}] Building TRTR cache region={region}, init_seed={init_seed}, fold={fold} ...')
-                        cache = trtr(args.dataset_dir, region, args.n_jobs, init_seed, args.split_seed, fold, args.n_folds, channel='both')
+                        cache = trtr(args.dataset_dir, region, args.n_jobs, init_seed, args.split_seed, fold, args.n_folds, channel='both', dataset_dir=args.dataset_dir)
                     for cp in cond_parts:
                         print(f'\n[{TAG}] {variant} | {region} | is={init_seed} | f={fold}/{args.n_folds} | cp={cp}')
                         path = arch_ckpt_path(variant, region, init_seed, args.split_seed, fold, args.n_folds, cp)
