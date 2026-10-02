@@ -35,6 +35,7 @@ from tsfresh.utilities.dataframe_functions import (
 )
 from xgboost import XGBClassifier
 
+from core.augment import POLICY_KINDS, augment, mmd_report, top_features
 from core.data import (
     CLASS_TO_IDX,
     CLASSES,
@@ -53,7 +54,7 @@ from core.provenance import artifact_lock, atomic_json, digest, fingerprint
 from core.utils import seed_everything
 from models.diffusion import ConditionalDiffusion
 from models.gan import Generator as GANGenerator
-from models.pinn import PhysicsInformedCVAE, SharedTransportPINN
+from models.pinn import PhysicsInformedCVAE, RhythmTPINN, SharedTransportPINN
 from models.vae import CVAE, VAE, ClasswiseVAE
 
 
@@ -70,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'pinn', 'tpinn', 'diffusion', 'gan'])
+    p.add_argument('--model', required=True, choices=['trtr', 'vae', 'cvae', 'cvae_part', 'pinn', 'tpinn', 'rhythm', 'diffusion', 'gan'])
     p.add_argument('--region', choices=['mouth', 'nose'], default=None)
     p.add_argument('--mode', choices=['tstr', 'tstr_plus'], default='tstr')
     p.add_argument('--ensemble_model', type=str, default='')  # tstr: mix synthetic from a 2nd generator (e.g. tpinn) for a two-generator ensemble
@@ -78,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--channel', choices=['humidity', 'temperature', 'both'], default='both')
     p.add_argument('--n_synthetic', type=int, default=None)
     p.add_argument('--augmentation_ratio', type=float, default=1.0)
+    p.add_argument('--aug_policy', choices=['prior', *POLICY_KINDS], default='prior')  # tstr_plus physics policies (core/augment.py): prior samples, boundary / typical-feature steering, rejection-filtered prior samples
+    p.add_argument('--aug_stream', default='')  # named random stream of the policy ('' = tp0 / fp / rh15 by generator, as in the development runs)
     p.add_argument('--real_fraction', type=float, default=1.0)  # tstr_plus: stratified fraction of real training data (data-scarcity curve)
     p.add_argument('--dataset_dir', default='dataset')
     p.add_argument('--n_jobs', type=int, default=4)
@@ -328,7 +331,7 @@ def save_result(result: dict, model: str, run_id: str) -> None:
             return [_json_safe(v) for v in obj]
         return obj
     result['artifact_id'] = run_id
-    identity = {k: v for k, v in result.items() if k not in ('metrics', 'metrics_val', 'metrics_realonly', 'trtr_metrics', 'feature_overlap', 'top_20_synth_features')}
+    identity = {k: v for k, v in result.items() if k not in ('metrics', 'metrics_val', 'metrics_realonly', 'metrics_realonly_val', 'mmd', 'trtr_metrics', 'feature_overlap', 'top_20_synth_features')}
     result['evaluation_id'] = digest(identity)
     with artifact_lock(path):
         if os.path.exists(path):
@@ -338,9 +341,39 @@ def save_result(result: dict, model: str, run_id: str) -> None:
         atomic_json(path, _json_safe(result))
 
 def save_summary(result: dict) -> None:
-    """Serialize summary updates and deduplicate by complete evaluation identity."""
+    """Serialize summary updates and deduplicate by complete evaluation identity (results/summary.csv, and
+    results/mmd.csv for results that carry a signal-space MMD)."""
     with artifact_lock('results/summary.csv'):
         _save_summary(result)
+    if result.get('mmd'):
+        with artifact_lock('results/mmd.csv'):
+            _save_mmd(result)
+
+def _save_mmd(result: dict) -> None:
+    """Append one MMD row (thesis layout: metric, region, model, seed, fold, value, config + run details) to
+    results/mmd.csv, keeping the last row per evaluation_id. value = MMD of the synthetic set vs the real
+    training trials (core.augment.mmd_report); mmd_class = class-wise mean; mmd_real_ref = real test vs train."""
+    csv_path = 'results/mmd.csv'
+    mmd = result['mmd']
+    row = pd.DataFrame([{'evaluation_id': result.get('evaluation_id', digest(result)),
+                         'metric': 'MMD',
+                         'region': result['region'],
+                         'model': result['model'],
+                         'cv_mode': result.get('cv_mode', 'kfold'),
+                         'seed': result.get('init_seed'),
+                         'fold': result.get('fold'),
+                         'value': mmd['mmd'],
+                         'mmd_class': mmd.get('mmd_class'),
+                         'mmd_real_ref': mmd.get('mmd_real_ref'),
+                         'aug_policy': result.get('aug_policy'),
+                         'augmentation_ratio': result.get('augmentation_ratio'),
+                         'hp_tag': (result.get('evaluation_config') or {}).get('hp_tag'),
+                         'config': result.get('artifact_id')}])
+    if os.path.exists(csv_path):
+        row = pd.concat([pd.read_csv(csv_path), row], ignore_index=True).drop_duplicates(subset=['evaluation_id'], keep='last')
+    temporary = csv_path + f'.{os.getpid()}.tmp'
+    row.to_csv(temporary, index=False)
+    os.replace(temporary, csv_path)
 
 def _save_summary(result: dict) -> None:
     """Append a flattened result row to results/summary.csv, deduping by config keys.
@@ -382,6 +415,13 @@ def _save_summary(result: dict) -> None:
                'n_train_real': result.get('n_train_real'),
                'augmentation_ratio': result.get('augmentation_ratio'),
                'aug_source': result.get('aug_source', 'gen'),
+               'aug_policy': result.get('aug_policy'),
+               'hp_tag': (result.get('evaluation_config') or {}).get('hp_tag'),
+               'realonly_accuracy': (result.get('metrics_realonly') or {}).get('accuracy'),
+               'realonly_val_accuracy': (result.get('metrics_realonly_val') or {}).get('accuracy'),
+               'mmd': (result.get('mmd') or {}).get('mmd'),
+               'mmd_class': (result.get('mmd') or {}).get('mmd_class'),
+               'mmd_real_ref': (result.get('mmd') or {}).get('mmd_real_ref'),
                'subset': result.get('subset', ''),
                'phys_variant': result.get('phys_variant', ''),
                'cir': result.get('cir', ''),
@@ -624,6 +664,18 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
                                     num_participants=ckpt.get('num_participants', 3),
                                     part_embed_dim=ckpt.get('part_embed_dim', 8),
                                     part_dropout=ckpt.get('part_dropout', 0.0))
+    elif model_name == 'rhythm':
+        model = RhythmTPINN(cir_params_init=ckpt['cir_params'],
+                            t_grid=ckpt['t_grid'],
+                            tau_s=ckpt.get('tau_s', 15.0),
+                            n_nuis=ckpt['latent_dim'],
+                            tau_max=ckpt.get('tau_max', 15.0),
+                            num_classes=3,
+                            embed_dim=ckpt['embed_dim'],
+                            condition_on_participant=ckpt.get('condition_on_participant', True),
+                            num_participants=ckpt.get('num_participants', 3),
+                            part_embed_dim=ckpt.get('part_embed_dim', 8),
+                            part_dropout=ckpt.get('part_dropout', 0.0))
     elif model_name == 'diffusion':
         model = ConditionalDiffusion(num_classes=3,
                                      num_participants=ckpt.get('num_participants', 3),
@@ -690,7 +742,7 @@ def generate_synthetic_signals(model, model_name: str, n_synthetic: int, stats: 
             all_labels.append(np.full(count, cls_idx))
         signals_phys = np.concatenate(all_signals, axis=0)
         labels = np.concatenate(all_labels, axis=0)
-    elif model_name in ('pinn', 'tpinn'):
+    elif model_name in ('pinn', 'tpinn', 'rhythm'):
         mode = stats.get('phys_prep', 'peakscale')
         t_mean = float(stats['mean'][1])
         t_std = float(stats['std'][1])
@@ -727,7 +779,7 @@ def validate_generator(model: torch.nn.Module, cache: dict, model_name: str, pre
     for key in ('init_seed', 'split_seed', 'fold', 'n_folds', 'cv_mode'):
         if settings[key] != cache[key]:
             raise ValueError(f'Generator/cache split mismatch: {key}')
-    if model_name in ('pinn', 'tpinn') and preprocessing == 'raw':
+    if model_name in ('pinn', 'tpinn', 'rhythm') and preprocessing == 'raw':
         raise ValueError('Physics generators require baseline or peaknorm classifier preprocessing')
     if cache['cv_mode'] == 'loso' and getattr(model, '_cond_part', False) and model.part_dropout <= 0:
         raise ValueError('LOSO generation requires a trained null participant token')
@@ -807,6 +859,11 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
         X_val_top = X_val_san[cache['top_20_features_sanitized']].values
         metrics_val = evaluate_classifier(stacker_tstr, X_val_top, y_val.values)
         print(f"[TSTR] val-split sanity: acc={metrics_val['accuracy']:.3f} f1={metrics_val['f1_weighted']:.3f} (test acc={tstr_metrics['accuracy']:.3f})")
+    # fidelity: signal-space MMD of the synthetic set vs the real training trials (classifier input space)
+    df_reg = load_dataset(dataset_dir)
+    df_reg = preprocess_signals(df_reg[df_reg['region'] == region].reset_index(drop=True), preprocessing)
+    df_tr_m, _, df_te_m = get_split(df_reg, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed, include_subjects=include_subjects)
+    mmd = mmd_report(_signals(df_tr_m), np.array([CLASS_TO_IDX[c] for c in df_tr_m['class']]), synth_signals, synth_labels, _signals(df_te_m))
     xgb_base = stacker_tstr.estimators_[0]
     xgb_clf = xgb_base.named_steps['clf'] if hasattr(xgb_base, 'named_steps') else xgb_base
     explainer = shap.TreeExplainer(xgb_clf)
@@ -841,6 +898,7 @@ def tstr(cache: dict, model_name: str, region: str, n_synthetic: int, n_jobs: in
             'metrics': tstr_metrics,
             'metrics_val': metrics_val,
             'feature_overlap': overlap,
+            'mmd': mmd,
             'top_20_synth_features': top_k_synth,
             'trtr_metrics': cache['trtr_metrics']}
 
@@ -954,7 +1012,15 @@ def generate_smote_aug(df_train: pd.DataFrame, n_aug: int, seed: int, k: int = 5
     return np.stack(sigs), np.array(labs)
 
 # train synthetic/real test real
-def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, cv_mode: str = 'kfold', preprocessing: str = 'raw', ckpt_run_id: str | None = None, real_fraction: float = 1.0, aug_source: str = 'gen', dataset_dir: str = 'dataset', n_folds: int = 5, include_subjects: tuple = (), guidance: float = -1.0) -> dict:
+def _signals(df: pd.DataFrame) -> np.ndarray:
+    """(n, 2, T) humidity / temperature array of a trial dataframe."""
+    return np.stack([np.stack([h, t]) for h, t in zip(df['humidity'], df['temperature'])]).astype(float)
+
+def _stream_alias(model_name: str, ckpt_run_id: str) -> str:
+    """Default random-stream name of a physics policy (the generator names of the development runs)."""
+    return 'rh15' if model_name == 'rhythm' else ('fp' if '_fp' in ckpt_run_id else 'tp0')
+
+def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: float, n_jobs: int, device, init_seed: int, split_seed: int, fold: int, run_id: str, free_bits: float = 0.0, latent_dim: int = 32, embed_dim: int = 16, part_embed_dim: int = 8, lambda_phys: float = 0.0, alpha: float = 0.0, n_copies: int = 1, cv_mode: str = 'kfold', preprocessing: str = 'raw', ckpt_run_id: str | None = None, real_fraction: float = 1.0, aug_source: str = 'gen', dataset_dir: str = 'dataset', n_folds: int = 5, include_subjects: tuple = (), guidance: float = -1.0, aug_policy: str = 'prior', aug_stream: str = '', eval_val: bool = False) -> dict:
     """Run augmentation TSTR+: train the classifier on real + synthetic data, test on the real fold.
 
     Generates int(n_train * augmentation_ratio) synthetic signals, concatenates their cached
@@ -974,8 +1040,14 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     :param free_bits, latent_dim, embed_dim, part_embed_dim, lambda_phys, alpha, n_copies:
         hyperparameters recorded in the result.
     :param cv_mode: 'kfold' or 'loso'.
+    :param aug_policy: 'prior' (generator prior samples) or a physics policy of core/augment.py (steer_margin,
+        steer_knn, obsdr) built from the generator and the real training trials.
+    :param aug_stream: random-stream name of the policy ('' = default per generator).
+    :param eval_val: also score the augmented and the real-only stacker on the real validation split.
     :return: result dict with config fields plus 'augmentation_ratio', 'metrics' (test scores),
-        'feature_overlap' (None), 'top_20_synth_features' (None), and 'trtr_metrics'.
+        'metrics_realonly' (matched real-only stacker), 'metrics_val' / 'metrics_realonly_val' (or None),
+        'mmd' (signal-space MMD of the synthetic set, see core.augment.mmd_report), 'feature_overlap' (None),
+        'top_20_synth_features' (None), and 'trtr_metrics'.
     """
     if real_fraction != 1.0:
         raise ValueError('Scarcity evaluation requires retraining the generator and feature selector on the same subset; real_fraction must be 1')
@@ -986,6 +1058,10 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
         X_real, y_real = X_real[keep], y_real[keep]
     n_real_used = len(y_real)
     n_synthetic = int(n_real_used * augmentation_ratio)
+    df = load_dataset(dataset_dir)
+    df = df[df['region'] == region].reset_index(drop=True)
+    df_tr, df_va, df_te = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed, include_subjects=include_subjects)
+    stream = None
     if aug_source == 'gen':
         model, ckpt_stats = load_model(model_name, ckpt_run_id or run_id, device)
         validate_generator(model, cache, model_name, preprocessing)
@@ -993,12 +1069,17 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
             model.guidance_scale = guidance
         print(f'[TSTR+] model={model_name}, n_synthetic={n_synthetic}, n_real_used={n_real_used} (frac={real_fraction}), preprocessing={preprocessing}')
         participant_idx = model.null_part_idx if (cv_mode == 'loso' and getattr(model, '_cond_part', False)) else None
-        synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed, participant_idx=participant_idx)
+        if aug_policy == 'prior':
+            synth_signals, synth_labels = generate_synthetic_signals(model, model_name, n_synthetic, ckpt_stats, device, init_seed, participant_idx=participant_idx)
+        else:
+            if model_name not in ('tpinn', 'rhythm'):
+                raise ValueError('physics augmentation policies need a tpinn or rhythm generator')
+            stream = f'{aug_stream or _stream_alias(model_name, ckpt_run_id or run_id)}/{POLICY_KINDS[aug_policy]}:{augmentation_ratio}'
+            synth_signals, synth_labels = augment(aug_policy, model, model_name, ckpt_stats, df_tr, cache, n_synthetic, init_seed, fold, stream,
+                                                  lambda signals: top_features(signals, cache, preprocessing), cv_mode)
+            print(f'[TSTR+] policy={aug_policy} stream={stream}')
     else:
         # non-generator REAL-signal augmentation controls (no generative model, no checkpoint loaded)
-        df = load_dataset(dataset_dir)
-        df = df[df['region'] == region].reset_index(drop=True)
-        df_tr, _, _ = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed, include_subjects=include_subjects)
         if aug_source == 'mixup':
             synth_signals, synth_labels = generate_real_aug(df_tr, n_synthetic, init_seed)
         elif aug_source == 'jitter':
@@ -1030,7 +1111,16 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
     # matched real-only-at-fraction baseline (same subsample) so the augmentation LIFT is paired per fold
     stacker_ro = train_stacking_classifier(X_real, y_real, init_seed, n_jobs=n_jobs)
     metrics_realonly = evaluate_classifier(stacker_ro, cache['X_test_top'], cache['y_test'])
-    print(f"[TSTR+] aug acc={metrics['accuracy']:.4f} | real-only@frac acc={metrics_realonly['accuracy']:.4f} | lift={metrics['accuracy']-metrics_realonly['accuracy']:+.4f}")
+    metrics_val = metrics_realonly_val = None
+    if eval_val:
+        dl_val, y_val = df_to_df_long(preprocess_signals(df_va, preprocessing))
+        X_val_top = _feat_top(dl_val, cache, n_jobs)
+        metrics_val = evaluate_classifier(stacker, X_val_top, y_val.values)
+        metrics_realonly_val = evaluate_classifier(stacker_ro, X_val_top, y_val.values)
+    # fidelity: signal-space MMD of the synthetic set vs the real training trials (classifier input space)
+    y_tr = np.array([CLASS_TO_IDX[c] for c in df_tr['class']])
+    mmd = mmd_report(_signals(preprocess_signals(df_tr, preprocessing)), y_tr, synth_signals, synth_labels, _signals(preprocess_signals(df_te, preprocessing)))
+    print(f"[TSTR+] aug acc={metrics['accuracy']:.4f} | real-only@frac acc={metrics_realonly['accuracy']:.4f} | lift={metrics['accuracy']-metrics_realonly['accuracy']:+.4f} | MMD {mmd['mmd']:.4f} (real test vs train {mmd['mmd_real_ref']:.4f})")
     return {'training_provenance': model.provenance if aug_source == 'gen' else None,
             'model': f'{model_name}_plus',
             'region': region,
@@ -1053,7 +1143,12 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
             'n_synth_kept': n_synth_kept,
             'augmentation_ratio': augmentation_ratio,
             'aug_source': aug_source,
+            'aug_policy': aug_policy,
+            'aug_stream': stream,
             'metrics_realonly': metrics_realonly,
+            'metrics_val': metrics_val,
+            'metrics_realonly_val': metrics_realonly_val,
+            'mmd': mmd,
             'top_20_features': cache['top_20_features_sanitized'],
             'metrics': metrics,
             'feature_overlap': None,
@@ -1066,7 +1161,7 @@ def _feat_top(df_long: pd.DataFrame, cache: dict, n_jobs: int) -> np.ndarray:
     X.columns = [re.sub(r'[^\w]', '_', c) for c in X.columns]
     return X[cache['top_20_features_sanitized']].values
 
-def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '', phys_residual: bool = False, class_transport: bool = False, parametric_source: bool = False, learn_cir_params: bool = False, ode: bool = False, subj_adv_lambda: float = 0.0, diff_hidden: int = 64, n_steps: int = 200, gan_hidden: int = 64, gan_loss: str = 'bce', gan_lr_d: float | None = None, lr: float = 1e-3, include_subjects: tuple = (), cir_tag: str = '', preprocessing: str = 'raw', phys_prep: str = 'peakscale', hp_tag: str = '', aug_ratio: float = 1.0, real_fraction: float = 1.0, ensemble_model: str = '', aug_source: str = 'gen', guidance: float = -1.0, n_synthetic: int | None = None, classwise_vae: bool = False, temperature_tau: float | None = None) -> str:
+def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '', phys_residual: bool = False, class_transport: bool = False, parametric_source: bool = False, learn_cir_params: bool = False, ode: bool = False, subj_adv_lambda: float = 0.0, diff_hidden: int = 64, n_steps: int = 200, gan_hidden: int = 64, gan_loss: str = 'bce', gan_lr_d: float | None = None, lr: float = 1e-3, include_subjects: tuple = (), cir_tag: str = '', preprocessing: str = 'raw', phys_prep: str = 'peakscale', hp_tag: str = '', aug_ratio: float = 1.0, real_fraction: float = 1.0, ensemble_model: str = '', aug_source: str = 'gen', guidance: float = -1.0, n_synthetic: int | None = None, classwise_vae: bool = False, temperature_tau: float | None = None, aug_policy: str = 'prior') -> str:
     """Build the generator artifact id encoding the model and its config flags.
 
     Assembles a per-model-family base id (region, seed, dims, model-specific markers) and appends
@@ -1087,6 +1182,8 @@ def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim:
         run_id = f'{region}_s{init_seed}_ld{latent_dim}_ed{embed_dim}_phys{lambda_phys}'
     elif base_model == 'tpinn':
         run_id = f'{region}_s{init_seed}_ld{latent_dim}_ed{embed_dim}_tphys' + ('_ct' if class_transport else '') + ('_ps' if parametric_source else '') + ('_res' if phys_residual else '') + ('_learn' if learn_cir_params else '') + ('_ode' if ode else '')
+    elif base_model == 'rhythm':
+        run_id = f'{region}_s{init_seed}_rhythm'
     elif base_model == 'diffusion':
         run_id = f'{region}_s{init_seed}_ed{embed_dim}_diff_h{diff_hidden}_st{n_steps}'
     elif base_model == 'gan':
@@ -1106,6 +1203,8 @@ def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim:
         run_id += f'_ens{ensemble_model}'
     if aug_source != 'gen':
         run_id += f'_aug{aug_source}'
+    if aug_policy != 'prior':
+        run_id += f'_{aug_policy}'
     if channel != 'both':
         run_id += f'_ch{channel}'
     if guidance >= 0:
@@ -1141,7 +1240,7 @@ def main():
         for region in regions:
             for init_seed in init_seeds:
                 for fold in folds:
-                    rid = build_run_id(args.model, region, init_seed, fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=args.real_fraction, ensemble_model=args.ensemble_model, aug_source=args.aug_source, guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae, temperature_tau=args.temperature_tau)
+                    rid = build_run_id(args.model, region, init_seed, fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=args.real_fraction, ensemble_model=args.ensemble_model, aug_source=args.aug_source, guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae, temperature_tau=args.temperature_tau, aug_policy=(args.aug_policy if args.mode == 'tstr_plus' else 'prior'))
                     model_dir = args.model + ('_plus' if args.mode == 'tstr_plus' else '')
                     path = f'results/{model_dir}/{rid}_tstr.json'
                     if not os.path.exists(path):
@@ -1159,7 +1258,7 @@ def main():
         return
     if args.region is None:
         raise SystemExit('[TSTR] --region is required (except with --aggregate)')
-    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=(args.real_fraction if args.mode == 'tstr_plus' else 1.0), ensemble_model=args.ensemble_model, aug_source=(args.aug_source if args.mode == 'tstr_plus' else 'gen'), guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae, temperature_tau=args.temperature_tau)
+    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=(args.real_fraction if args.mode == 'tstr_plus' else 1.0), ensemble_model=args.ensemble_model, aug_source=(args.aug_source if args.mode == 'tstr_plus' else 'gen'), guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae, temperature_tau=args.temperature_tau, aug_policy=(args.aug_policy if args.mode == 'tstr_plus' else 'prior'))
     ckpt_run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, 'both', args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing='raw', phys_prep=args.phys_prep, hp_tag=args.hp_tag, classwise_vae=args.classwise_vae, temperature_tau=args.temperature_tau)
     # ensemble second-generator checkpoint id (tpinn = tpinn-res @ stdscale, the champion physics model)
     ensemble_ckpt_run_id = None
@@ -1212,7 +1311,7 @@ def main():
         return
     # train-synthetic-test-real
     if args.mode == 'tstr_plus':
-        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, cv_mode=args.cv_mode, preprocessing=args.preprocessing, ckpt_run_id=ckpt_run_id, real_fraction=args.real_fraction, aug_source=args.aug_source, dataset_dir=args.dataset_dir, n_folds=args.n_folds, include_subjects=include_subjects, guidance=args.guidance)
+        result = tstr_plus(cache, args.model, args.region, args.augmentation_ratio, args.n_jobs, device, args.init_seed, args.split_seed, args.fold, run_id, args.free_bits, args.latent_dim, args.embed_dim, args.part_embed_dim, args.lambda_phys, args.alpha, args.n_copies, cv_mode=args.cv_mode, preprocessing=args.preprocessing, ckpt_run_id=ckpt_run_id, real_fraction=args.real_fraction, aug_source=args.aug_source, dataset_dir=args.dataset_dir, n_folds=args.n_folds, include_subjects=include_subjects, guidance=args.guidance, aug_policy=args.aug_policy, aug_stream=args.aug_stream, eval_val=args.eval_val)
         result['subset'] = sub_value
         result['phys_variant'] = phys_variant
         result['cir'] = args.cir_tag

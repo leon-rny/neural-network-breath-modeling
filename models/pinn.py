@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -389,3 +391,94 @@ class SharedTransportPINN(CVAE):
         if return_aux:
             return x_hat, uH, uT, cir
         return x_hat
+
+
+# rhythm tpinn: the class enters only through the breathing physics
+RHYTHM_BANDS_BPM = ((5.0, 12.0), (12.0, 20.0), (20.0, 40.0))  # bradypnea, eupnea, tachypnea (clinical definitions)
+N_RHYTHM = 6  # rhythm latents: rate, phase (cos, sin), amplitude, T:H gain, rate wander
+DT_SAMPLE, FINE, PRE_S, ONSET_S = 2.004, 8, 60.0, 10.0  # DHT22 sampling interval (s), fine-grid factor, pre-roll (s), onset (s)
+
+class RhythmTPINN(SharedTransportPINN):
+    """Shared-transport PINN whose class information enters only through a breathing rhythm.
+
+    x_hat = envelope(z_n, p) + rhythm(f, phi, A, w; tau_H, tau_T) [+ smoothed residual]: the envelope is the
+    calibrated transport physics with a constant class token (class-blind); the rhythm is a breath waveform
+    (cos + learned 2nd harmonic, slow rate wander) at a rate f inside the clinical band of the class, rendered
+    on a 0.25 s grid, passed through learned first-order humidity / temperature sensor lags and sampled every
+    2.004 s, so aliasing and attenuation follow from the physics. Latent z = [z_n | 6 rhythm latents], N(0, I).
+    """
+
+    def __init__(self, *args, n_nuis: int = 16, residual_mode: str = 'none', tau_init=(5.0, 3.0), tau_max: float = 15.0, **kwargs):
+        """
+        :param n_nuis: Number of class-blind (envelope / participant) latent dimensions.
+        :param residual_mode: 'none' (pure physics) or 'smooth' (class-blind 5-sample moving-average residual).
+        :param tau_init: Initial humidity and temperature sensor lags in seconds.
+        :param tau_max: Upper bound of the learned sensor lags in seconds (lower bound 0.5 s).
+        """
+        kwargs['latent_dim'] = n_nuis + N_RHYTHM
+        kwargs['residual'] = True
+        super().__init__(*args, **kwargs)
+        self.n_nuis, self.residual_mode = n_nuis, residual_mode
+        self.tau_bounds = (math.log(0.5), math.log(tau_max))
+        self.log_tau_c = nn.Parameter(torch.log(torch.tensor(tau_init, dtype=torch.float32)))
+        self.wave_a2 = nn.Parameter(torch.tensor(-1.0))
+        self.wave_b2 = nn.Parameter(torch.tensor(0.0))
+        self.res_gain = nn.Parameter(torch.tensor(0.1))
+        self.register_buffer('bands', torch.tensor(RHYTHM_BANDS_BPM) / 60.0)
+        self.dt = DT_SAMPLE / FINE
+        self.n_pre = int(round(PRE_S / self.dt))
+        self.n_fine = self.n_pre + self.T * FINE
+        t = (torch.arange(self.n_fine, dtype=torch.float32) - self.n_pre) * self.dt
+        self.register_buffer('t_fine', t)
+        self.register_buffer('onset', torch.sigmoid((t - ONSET_S) / 1.0))
+        self.register_buffer('kt', torch.arange(int(round(120.0 / self.dt)), dtype=torch.float32) * self.dt)
+
+    def taus(self) -> tuple[float, float]:
+        """Current humidity and temperature sensor lags in seconds."""
+        tau = self.log_tau_c.detach().clamp(*self.tau_bounds).exp()
+        return float(tau[0]), float(tau[1])
+
+    def rhythm_params(self, z, y, rate_override=None):
+        """Map the rhythm latents to rate (Hz, inside the class band), phase, amplitude, T:H gain and wander."""
+        r = z[:, self.n_nuis:]
+        lo, hi = self.bands[y, 0], self.bands[y, 1]
+        f = lo + (hi - lo) * torch.sigmoid(r[:, 0]) if rate_override is None else rate_override
+        phi = torch.atan2(r[:, 2], r[:, 1] + 1e-6)
+        amp = F.softplus(r[:, 3] + 1.0)
+        ratio = torch.exp(0.5 * r[:, 4])
+        wander = 0.15 * torch.tanh(r[:, 5])
+        return f, phi, amp, ratio, wander
+
+    def rhythm(self, z, y, rate_override=None, tau_override=None):
+        """Render the breathing rhythm on the fine grid, apply both sensor lags and sample at the DHT22 instants."""
+        f, phi, amp, ratio, wander = self.rhythm_params(z, y, rate_override)
+        span = self.t_fine[-1] - self.t_fine[0]
+        f_t = f[:, None] * (1.0 + wander[:, None] * torch.sin(2 * math.pi * (self.t_fine - self.t_fine[0]) / span)[None])
+        theta = phi[:, None] + 2 * math.pi * torch.cumsum(f_t, dim=1) * self.dt
+        a2 = torch.sigmoid(self.wave_a2)
+        src = (torch.cos(theta) + a2 * torch.cos(2 * theta + self.wave_b2)) * self.onset[None]
+        log_tau = self.log_tau_c.clamp(*self.tau_bounds) if tau_override is None else tau_override
+        out = []
+        for c in range(2):
+            k = torch.exp(-self.kt / log_tau[c].exp())
+            k = (k / k.sum()).flip(0).view(1, 1, -1)
+            y_c = F.conv1d(F.pad(src.unsqueeze(1), (k.shape[-1] - 1, 0)), k).squeeze(1)  # causal first-order sensor
+            out.append(y_c[:, self.n_pre::FINE][:, :self.T])
+        gains = torch.stack([amp, amp * ratio], dim=1)
+        return torch.stack(out, dim=1) * gains[:, :, None]
+
+    def _physics(self, z, y, p, rate_override=None, tau_override=None):
+        """Class-blind envelope (constant class token, rhythm latents zeroed) + class-carrying rhythm."""
+        B = z.shape[0]
+        y0 = torch.zeros_like(y)
+        z_n = torch.cat([z[:, :self.n_nuis], torch.zeros(B, N_RHYTHM, device=z.device)], dim=1)
+        c = self._cond(z_n, y0, p)
+        zero_A = torch.zeros(B, device=z.device)
+        log_D, log_v = self.log_D.expand(B), self.log_v.expand(B)
+        hum, uH = self.cir_conv(self.uH_head(c), zero_A, log_D, log_v, None)
+        tmp, uT = self.cir_conv(self.uT_head(c), zero_A, log_D, log_v, None)
+        x_hat = torch.stack([hum, tmp], dim=1) + self.rhythm(z, y, rate_override, tau_override)
+        if self.residual_mode == 'smooth':
+            res = F.avg_pool1d(F.pad(self.decoder(z_n, y0, p), (2, 2), mode='replicate'), 5, stride=1)
+            x_hat = x_hat + self.res_gain * res
+        return x_hat, uH, uT, (zero_A, log_D, log_v)

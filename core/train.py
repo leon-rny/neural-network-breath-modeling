@@ -24,7 +24,7 @@ from core.provenance import file_digest, fingerprint, reserve_training
 from core.utils import make_generator, seed_everything, seed_worker
 from models.diffusion import ConditionalDiffusion
 from models.gan import Discriminator, Generator
-from models.pinn import PhysicsInformedCVAE, SharedTransportPINN
+from models.pinn import PhysicsInformedCVAE, RhythmTPINN, SharedTransportPINN
 from models.vae import CVAE, VAE, ClasswiseVAE, elbo_loss
 
 
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     p = argparse.ArgumentParser()
     # general
-    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part', 'pinn', 'tpinn', 'diffusion', 'gan'])
+    p.add_argument('--model', required=True, choices=['vae', 'cvae', 'cvae_part', 'pinn', 'tpinn', 'rhythm', 'diffusion', 'gan'])
     p.add_argument('--n_steps', type=int, default=200)
     p.add_argument('--region', required=True, choices=['mouth', 'nose'])
     p.add_argument('--dataset_dir', default='dataset')
@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--ode', action='store_true')  # UDE mode: relaxation ODE + neural residual instead of the CIR convolution
     p.add_argument('--class_transport', action='store_true')
     p.add_argument('--parametric_source', action='store_true')
+    p.add_argument('--tau_max', type=float, default=15.0)  # rhythm: upper bound (s) of the learned humidity / temperature sensor lags
     # jittering augmentation (training only, defaults = off)
     p.add_argument('--alpha', type=float, default=0.0)
     p.add_argument('--n_copies', type=int, default=1)
@@ -293,7 +294,7 @@ def main():
         args.beta_warmup_epochs = args.epochs // 2
     if args.epochs < 1 or not 0 <= args.beta_warmup_epochs <= args.epochs:
         raise ValueError('Require epochs >= 1 and 0 <= beta_warmup_epochs <= epochs')
-    if args.cv_mode == 'loso' and args.model in ('cvae_part', 'pinn', 'tpinn', 'diffusion', 'gan') and args.part_dropout <= 0:
+    if args.cv_mode == 'loso' and args.model in ('cvae_part', 'pinn', 'tpinn', 'rhythm', 'diffusion', 'gan') and args.part_dropout <= 0:
         raise ValueError('Participant-conditioned LOSO requires positive part_dropout to train the null token')
     device = torch.device('cpu')
     if args.temperature_tau is not None and (args.model != 'tpinn' or args.ode or args.class_transport or args.parametric_source):
@@ -311,6 +312,8 @@ def main():
         run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_phys{args.lambda_phys}'
     elif args.model == 'tpinn':
         run_id = f'{args.region}_s{args.init_seed}_ld{args.latent_dim}_ed{args.embed_dim}_tphys' + ('_ct' if args.class_transport else '') + ('_ps' if args.parametric_source else '') + ('_res' if args.phys_residual else '') + ('_learn' if args.learn_cir_params else '') + ('_ode' if args.ode else '')
+    elif args.model == 'rhythm':
+        run_id = f'{args.region}_s{args.init_seed}_rhythm' + (f'_tmax{args.tau_max:g}' if args.tau_max != 15.0 else '')
     elif args.model == 'diffusion':
         run_id = f'{args.region}_s{args.init_seed}_ed{args.embed_dim}_diff_h{args.diff_hidden}_st{args.n_steps}'
     elif args.model == 'gan':
@@ -328,7 +331,7 @@ def main():
     ckpt_path = f'results/{args.model}/{run_id}_checkpoint.pt'
     history_path = f'results/{args.model}/{run_id}_train_history.csv'
     inputs = fingerprint(args.dataset_dir)
-    if args.model in ('pinn', 'tpinn'):
+    if args.model in ('pinn', 'tpinn', 'rhythm'):
         calibration = f'results/pinn/params_{args.region}{("_" + args.cir_tag) if args.cir_tag else ""}.npy'
         inputs['calibration_sha256'] = file_digest(calibration)
     provenance = reserve_training(ckpt_path, vars(args), inputs)
@@ -344,9 +347,9 @@ def main():
     # args.fold is 1-indexed
     df_train, df_val, _ = get_split(df, cv_mode=args.cv_mode, fold=args.fold - 1, n_folds=args.n_folds, split_seed=args.split_seed)
     trained_participants = sorted(PARTICIPANT_TO_IDX[p] for p in df_train['participant'].unique())
-    DatasetCls = PhysicsInformedDataset if args.model in ('pinn', 'tpinn') else BreathDataset
+    DatasetCls = PhysicsInformedDataset if args.model in ('pinn', 'tpinn', 'rhythm') else BreathDataset
     ds_kwargs = {'alpha': args.alpha, 'n_copies': args.n_copies}
-    if args.model in ('pinn', 'tpinn'):
+    if args.model in ('pinn', 'tpinn', 'rhythm'):
         ds_kwargs['phys_prep'] = args.phys_prep
     train_ds = DatasetCls(df_train, **ds_kwargs)
     train_ds_clean = DatasetCls(df_train, stats=train_ds.stats) if args.alpha > 0 else train_ds
@@ -401,7 +404,7 @@ def main():
                                    'val': f'{val_loss:.4f}',
                                    'active': n_active})
     # pinn / tpinn branch (tpinn = shared-transport physics-as-decoder
-    elif args.model in ('pinn', 'tpinn'):
+    elif args.model in ('pinn', 'tpinn', 'rhythm'):
         params_cir = np.load(f'results/pinn/params_{args.region}{("_" + args.cir_tag) if args.cir_tag else ""}.npy')
         t_grid = np.arange(36) * 2.0
         if args.model == 'tpinn':
@@ -413,6 +416,11 @@ def main():
                                         num_classes=3, embed_dim=args.embed_dim, condition_on_participant=True,
                                         num_participants=num_participants, part_embed_dim=args.part_embed_dim,
                                         part_dropout=args.part_dropout).to(device)
+        elif args.model == 'rhythm':
+            model = RhythmTPINN(cir_params_init=params_cir, t_grid=t_grid, tau_s=args.tau_s, n_nuis=args.latent_dim,
+                                tau_max=args.tau_max, num_classes=3, embed_dim=args.embed_dim, condition_on_participant=True,
+                                num_participants=num_participants, part_embed_dim=args.part_embed_dim,
+                                part_dropout=args.part_dropout).to(device)
         else:
             model = PhysicsInformedCVAE(cir_params_init=params_cir, t_grid=t_grid, tau_s=args.tau_s,
                                         learn_cir_params=args.learn_cir_params, latent_dim=args.latent_dim,
@@ -443,7 +451,7 @@ def main():
                             'phys_residual': args.phys_residual, 'class_transport': args.class_transport,
                             'parametric_source': args.parametric_source, 'ode': args.ode,
                             'condition_on_participant': True, 'num_participants': num_participants,
-                            'part_dropout': args.part_dropout, 'cv_mode': args.cv_mode}, ckpt_path)
+                            'part_dropout': args.part_dropout, 'cv_mode': args.cv_mode, 'tau_max': args.tau_max}, ckpt_path)
             history.append({'epoch': epoch, 'beta': beta,
                             **{f'train_{k}': train_m[k] for k in ('total', 'recon', 'kl', 'phys')},
                             **{f'val_{k}': val_m[k] for k in ('total', 'recon', 'kl', 'phys')},
