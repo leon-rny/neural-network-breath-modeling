@@ -17,6 +17,7 @@ from core.data import (
     get_split,
     load_dataset,
     phys_prep_marker,
+    sensor_marker,
     subset_tag,
 )
 from core.provenance import file_digest, fingerprint, reserve_training
@@ -69,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     # pinn-specific (ignored by vae/cvae/cvae_part)
     p.add_argument('--lambda_phys', type=float, default=0.0)
     p.add_argument('--tau_s', type=float, default=15.0)
+    p.add_argument('--temperature_tau', type=float, default=None)
     p.add_argument('--learn_cir_params', action='store_true')
     p.add_argument('--phys_residual', action='store_true')
     p.add_argument('--ode', action='store_true')  # UDE mode: relaxation ODE + neural residual instead of the CIR convolution
@@ -294,6 +296,8 @@ def main():
     if args.cv_mode == 'loso' and args.model in ('cvae_part', 'pinn', 'tpinn', 'diffusion', 'gan') and args.part_dropout <= 0:
         raise ValueError('Participant-conditioned LOSO requires positive part_dropout to train the null token')
     device = torch.device('cpu')
+    if args.temperature_tau is not None and (args.model != 'tpinn' or args.ode or args.class_transport or args.parametric_source):
+        raise ValueError('temperature_tau requires the fixed-sensor tpinn transport branch')
     print(f'[TRAIN] init_seed={args.init_seed} split_seed={args.split_seed} fold={args.fold} cv={args.cv_mode} | Model: {args.model} | Region: {args.region} | Device: {device} | Epochs: {args.epochs}')
     include_subjects = tuple(x.strip() for x in args.include_subjects.split(',') if x.strip())
     os.makedirs(f'results/{args.model}', exist_ok=True)
@@ -316,6 +320,7 @@ def main():
         run_id += f'_a{args.alpha}_n{args.n_copies}'
     if args.hp_tag:
         run_id += f'_{args.hp_tag}'
+    run_id += sensor_marker(args.temperature_tau)
     if args.classwise_vae:
         if args.model != 'vae':
             raise ValueError('classwise_vae is only valid for model=vae')
@@ -404,6 +409,7 @@ def main():
                                         learn_transport=args.learn_cir_params, residual=args.phys_residual,
                                         class_transport=args.class_transport, parametric_source=args.parametric_source,
                                         ode=args.ode, latent_dim=args.latent_dim,
+                                        temperature_tau=args.temperature_tau,
                                         num_classes=3, embed_dim=args.embed_dim, condition_on_participant=True,
                                         num_participants=num_participants, part_embed_dim=args.part_embed_dim,
                                         part_dropout=args.part_dropout).to(device)
@@ -433,6 +439,7 @@ def main():
                             'embed_dim': args.embed_dim, 'part_embed_dim': args.part_embed_dim,
                             'region': args.region, 'cir_params': params_cir, 't_grid': t_grid,
                             'tau_s': args.tau_s, 'learn_cir_params': args.learn_cir_params,
+                            'temperature_tau': args.temperature_tau,
                             'phys_residual': args.phys_residual, 'class_transport': args.class_transport,
                             'parametric_source': args.parametric_source, 'ode': args.ode,
                             'condition_on_participant': True, 'num_participants': num_participants,

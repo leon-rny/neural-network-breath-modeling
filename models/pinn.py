@@ -206,7 +206,7 @@ class SharedTransportPINN(CVAE):
     """Physics-AS-decoder generative model with a shared advection-diffusion transport for both
     channels (heat-mass analogy."""
 
-    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, learn_transport: bool = False, residual: bool = False, class_transport: bool = False, parametric_source: bool = False, ode: bool = False, **cvae_kwargs):
+    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, learn_transport: bool = False, residual: bool = False, class_transport: bool = False, parametric_source: bool = False, ode: bool = False, temperature_tau: float | None = None, **cvae_kwargs):
         """
         :param cir_params_init: (A, D, v, ...) initial transport parameters from the SIR fit (A is unused, the kernel is unit-integral).
         :param t_grid: 1D array of sample times (seconds) for the transport kernel.
@@ -217,11 +217,19 @@ class SharedTransportPINN(CVAE):
         :param residual: Whether to add the conv decoder output as a class-discriminative residual on the physics envelope (default False).
         :param class_transport: Whether to learn per-class (D, v) plus a global learnable sensor lag (default False).
         :param parametric_source: Whether to replace the learned source heads with an analytic per-class sigmoid injection (default False).
+        :param temperature_tau: Optional fixed temperature lag in seconds, separate from humidity.
         :param cvae_kwargs: Forwarded to the base CVAE (latent_dim, num_classes, conditioning, ...).
         """
         super().__init__(**cvae_kwargs)
         rng_state = torch.get_rng_state()
         self.cir_conv = CIRConvolution(t_grid, tau_s=tau_s, d0=d0, baseline_samples=baseline_samples)
+        if temperature_tau is not None:
+            if not np.isfinite(temperature_tau) or temperature_tau <= 0:
+                raise ValueError('temperature_tau must be finite and positive')
+            if ode or class_transport or parametric_source:
+                raise ValueError('Separate fixed sensors require the fixed-sensor transport branch')
+        self.temperature_tau = temperature_tau
+        self.temperature_conv = None if temperature_tau is None else CIRConvolution(t_grid, tau_s=temperature_tau, d0=d0, baseline_samples=baseline_samples)
         T = len(t_grid)
         self.learn_transport = learn_transport
         self.class_transport = class_transport
@@ -326,7 +334,8 @@ class SharedTransportPINN(CVAE):
         else:
             c = self._cond(z, y, p)
             humidity_phys, uH = self.cir_conv(self.uH_head(c), zero_A, log_D, log_v, log_tau_s)
-            temperature_phys, uT = self.cir_conv(self.uT_head(c), zero_A, log_D, log_v, log_tau_s)
+            temperature_conv = self.cir_conv if self.temperature_conv is None else self.temperature_conv
+            temperature_phys, uT = temperature_conv(self.uT_head(c), zero_A, log_D, log_v, log_tau_s)
         x_hat = torch.stack([humidity_phys, temperature_phys], dim=1)
         if self.residual:
             x_hat = x_hat + self.decoder(z, y, p)  # class-discriminative residual on the physics envelope

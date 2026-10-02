@@ -194,6 +194,14 @@ def phys_prep_marker(phys_prep: str = 'peakscale') -> str:
     """run_id/summary marker for the physics-generator input normalization (PhysicsInformedDataset), peakscale = current default."""
     return '' if phys_prep in ('', 'peakscale') else f'_pp{phys_prep}'
 
+def sensor_marker(temperature_tau: float | None = None) -> str:
+    """Identify an optional fixed temperature sensor lag without changing legacy ids."""
+    if temperature_tau is None:
+        return ''
+    if not np.isfinite(temperature_tau) or temperature_tau <= 0:
+        raise ValueError('temperature_tau must be finite and positive')
+    return f'_tauT{float(temperature_tau)}'
+
 def get_split(df: pd.DataFrame, cv_mode: str, fold: int, n_folds: int, split_seed: int = 42, val_size: float = 0.15, exclude_subjects: tuple = (), loso_trial_val: bool = False, include_subjects: tuple = ()) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Dispatch to the k-fold or LOSO splitter."""
     if include_subjects:

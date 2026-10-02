@@ -9,15 +9,8 @@ __pycache__/
 .vscode/
 .ruff_cache/
 
-# results
+# results/evaluation
 experiments/
 results/
-backups/
-reproduction/
-docs/
-tests/
-
-# evaluation
-plotting.py
+development/
 *.ipynb
-*.pdf

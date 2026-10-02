@@ -21,7 +21,12 @@ from sklearn.metrics import (
     log_loss,
     roc_auc_score,
 )
-from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.model_selection import (
+    GridSearchCV,
+    GroupKFold,
+    StratifiedKFold,
+    train_test_split,
+)
 from sklearn.neighbors import NearestNeighbors
 from tsfresh import extract_features
 from tsfresh.feature_extraction.settings import from_columns
@@ -40,6 +45,7 @@ from core.data import (
     loso_path_tag,
     phys_prep_marker,
     prep_marker,
+    sensor_marker,
     subset_tag,
 )
 from core.features import TrainingFeatureSelector
@@ -93,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--part_embed_dim', type=int, default=8)
     p.add_argument('--lambda_phys', type=float, default=1.0)
     p.add_argument('--tau_s', type=float, default=15.0)
+    p.add_argument('--temperature_tau', type=float, default=None)
     p.add_argument('--subj_adv_lambda', type=float, default=0.0)
     p.add_argument('--diff_hidden', type=int, default=64)
     p.add_argument('--n_steps', type=int, default=200)
@@ -237,13 +244,14 @@ class FoldSMOTE(SMOTE):
         sampler = SMOTE(random_state=self.random_state, k_neighbors=min(5, int(counts.min()) - 1))
         return sampler.fit_resample(X, y)
 
-def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_seed: int, n_jobs: int = -1) -> StackingClassifier:
+def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_seed: int, n_jobs: int = -1, groups: np.ndarray | None = None) -> StackingClassifier:
     """Fit a SMOTE + XGB/CatBoost stacking classifier with a random-forest meta-learner.
 
     :param X_train: feature matrix.
     :param y_train: integer class labels.
     :param init_seed: random seed for all estimators and SMOTE.
     :param n_jobs: parallel workers for the stacker's cross-validation.
+    :param groups: Optional participant groups for disjoint internal stacking folds.
     :return: the fitted StackingClassifier.
     """
     def make_base(clf):
@@ -255,11 +263,17 @@ def train_stacking_classifier(X_train: np.ndarray, y_train: np.ndarray, init_see
     if min_class < 2:
         raise ValueError('Stacking cross-validation needs at least two samples per class')
     n_splits = min(5, min_class)
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=init_seed)
+    if groups is not None:
+        groups = np.asarray(groups)
+        if len(groups) != len(y_train) or len(np.unique(groups)) < 2:
+            raise ValueError('Grouped stacking needs matching groups and at least two participants')
+        cv = list(GroupKFold(n_splits=min(5, len(np.unique(groups)))).split(X_train, y_train, groups))
     # create clf and use smote
     xgb_clf = make_base(XGBClassifier(n_jobs=1, eval_metric='mlogloss', random_state=init_seed, max_depth=4, reg_alpha=0.5, reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8, n_estimators=300))
     cat_clf = make_base(CatBoostClassifier(thread_count=1, logging_level='Silent', random_state=init_seed, iterations=300, depth=4, l2_leaf_reg=5.0, random_strength=2.0, bagging_temperature=2.0, od_type='Iter', od_wait=20, allow_writing_files=False))
     meta_clf = RandomForestClassifier(n_jobs=1, n_estimators=150, max_depth=3, min_samples_leaf=5, min_samples_split=10, random_state=init_seed)
-    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=init_seed), n_jobs=n_jobs)
+    stacker = StackingClassifier(estimators=[('xgb', xgb_clf), ('cat', cat_clf)], final_estimator=meta_clf, passthrough=True, cv=cv, n_jobs=n_jobs)
     stacker.fit(X_train, y_train)
     return stacker
 
@@ -602,6 +616,7 @@ def load_model(model_name: str, run_id: str, device: 'torch.device') -> tuple[to
                                     class_transport=ckpt.get('class_transport', False),
                                     parametric_source=ckpt.get('parametric_source', False),
                                     ode=ckpt.get('ode', False),
+                                    temperature_tau=ckpt.get('temperature_tau'),
                                     latent_dim=ckpt['latent_dim'],
                                     num_classes=3,
                                     embed_dim=ckpt['embed_dim'],
@@ -1051,7 +1066,7 @@ def _feat_top(df_long: pd.DataFrame, cache: dict, n_jobs: int) -> np.ndarray:
     X.columns = [re.sub(r'[^\w]', '_', c) for c in X.columns]
     return X[cache['top_20_features_sanitized']].values
 
-def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '', phys_residual: bool = False, class_transport: bool = False, parametric_source: bool = False, learn_cir_params: bool = False, ode: bool = False, subj_adv_lambda: float = 0.0, diff_hidden: int = 64, n_steps: int = 200, gan_hidden: int = 64, gan_loss: str = 'bce', gan_lr_d: float | None = None, lr: float = 1e-3, include_subjects: tuple = (), cir_tag: str = '', preprocessing: str = 'raw', phys_prep: str = 'peakscale', hp_tag: str = '', aug_ratio: float = 1.0, real_fraction: float = 1.0, ensemble_model: str = '', aug_source: str = 'gen', guidance: float = -1.0, n_synthetic: int | None = None, classwise_vae: bool = False) -> str:
+def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim: int, embed_dim: int, part_embed_dim: int, free_bits: float, alpha: float, n_copies: int, channel: str = 'both', lambda_phys: float = 1.0, cv_mode: str = 'kfold', part_dropout: float = 0.0, loso_tag: str = '', phys_residual: bool = False, class_transport: bool = False, parametric_source: bool = False, learn_cir_params: bool = False, ode: bool = False, subj_adv_lambda: float = 0.0, diff_hidden: int = 64, n_steps: int = 200, gan_hidden: int = 64, gan_loss: str = 'bce', gan_lr_d: float | None = None, lr: float = 1e-3, include_subjects: tuple = (), cir_tag: str = '', preprocessing: str = 'raw', phys_prep: str = 'peakscale', hp_tag: str = '', aug_ratio: float = 1.0, real_fraction: float = 1.0, ensemble_model: str = '', aug_source: str = 'gen', guidance: float = -1.0, n_synthetic: int | None = None, classwise_vae: bool = False, temperature_tau: float | None = None) -> str:
     """Build the generator artifact id encoding the model and its config flags.
 
     Assembles a per-model-family base id (region, seed, dims, model-specific markers) and appends
@@ -1060,6 +1075,8 @@ def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim:
     :return: the run-id string used to locate checkpoints and result files.
     """
     base_model = model.removesuffix('_plus')
+    if temperature_tau is not None and (base_model != 'tpinn' or ode or class_transport or parametric_source):
+        raise ValueError('temperature_tau requires the fixed-sensor tpinn transport branch')
     if base_model == 'vae':
         run_id = f'{region}_s{init_seed}_ld{latent_dim}_fb{free_bits}'
     elif base_model == 'cvae':
@@ -1097,6 +1114,7 @@ def build_run_id(model: str, region: str, init_seed: int, fold: int, latent_dim:
         run_id += f'_ns{n_synthetic}'
     if hp_tag:
         run_id += f'_{hp_tag}'
+    run_id += sensor_marker(temperature_tau)
     if classwise_vae:
         run_id += '_classwise'
     return run_id
@@ -1123,7 +1141,7 @@ def main():
         for region in regions:
             for init_seed in init_seeds:
                 for fold in folds:
-                    rid = build_run_id(args.model, region, init_seed, fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=args.real_fraction, ensemble_model=args.ensemble_model, aug_source=args.aug_source, guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae)
+                    rid = build_run_id(args.model, region, init_seed, fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=args.real_fraction, ensemble_model=args.ensemble_model, aug_source=args.aug_source, guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae, temperature_tau=args.temperature_tau)
                     model_dir = args.model + ('_plus' if args.mode == 'tstr_plus' else '')
                     path = f'results/{model_dir}/{rid}_tstr.json'
                     if not os.path.exists(path):
@@ -1141,8 +1159,8 @@ def main():
         return
     if args.region is None:
         raise SystemExit('[TSTR] --region is required (except with --aggregate)')
-    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=(args.real_fraction if args.mode == 'tstr_plus' else 1.0), ensemble_model=args.ensemble_model, aug_source=(args.aug_source if args.mode == 'tstr_plus' else 'gen'), guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae)
-    ckpt_run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, 'both', args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing='raw', phys_prep=args.phys_prep, hp_tag=args.hp_tag, classwise_vae=args.classwise_vae)
+    run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, args.channel, args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing=args.preprocessing, phys_prep=args.phys_prep, hp_tag=args.hp_tag, aug_ratio=(args.augmentation_ratio if args.mode == 'tstr_plus' else 1.0), real_fraction=(args.real_fraction if args.mode == 'tstr_plus' else 1.0), ensemble_model=args.ensemble_model, aug_source=(args.aug_source if args.mode == 'tstr_plus' else 'gen'), guidance=args.guidance, n_synthetic=args.n_synthetic, classwise_vae=args.classwise_vae, temperature_tau=args.temperature_tau)
+    ckpt_run_id = build_run_id(args.model, args.region, args.init_seed, args.fold, args.latent_dim, args.embed_dim, args.part_embed_dim, args.free_bits, args.alpha, args.n_copies, 'both', args.lambda_phys, args.cv_mode, args.part_dropout, loso_tag, phys_residual=args.phys_residual, class_transport=args.class_transport, parametric_source=args.parametric_source, learn_cir_params=args.learn_cir_params, ode=args.ode, subj_adv_lambda=args.subj_adv_lambda, diff_hidden=args.diff_hidden, n_steps=args.n_steps, gan_hidden=args.gan_hidden, gan_loss=args.gan_loss, gan_lr_d=args.gan_lr_d, lr=args.lr, include_subjects=include_subjects, cir_tag=args.cir_tag, preprocessing='raw', phys_prep=args.phys_prep, hp_tag=args.hp_tag, classwise_vae=args.classwise_vae, temperature_tau=args.temperature_tau)
     # ensemble second-generator checkpoint id (tpinn = tpinn-res @ stdscale, the champion physics model)
     ensemble_ckpt_run_id = None
     if args.ensemble_model == 'tpinn':
