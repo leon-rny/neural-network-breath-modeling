@@ -16,6 +16,7 @@ Policies (synthetic : real ratio via --augmentation_ratio):
                 random forest (discriminator rejection), class-balanced
 Every policy draws from a named random stream (crc32 of seed / fold / stream name) so results do not depend
 on what else runs in the same process.
+`rerender` re-renders real trials under random sensor gain / response + the DHT22 observation (core.cnn).
 """
 
 import zlib
@@ -76,6 +77,48 @@ def observe_with(signals: np.ndarray, base: np.ndarray) -> np.ndarray:
     out = np.round(out / RESOLUTION) * RESOLUTION
     out[:, 0] = np.clip(out[:, 0], 0.0, H_CEILING)
     return out
+
+
+# physics re-rendering of real trials (sensor gain / response randomization, core.cnn)
+DT = 2.004  # sampling interval (s)
+
+
+def sensor_response(x: np.ndarray, dtau: float) -> np.ndarray:
+    """First-order sensor response change of (n, T) baseline-corrected signals: dtau > 0 adds a lag of time constant
+    dtau (s), dtau < 0 inverts one (sharper), 0 leaves the signal unchanged."""
+    if dtau == 0:
+        return x
+    a = 1.0 - np.exp(-DT / abs(dtau))
+    y = np.empty_like(x)
+    if dtau > 0:
+        y[:, 0] = x[:, 0]
+        for n in range(1, x.shape[1]):
+            y[:, n] = y[:, n - 1] + a * (x[:, n] - y[:, n - 1])
+    else:
+        y[:, 0] = x[:, 0]
+        y[:, 1:] = (x[:, 1:] - (1 - a) * x[:, :-1]) / a
+    return y
+
+
+def rerender(signals: np.ndarray, copies: int, gain_max: float, tau_max: float, rng: np.random.RandomState) -> np.ndarray:
+    """`copies` re-renderings of absolute (n, 2, T) real trials under random sensor physics: per trial and channel a
+    gain g (log-uniform in [1/gain_max, gain_max]: breath strength x sensor coupling) and a response change dtau
+    (uniform in [-tau_max / 2, tau_max] s) act on the baseline-corrected signal, then the DHT22 observation (0.1 grid,
+    99.9 %RH ceiling). tau_max = 0 randomizes the gain only."""
+    S = np.asarray(signals, dtype=float)
+    out = []
+    for _ in range(copies):
+        for i in range(len(S)):
+            theta = [(float(np.exp(rng.uniform(-np.log(gain_max), np.log(gain_max)))), float(rng.uniform(-tau_max / 2, tau_max))) for _c in range(2)]
+            sig = S[i:i + 1]
+            base = sig[:, :, :5].mean(2, keepdims=True)
+            r = np.empty_like(sig)
+            for c, (g, dt) in enumerate(theta):
+                r[:, c] = g * sensor_response(sig[:, c] - base[:, c], dt) + base[:, c]
+            r = np.round(r / RESOLUTION) * RESOLUTION
+            r[:, 0] = np.clip(r[:, 0], 0.0, H_CEILING)
+            out.append(r)
+    return np.concatenate(out)
 
 
 def denormalize(x, stats: dict) -> np.ndarray:
@@ -228,9 +271,14 @@ def signal_mmd(X: np.ndarray, Y: np.ndarray) -> float:
     return float(k(d_aa).mean() + k(d_bb).mean() - 2 * k(d_ab).mean())
 
 
-def mmd_report(real: np.ndarray, y_real: np.ndarray, synth: np.ndarray, y_synth: np.ndarray, real_ref: np.ndarray) -> dict:
+def mmd_report(real: np.ndarray, y_real: np.ndarray, synth: np.ndarray, y_synth: np.ndarray, real_ref: np.ndarray, with_test: bool = False) -> dict:
     """MMD of the synthetic set vs the real training trials (all classes: 'mmd'; mean over classes: 'mmd_class') and,
     as a reference level, of the held-out real test trials vs the same training trials ('mmd_real_ref').
+    with_test (k-fold / TSTR+ only): also the synthetic set vs the held-out real test trials of the same participants
+    ('mmd_test'; held-out fidelity that does not reward reproducing training trials, its floor is mmd_real_ref).
     All signals in the classifier's input space (after the run's preprocessing, e.g. baseline-corrected)."""
     per_class = [signal_mmd(real[y_real == c], synth[y_synth == c]) for c in np.unique(y_real) if (y_synth == c).sum() > 1]
-    return {'mmd': signal_mmd(real, synth), 'mmd_class': float(np.mean(per_class)), 'mmd_real_ref': signal_mmd(real, real_ref)}
+    out = {'mmd': signal_mmd(real, synth), 'mmd_class': float(np.mean(per_class)), 'mmd_real_ref': signal_mmd(real, real_ref)}
+    if with_test:
+        out['mmd_test'] = signal_mmd(real_ref, synth)
+    return out

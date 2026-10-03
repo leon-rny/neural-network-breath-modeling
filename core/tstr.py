@@ -352,7 +352,8 @@ def save_summary(result: dict) -> None:
 def _save_mmd(result: dict) -> None:
     """Append one MMD row (thesis layout: metric, region, model, seed, fold, value, config + run details) to
     results/mmd.csv, keeping the last row per evaluation_id. value = MMD of the synthetic set vs the real
-    training trials (core.augment.mmd_report); mmd_class = class-wise mean; mmd_real_ref = real test vs train."""
+    training trials (core.augment.mmd_report); mmd_class = class-wise mean; mmd_real_ref = real test vs train;
+    mmd_test = synthetic set vs the held-out real test trials (k-fold / TSTR+ runs only, floor = mmd_real_ref)."""
     csv_path = 'results/mmd.csv'
     mmd = result['mmd']
     row = pd.DataFrame([{'evaluation_id': result.get('evaluation_id', digest(result)),
@@ -365,6 +366,7 @@ def _save_mmd(result: dict) -> None:
                          'value': mmd['mmd'],
                          'mmd_class': mmd.get('mmd_class'),
                          'mmd_real_ref': mmd.get('mmd_real_ref'),
+                         'mmd_test': mmd.get('mmd_test'),
                          'aug_policy': result.get('aug_policy'),
                          'augmentation_ratio': result.get('augmentation_ratio'),
                          'hp_tag': (result.get('evaluation_config') or {}).get('hp_tag'),
@@ -422,6 +424,7 @@ def _save_summary(result: dict) -> None:
                'mmd': (result.get('mmd') or {}).get('mmd'),
                'mmd_class': (result.get('mmd') or {}).get('mmd_class'),
                'mmd_real_ref': (result.get('mmd') or {}).get('mmd_real_ref'),
+               'mmd_test': (result.get('mmd') or {}).get('mmd_test'),
                'subset': result.get('subset', ''),
                'phys_variant': result.get('phys_variant', ''),
                'cir': result.get('cir', ''),
@@ -1119,7 +1122,7 @@ def tstr_plus(cache: dict, model_name: str, region: str, augmentation_ratio: flo
         metrics_realonly_val = evaluate_classifier(stacker_ro, X_val_top, y_val.values)
     # fidelity: signal-space MMD of the synthetic set vs the real training trials (classifier input space)
     y_tr = np.array([CLASS_TO_IDX[c] for c in df_tr['class']])
-    mmd = mmd_report(_signals(preprocess_signals(df_tr, preprocessing)), y_tr, synth_signals, synth_labels, _signals(preprocess_signals(df_te, preprocessing)))
+    mmd = mmd_report(_signals(preprocess_signals(df_tr, preprocessing)), y_tr, synth_signals, synth_labels, _signals(preprocess_signals(df_te, preprocessing)), with_test=(cv_mode == 'kfold'))
     print(f"[TSTR+] aug acc={metrics['accuracy']:.4f} | real-only@frac acc={metrics_realonly['accuracy']:.4f} | lift={metrics['accuracy']-metrics_realonly['accuracy']:+.4f} | MMD {mmd['mmd']:.4f} (real test vs train {mmd['mmd_real_ref']:.4f})")
     return {'training_provenance': model.provenance if aug_source == 'gen' else None,
             'model': f'{model_name}_plus',
