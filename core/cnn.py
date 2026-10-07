@@ -12,6 +12,10 @@ Augmentation policies (--augmentation_ratio 2 = twice as many synthetic as real 
   physgain  physics re-renderings of the real trials (core.augment.rerender): random sensor gain x/÷1.8 per channel
             + the DHT22 observation (0.1 grid, 99.9 %RH ceiling)
   physwide  the same + a random first-order sensor response change (-2 .. +4 s)
+  postgain  PI-CVAE posterior samples (core.augment.posterior_samples) of class-balanced real training parents, decoded
+            with the parent's class and participant + the parent's baseline + DHT22 observation, then the physgain
+            step; generator = the partition's TPINN (alpha 0, residual, fixed transport; as 06_pinn.sh) loaded from
+            results/tpinn/<GENERATOR>_checkpoint.pt
   mixup     same-class mixup of real trials (core.tstr.generate_real_aug), the generic reference
 --real_fraction f < 1 trains everything on round(f * n) trials of every class x participant stratum of the training
 split (at least 2); validation and test splits stay complete.
@@ -40,12 +44,14 @@ import torch
 from torch import nn
 
 from core import tstr as T
-from core.augment import mmd_report, rerender, stream_rng
+from core.augment import mmd_report, posterior_samples, rerender, sample_parents, stream_rng
 from core.data import CLASS_TO_IDX, get_split, load_dataset
 from core.provenance import fingerprint
 from core.utils import seed_everything
 
-POLICIES = {'physgain': (1.8, 0.0), 'physwide': (1.8, 4.0), 'mixup': None}  # (gain_max, tau_max) of the re-rendering
+POLICIES = {'physgain': (1.8, 0.0), 'physwide': (1.8, 4.0), 'postgain': (1.8, 0.0), 'mixup': None}  # (gain_max, tau_max) of the re-rendering
+GENERATOR = '{region}_s{seed}_ld16_ed8_tphys_res_f{fold}{loso}_ppstdscale_a0n10_shape3.0'  # postgain: TPINN a0 of 06_pinn.sh
+GENERATOR_FIELDS = ('latent_dim', 'embed_dim', 'part_embed_dim', 'alpha', 'n_copies', 'phys_prep')
 
 
 class Net(nn.Module):
@@ -125,9 +131,22 @@ def subset_train(df_train: pd.DataFrame, fraction: float, seed: int) -> pd.DataF
     return df_train.loc[sorted(keep)].reset_index(drop=True)
 
 
+def load_generator(region: str, cv_mode: str, fold: int, n_folds: int, init_seed: int, split_seed: int, dataset_dir: str):
+    """The partition's PI-CVAE (results/tpinn/<GENERATOR>_checkpoint.pt), checked against the dataset and the split
+    (not the code version: the decoder is rebuilt from models/pinn.py and the trained weights load strictly)."""
+    run_id = GENERATOR.format(region=region, seed=init_seed, fold=fold, loso='_loso_drop0.1' if cv_mode == 'loso' else '')
+    model, stats = T.load_model('tpinn', run_id, torch.device('cpu'))
+    cfg = model.provenance['training_config']
+    split = {'region': region, 'cv_mode': cv_mode, 'fold': fold, 'n_folds': n_folds, 'init_seed': init_seed, 'split_seed': split_seed}
+    if model.provenance['dataset_sha256'] != fingerprint(dataset_dir)['dataset_sha256'] or any(cfg[k] != v for k, v in split.items()):
+        raise ValueError(f'Generator {run_id} was not trained on this data / partition')
+    return model, stats, run_id, {k: cfg[k] for k in GENERATOR_FIELDS}
+
+
 def run(region: str, cv_mode: str, fold: int, n_folds: int, init_seed: int, split_seed: int, aug_policies: list[str],
-        augmentation_ratio: float, epochs: int, dataset_dir: str, real_fraction: float = 1.0) -> list[dict]:
-    """CNN real-only and CNN + each augmentation policy on one partition; one result dict per policy (core.tstr layout)."""
+        augmentation_ratio: float, epochs: int, dataset_dir: str, real_fraction: float = 1.0, return_models: bool = False):
+    """CNN real-only and CNN + each augmentation policy on one partition; one result dict per policy (core.tstr layout).
+    return_models: also return the fitted CNNs ({'real': ..., <policy>: ...}, used by the core.lgbm ensemble)."""
     seed_everything(init_seed)
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
@@ -140,17 +159,25 @@ def run(region: str, cv_mode: str, fold: int, n_folds: int, init_seed: int, spli
     clf_ro = fit(R_tr, y_tr, R_va, y_va, init_seed, scale, epochs)
     metrics_ro, metrics_ro_val = T.evaluate_classifier(clf_ro, R_te, y_te), T.evaluate_classifier(clf_ro, R_va, y_va)
     bc = lambda s: T.preprocess_synth_signals(s, 'baseline')  # noqa: E731
-    results = []
+    results, models = [], {'real': clf_ro}
     for policy in aug_policies:
+        generator = {}
         if policy == 'mixup':
             synth, y_synth = T.generate_real_aug(df_tr, int(round(augmentation_ratio * len(y_tr))), init_seed)
             synth, y_synth = np.asarray(synth, dtype=float), np.asarray(y_synth)
+        elif policy == 'postgain':
+            model, stats, gen_id, gen_cfg = load_generator(region, cv_mode, fold, n_folds, init_seed, split_seed, dataset_dir)
+            parents, y_synth = sample_parents(df_tr, int(round(augmentation_ratio * len(y_tr))), stream_rng(init_seed, fold, 'postgain_parents'))
+            post = posterior_samples(model, stats, parents, stream_rng(init_seed, fold, 'postgain_z'))
+            synth = rerender(post, 1, *POLICIES[policy], stream_rng(init_seed, fold, 'postgain_gain'))
+            generator = {'generator': gen_id, **gen_cfg, 'phys_variant': 'res'}
         else:
             gain_max, tau_max = POLICIES[policy]
             copies = max(1, int(round(augmentation_ratio)))
             synth = rerender(R_tr, copies, gain_max, tau_max, stream_rng(init_seed, fold, f'{real_fraction}/{policy}'))
             y_synth = np.tile(y_tr, copies)
         clf = fit(np.concatenate([R_tr, synth]), np.r_[y_tr, y_synth], R_va, y_va, init_seed, scale, epochs)
+        models[policy] = clf
         metrics = T.evaluate_classifier(clf, R_te, y_te)
         mmd = mmd_report(bc(R_tr), y_tr, bc(synth), y_synth, bc(R_te), with_test=(cv_mode == 'kfold'))
         print(f"[CNN+] {region} {cv_mode} fold {fold} seed {init_seed} f {real_fraction:g} {policy} ({len(y_synth)} synthetic): "
@@ -158,12 +185,12 @@ def run(region: str, cv_mode: str, fold: int, n_folds: int, init_seed: int, spli
         results.append({'model': 'cnn_plus', 'region': region, 'channel': 'both', 'cv_mode': cv_mode, 'init_seed': init_seed,
                         'split_seed': split_seed, 'fold': fold, 'real_fraction': real_fraction, 'n_train_real': int(len(y_tr)),
                         'n_synthetic': int(len(y_synth)), 'augmentation_ratio': augmentation_ratio,
-                        'aug_source': 'mixup' if policy == 'mixup' else 'physics', 'aug_policy': policy,
+                        'aug_source': {'mixup': 'mixup', 'postgain': 'gen'}.get(policy, 'physics'), 'aug_policy': policy,
                         'metrics': metrics, 'metrics_realonly': metrics_ro,
                         'metrics_val': T.evaluate_classifier(clf, R_va, y_va), 'metrics_realonly_val': metrics_ro_val,
                         'mmd': mmd, 'subset': f'frac{real_fraction:g}' if real_fraction < 1.0 else '',
-                        'prep': 'baseline', 'phys_prep': '', 'provenance': fingerprint(dataset_dir)})
-    return results
+                        'prep': 'baseline', 'phys_prep': '', **generator, 'provenance': fingerprint(dataset_dir)})
+    return (results, models) if return_models else results
 
 
 def f_equivalent(acc: float, fractions: np.ndarray, curve: np.ndarray) -> tuple[float, bool]:

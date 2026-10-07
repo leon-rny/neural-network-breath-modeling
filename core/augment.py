@@ -16,7 +16,8 @@ Policies (synthetic : real ratio via --augmentation_ratio):
                 random forest (discriminator rejection), class-balanced
 Every policy draws from a named random stream (crc32 of seed / fold / stream name) so results do not depend
 on what else runs in the same process.
-`rerender` re-renders real trials under random sensor gain / response + the DHT22 observation (core.cnn).
+`rerender` re-renders real trials under random sensor gain / response + the DHT22 observation (core.cnn);
+`posterior_samples` decodes posterior samples of real parent trials (core.cnn policy postgain).
 """
 
 import zlib
@@ -235,6 +236,26 @@ def steer_samples(model, stats: dict, df_parents: pd.DataFrame, feat_fn, X_real:
         centre = ze.mean(1)
         scale = torch.minimum(torch.maximum(ze.std(1), 0.1 * post_sd), post_sd)
     return best_sig
+
+
+def posterior_samples(model, stats: dict, df_parents: pd.DataFrame, rng: np.random.RandomState) -> np.ndarray:
+    """One posterior sample per real parent trial: encode (trial, class, participant), draw z ~ q(z|x), decode through
+    the physics generator with the parent's class and participant, sensor model with the parent's baseline.
+    Returns observed absolute signals (n, 2, T)."""
+    import torch
+
+    from core.data import PhysicsInformedDataset
+    ds = PhysicsInformedDataset(df_parents, stats=stats)
+    x = torch.stack([ds[i][0] for i in range(len(ds))])
+    y = torch.tensor([CLASS_TO_IDX[c] for c in df_parents['class']], dtype=torch.long)
+    p = torch.tensor([PARTICIPANT_TO_IDX[q] for q in df_parents['participant']], dtype=torch.long)
+    gen = torch.Generator().manual_seed(int(rng.randint(2 ** 31)))
+    model.eval()
+    with torch.no_grad():
+        mu, logvar = model.encoder(x, y, p)
+        z = mu + (0.5 * logvar).exp() * torch.randn(mu.shape, generator=gen)
+        xh = model._physics(z, y, p)[0]
+    return observe_with(denormalize(xh.numpy(), stats), parent_baselines(df_parents))
 
 
 def augment(policy: str, model, model_name: str, stats: dict, df_train: pd.DataFrame, cache: dict, n_add: int, seed: int,
