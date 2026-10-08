@@ -211,14 +211,14 @@ def run(region: str, cv_mode: str, fold: int, n_folds: int, init_seed: int, spli
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
     df_tr, df_va, df_te = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
-    y = lambda d: np.array([CLASS_TO_IDX[c] for c in d['class']])  # noqa: E731
+    y = lambda d: np.array([CLASS_TO_IDX[c] for c in d['class']])
     y_tr, y_va, y_te = y(df_tr), y(df_va), y(df_te)
     X_tr, X_va, X_te = (combo_features(T._signals(d)).values for d in (df_tr, df_va, df_te))
     params, inner = tune(X_tr, y_tr, df_tr['participant'].values, cv_mode, init_seed, n_trials)
     clf = make(params, init_seed).fit(X_tr, y_tr)
     print(f"[LGBM] {region} {cv_mode} fold {fold} seed {init_seed}: inner {inner:.4f} | test {(clf.predict(X_te) == y_te).mean():.4f} | {params}", flush=True)
     base = {'region': region, 'channel': 'both', 'cv_mode': cv_mode, 'init_seed': init_seed, 'split_seed': split_seed, 'fold': fold,
-            'n_train_real': int(len(y_tr)), 'prep': 'baseline', 'phys_prep': '', 'provenance': fingerprint(dataset_dir)}
+            'n_train_real': len(y_tr), 'prep': 'baseline', 'phys_prep': '', 'provenance': fingerprint(dataset_dir)}
     results = [{**base, 'model': 'lgbm', 'aug_source': 'none', 'params': params, 'inner_accuracy': inner, 'n_trials': n_trials,
                 'metrics': T.evaluate_classifier(clf, X_te, y_te), 'metrics_val': T.evaluate_classifier(clf, X_va, y_va)}]
     if not ensemble:
@@ -227,7 +227,7 @@ def run(region: str, cv_mode: str, fold: int, n_folds: int, init_seed: int, spli
     cnn_results, cnns = cnn.run(region, cv_mode, fold, n_folds, init_seed, split_seed, [aug_policy], augmentation_ratio, epochs, dataset_dir, return_models=True)
     R_va, R_te = T._signals(df_va), T._signals(df_te)
     P_te, P_va = clf.predict_proba(X_te), clf.predict_proba(X_va)
-    ens = lambda m, R, P: Probabilities((P + m.predict_proba(R)) / 2)  # noqa: E731
+    ens = lambda m, R, P: Probabilities((P + m.predict_proba(R)) / 2)
     lgbm_metrics = results[0]['metrics']
     results = cnn_results  # the lgbm row comes from the plain run (07_lightgbm.sh); here: cnn_plus + the ensemble
     generator = {k: cnn_results[0][k] for k in ('generator', *cnn.GENERATOR_FIELDS, 'phys_variant') if k in cnn_results[0]}

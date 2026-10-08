@@ -288,7 +288,7 @@ def signal_mmd(X: np.ndarray, Y: np.ndarray) -> float:
     A, B = np.asarray(X, dtype=float).reshape(len(X), -1), np.asarray(Y, dtype=float).reshape(len(Y), -1)
     d_aa, d_bb, d_ab = cdist(A, A, 'sqeuclidean'), cdist(B, B, 'sqeuclidean'), cdist(A, B, 'sqeuclidean')
     sigma2 = np.median(np.concatenate([d_aa[np.triu_indices(len(A), 1)], d_bb[np.triu_indices(len(B), 1)], d_ab.ravel()]))
-    k = lambda d: np.exp(-d / (2 * sigma2))  # noqa: E731
+    k = lambda d: np.exp(-d / (2 * sigma2))
     return float(k(d_aa).mean() + k(d_bb).mean() - 2 * k(d_ab).mean())
 
 

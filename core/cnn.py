@@ -44,7 +44,13 @@ import torch
 from torch import nn
 
 from core import tstr as T
-from core.augment import mmd_report, posterior_samples, rerender, sample_parents, stream_rng
+from core.augment import (
+    mmd_report,
+    posterior_samples,
+    rerender,
+    sample_parents,
+    stream_rng,
+)
 from core.data import CLASS_TO_IDX, get_split, load_dataset
 from core.provenance import fingerprint
 from core.utils import seed_everything
@@ -126,7 +132,7 @@ def subset_train(df_train: pd.DataFrame, fraction: float, seed: int) -> pd.DataF
     keep = []
     for _, idx in df_train.groupby(['class', 'participant'], sort=True).groups.items():
         idx = np.sort(np.asarray(idx))
-        k = min(len(idx), max(2, int(round(fraction * len(idx)))))
+        k = min(len(idx), max(2, round(fraction * len(idx))))
         keep.extend(rng.choice(idx, k, replace=False).tolist())
     return df_train.loc[sorted(keep)].reset_index(drop=True)
 
@@ -152,28 +158,28 @@ def run(region: str, cv_mode: str, fold: int, n_folds: int, init_seed: int, spli
     df = df[df['region'] == region].reset_index(drop=True)
     df_tr, df_va, df_te = get_split(df, cv_mode=cv_mode, fold=fold - 1, n_folds=n_folds, split_seed=split_seed)
     df_tr = subset_train(df_tr, real_fraction, init_seed)
-    y = lambda d: np.array([CLASS_TO_IDX[c] for c in d['class']])  # noqa: E731
+    y = lambda d: np.array([CLASS_TO_IDX[c] for c in d['class']])
     R_tr, R_va, R_te = T._signals(df_tr), T._signals(df_va), T._signals(df_te)
     y_tr, y_va, y_te = y(df_tr), y(df_va), y(df_te)
     scale = (R_tr - R_tr[:, :, :5].mean(2, keepdims=True)).std(axis=(0, 2)) + 1e-6
     clf_ro = fit(R_tr, y_tr, R_va, y_va, init_seed, scale, epochs)
     metrics_ro, metrics_ro_val = T.evaluate_classifier(clf_ro, R_te, y_te), T.evaluate_classifier(clf_ro, R_va, y_va)
-    bc = lambda s: T.preprocess_synth_signals(s, 'baseline')  # noqa: E731
+    bc = lambda s: T.preprocess_synth_signals(s, 'baseline')
     results, models = [], {'real': clf_ro}
     for policy in aug_policies:
         generator = {}
         if policy == 'mixup':
-            synth, y_synth = T.generate_real_aug(df_tr, int(round(augmentation_ratio * len(y_tr))), init_seed)
+            synth, y_synth = T.generate_real_aug(df_tr, round(augmentation_ratio * len(y_tr)), init_seed)
             synth, y_synth = np.asarray(synth, dtype=float), np.asarray(y_synth)
         elif policy == 'postgain':
             model, stats, gen_id, gen_cfg = load_generator(region, cv_mode, fold, n_folds, init_seed, split_seed, dataset_dir)
-            parents, y_synth = sample_parents(df_tr, int(round(augmentation_ratio * len(y_tr))), stream_rng(init_seed, fold, 'postgain_parents'))
+            parents, y_synth = sample_parents(df_tr, round(augmentation_ratio * len(y_tr)), stream_rng(init_seed, fold, 'postgain_parents'))
             post = posterior_samples(model, stats, parents, stream_rng(init_seed, fold, 'postgain_z'))
             synth = rerender(post, 1, *POLICIES[policy], stream_rng(init_seed, fold, 'postgain_gain'))
             generator = {'generator': gen_id, **gen_cfg, 'phys_variant': 'res'}
         else:
             gain_max, tau_max = POLICIES[policy]
-            copies = max(1, int(round(augmentation_ratio)))
+            copies = max(1, round(augmentation_ratio))
             synth = rerender(R_tr, copies, gain_max, tau_max, stream_rng(init_seed, fold, f'{real_fraction}/{policy}'))
             y_synth = np.tile(y_tr, copies)
         clf = fit(np.concatenate([R_tr, synth]), np.r_[y_tr, y_synth], R_va, y_va, init_seed, scale, epochs)
@@ -183,8 +189,8 @@ def run(region: str, cv_mode: str, fold: int, n_folds: int, init_seed: int, spli
         print(f"[CNN+] {region} {cv_mode} fold {fold} seed {init_seed} f {real_fraction:g} {policy} ({len(y_synth)} synthetic): "
               f"acc {metrics['accuracy']:.4f} | real-only {metrics_ro['accuracy']:.4f} | lift {metrics['accuracy'] - metrics_ro['accuracy']:+.4f} | MMD {mmd['mmd']:.4f}")
         results.append({'model': 'cnn_plus', 'region': region, 'channel': 'both', 'cv_mode': cv_mode, 'init_seed': init_seed,
-                        'split_seed': split_seed, 'fold': fold, 'real_fraction': real_fraction, 'n_train_real': int(len(y_tr)),
-                        'n_synthetic': int(len(y_synth)), 'augmentation_ratio': augmentation_ratio,
+                        'split_seed': split_seed, 'fold': fold, 'real_fraction': real_fraction, 'n_train_real': len(y_tr),
+                        'n_synthetic': len(y_synth), 'augmentation_ratio': augmentation_ratio,
                         'aug_source': {'mixup': 'mixup', 'postgain': 'gen'}.get(policy, 'physics'), 'aug_policy': policy,
                         'metrics': metrics, 'metrics_realonly': metrics_ro,
                         'metrics_val': T.evaluate_classifier(clf, R_va, y_va), 'metrics_realonly_val': metrics_ro_val,

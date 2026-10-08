@@ -24,9 +24,20 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from core import tstr as T
-from core.data import PARTICIPANT_TO_IDX, PhysicsInformedDataset, get_split, load_dataset
+from core.augment import (
+    denormalize,
+    observe_with,
+    parent_baselines,
+    top_features,
+    training_baselines,
+)
+from core.data import (
+    PARTICIPANT_TO_IDX,
+    PhysicsInformedDataset,
+    get_split,
+    load_dataset,
+)
 from core.utils import seed_everything
-from core.augment import denormalize, observe_with, parent_baselines, top_features, training_baselines
 from models.vae import elbo_loss
 
 
@@ -72,7 +83,7 @@ def main():
     cache = pd.read_pickle(f'{a.base_run}/results/trtr/{a.region}_is{a.seed}_ss42_fold{a.fold}of{n_folds}{loso}_prepbaseline_checkpoint.pkl')
     df = load_dataset(f'{a.base_run}/dataset')
     df = df[df.region == a.region].reset_index(drop=True)
-    tr, va, _ = get_split(df, a.cv_mode, a.fold - 1, n_folds, 42)
+    tr, _, _ = get_split(df, a.cv_mode, a.fold - 1, n_folds, 42)
     run_id = a.template.format(region=a.region, seed=a.seed, fold=a.fold, loso=('_loso_drop0.1' if a.cv_mode == 'loso' else ''))
     cwd = os.getcwd()
     os.chdir(a.gen_root)
@@ -112,7 +123,7 @@ def main():
         return xp, fp, y_t, xq, fq, yq
 
     # 1) emulator of the selected features on observed signals
-    xp, fp, yp, xq, fq, yq = gen_set(model)
+    xp, fp, _, xq, fq, yq = gen_set(model)
     Xe = torch.cat([x_real, xp, xq])
     Fe = torch.cat([R, fp, fq])
     perm = torch.randperm(len(Xe))
@@ -154,7 +165,7 @@ def main():
         tot = {'recon': 0.0, 'feat': 0.0, 'n': 0}
         for signal, _t, label, part, _o in loader:
             x_hat, mu, logvar, *_ = model(signal, label.long(), part.long())
-            elbo, recon, kl = elbo_loss(signal, x_hat, mu, logvar, 0.01, 0.0)
+            elbo, recon, _ = elbo_loss(signal, x_hat, mu, logvar, 0.01, 0.0)
             shape = F.mse_loss(x_hat[:, :, 1:] - x_hat[:, :, :-1], signal[:, :, 1:] - signal[:, :, :-1])
             yq = torch.randint(0, 3, (len(label),))
             pq = torch.full_like(yq, null) if null is not None else pool[torch.randint(len(pool), (len(yq),))]
