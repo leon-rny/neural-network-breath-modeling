@@ -13,6 +13,7 @@ from catboost import CatBoostClassifier
 from imblearn.over_sampling import SMOTE, RandomOverSampler
 from imblearn.pipeline import Pipeline as ImbPipeline
 from lightgbm import LGBMClassifier, early_stopping, log_evaluation
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import RandomForestClassifier, StackingClassifier
 from sklearn.metrics import (
     accuracy_score,
@@ -28,9 +29,10 @@ from sklearn.model_selection import (
     train_test_split,
 )
 from sklearn.neighbors import NearestNeighbors
-from tsfresh import extract_features
+from tsfresh import extract_features, select_features
 from tsfresh.feature_extraction.settings import from_columns
 from tsfresh.utilities.dataframe_functions import (
+    get_range_values_per_column,
     impute_dataframe_range,
 )
 from xgboost import XGBClassifier
@@ -49,7 +51,6 @@ from core.data import (
     sensor_marker,
     subset_tag,
 )
-from core.features import TrainingFeatureSelector
 from core.provenance import artifact_lock, atomic_json, digest, fingerprint
 from core.utils import seed_everything
 from models.diffusion import ConditionalDiffusion
@@ -233,6 +234,26 @@ def extract_fixed_features(df_long: pd.DataFrame, top_features_raw: list[str], n
         for c in missing:
             X[c] = 0.0
     return X[top_features_raw]
+
+class TrainingFeatureSelector(TransformerMixin, BaseEstimator):
+    """Learn imputation values and relevant feature names from training rows only."""
+
+    def __init__(self, n_jobs: int = 1) -> None:
+        self.n_jobs = n_jobs
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> 'TrainingFeatureSelector':
+        """Fit tsfresh relevance selection after training-only imputation."""
+        self.max_, self.min_, self.median_ = get_range_values_per_column(X)
+        clean = impute_dataframe_range(X.copy(), self.max_, self.min_, self.median_)
+        self.columns_ = select_features(clean, y, n_jobs=self.n_jobs).columns.tolist()
+        if not self.columns_:
+            raise ValueError('No relevant features found in the inner training fold')
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Apply the fitted transform without learning from evaluation rows."""
+        clean = impute_dataframe_range(X.copy(), self.max_, self.min_, self.median_)
+        return clean[self.columns_]
 
 class FoldSMOTE(SMOTE):
     """Adapt SMOTE to the training rows available in each inner cross-validation fit."""
@@ -491,22 +512,7 @@ def load_cache(region: str, init_seed: int, split_seed: int, fold: int, n_folds:
         return cache
     return None
 
-_SSL_CACHE: dict = {}
-
-def _ssl_embeddings(df: pd.DataFrame, ssl_ckpt: str) -> np.ndarray:
-    """SSL contrastive embeddings (research idea #4) for each trial in df, in df row order (aligns with
-    df_to_df_long's id order). Signals are baseline-corrected to match the encoder's pretraining space."""
-    from core.ssl import SSLEncoder, _baseline_correct, embed
-    if ssl_ckpt not in _SSL_CACHE:
-        ck = torch.load(ssl_ckpt, map_location='cpu')
-        enc = SSLEncoder(ck['emb_dim'])
-        enc.load_state_dict(ck['state'])
-        enc.eval()
-        _SSL_CACHE[ssl_ckpt] = enc
-    sigs = np.stack([_baseline_correct(np.stack([r['humidity'], r['temperature']])) for _, r in df.iterrows()])
-    return embed(_SSL_CACHE[ssl_ckpt], sigs)
-
-def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed: int, fold: int, n_folds: int = 5, channel: str = 'both', cv_mode: str = 'kfold', exclude_subjects: tuple = (), loso_trial_val: bool = False, include_subjects: tuple = (), preprocessing: str = 'raw', ssl_ckpt: str = '') -> dict:
+def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed: int, fold: int, n_folds: int = 5, channel: str = 'both', cv_mode: str = 'kfold', exclude_subjects: tuple = (), loso_trial_val: bool = False, include_subjects: tuple = (), preprocessing: str = 'raw') -> dict:
     """Run the train-real-test-real pipeline and cache its artifacts.
 
     Loads/splits the region data, extracts tsfresh features, selects the top-20 by SHAP from a
@@ -530,8 +536,6 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
         X_test_top, y_train, y_test, stats, n_train, trtr_metrics, channel, cv_mode, init_seed,
         split_seed, fold, n_folds.
     """
-    if ssl_ckpt:
-        raise ValueError('SSL evaluation requires a fold-specific pretraining manifest; all-data checkpoints are not valid here')
     # load dataset
     df = load_dataset(dataset_dir)
     df = df[df['region'] == region].reset_index(drop=True)
@@ -577,16 +581,12 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
     top_20_san = X_full_san.columns.to_numpy()[top_idx].tolist()
     top_20_raw = [san_to_raw[s] for s in top_20_san]
     X_train_top = X_full_san[top_20_san].values
-    if ssl_ckpt:
-        X_train_top = np.hstack([X_train_top, _ssl_embeddings(df_train, ssl_ckpt)])
     ## test real
     df_long_test, y_test = df_to_df_long(df_test)
     X_test_raw_top = extract_fixed_features(df_long_test, top_20_raw, n_jobs, imputation)
     X_test_san = X_test_raw_top.copy()
     X_test_san.columns = [re.sub(r'[^\w]', '_', col) for col in X_test_san.columns]
     X_test_top = X_test_san[top_20_san].values
-    if ssl_ckpt:
-        X_test_top = np.hstack([X_test_top, _ssl_embeddings(df_test, ssl_ckpt)])
     # train stack classifier
     clf = train_stacking_classifier(X_train_top, y_train.values, init_seed, n_jobs=n_jobs)
     # evaluate classifier
@@ -610,7 +610,7 @@ def trtr(dataset_dir: str, region: str, n_jobs: int, init_seed: int, split_seed:
              'fold': fold,
              'n_folds': n_folds}
     os.makedirs('results/trtr', exist_ok=True)
-    with open(_cache_path(region, init_seed, split_seed, fold, n_folds, channel, cv_mode, loso_path_tag(loso_trial_val, exclude_subjects), subset_tag(include_subjects), prep_marker(preprocessing) + ('_ssl' if ssl_ckpt else '')), 'wb') as f:
+    with open(_cache_path(region, init_seed, split_seed, fold, n_folds, channel, cv_mode, loso_path_tag(loso_trial_val, exclude_subjects), subset_tag(include_subjects), prep_marker(preprocessing)), 'wb') as f:
         pickle.dump(cache, f)
     return cache
 
