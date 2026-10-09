@@ -1,3 +1,12 @@
+"""Calibration of the PI-CVAE measurement chain: per region, the baseline-corrected mean of the single-exhalation
+calibration recordings (dataset/sir/sir_<region>_trial_*.dat) is fitted with the advection-diffusion channel response
+convolved with a first-order humidity sensor (tau_s = 15 s; parameters A, D, v, t_shift by differential evolution), and
+the temperature response with the same transport and a bi-exponential sensor. Writes results/pinn/params_<region>.npy
+(A, D, v, t_shift of the humidity fit) with a manifest of the input files.
+
+Usage (repository root): python -m core.fit_sir
+"""
+
 import argparse
 import hashlib
 import json
@@ -11,7 +20,6 @@ from scipy.optimize import differential_evolution
 # constants
 SEED = 0
 REGIONS = ['mouth', 'nose']
-CLASSES = ['bradypnea', 'eupnea', 'tachypnea']
 TAU_S_HUMIDITY = 15.0
 D0 = 0.03  # source-detector separation (m), matches advection_diffusion default
 
@@ -25,7 +33,7 @@ def load_sir(dataset_dir='dataset'):
     dataset = []
     folder = os.path.join(dataset_dir, 'sir')
     for fname in sorted(os.listdir(folder)):
-        m = re.compile(r'^(sir_long|sir|bradypnea|eupnea|tachypnea)_(mouth|nose)_trial_(\d+)\.dat$').match(fname)
+        m = re.compile(r'^(sir)_(mouth|nose)_trial_(\d+)\.dat$').match(fname)
         if m is None:
             continue
         df = pd.read_csv(os.path.join(folder, fname))
@@ -199,11 +207,9 @@ def fit_group(df_group, label):
     return params_h
 
 def main():
-    """Fit the SIR model per region (and optionally per class) and save humidity params."""
+    """Fit the calibration per region and save the humidity params."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--dataset_dir', default='dataset')
-    parser.add_argument('--per_class', action='store_true')
-    parser.add_argument('--calibration', choices=['sir', 'sir_long'], default='sir')
     parser.add_argument('--region', choices=REGIONS, default=None)
     args = parser.parse_args()
     out_dir = os.path.join('results', 'pinn')
@@ -211,14 +217,11 @@ def main():
     df_sir = load_sir(args.dataset_dir)
     if df_sir.empty:
         raise SystemExit(f"No SIR files matched in {os.path.join(args.dataset_dir, 'sir')}")
-    regions = [args.region] if args.region else REGIONS
-    # generic fit: sir_long step-input, per region
-    df_long = df_sir[df_sir['class'] == args.calibration]
-    for region in regions:
-        df_r = df_long[df_long['region'] == region]
+    for region in [args.region] if args.region else REGIONS:
+        df_r = df_sir[df_sir['region'] == region]
         if df_r.empty:
-            raise ValueError(f'No {args.calibration} calibration trials for region={region}')
-        params_h = fit_group(df_r, f'GENERIC region={region}')
+            raise ValueError(f'No calibration trials for region={region}')
+        params_h = fit_group(df_r, f'region={region}')
         out_path = os.path.join(out_dir, f'params_{region}.npy')
         np.save(out_path, params_h)
         inputs = {}
@@ -226,20 +229,8 @@ def main():
             with open(os.path.join(args.dataset_dir, 'sir', filename), 'rb') as source:
                 inputs[filename] = hashlib.sha256(source.read()).hexdigest()
         with open(out_path + '.json', 'w') as manifest:
-            json.dump({'calibration': args.calibration, 'files': inputs, 'seed': SEED}, manifest, indent=2)
+            json.dump({'calibration': 'sir', 'files': inputs, 'seed': SEED}, manifest, indent=2)
         print(f'  saved -> {out_path}')
-    # optional per-class fits
-    if args.per_class:
-        for region in regions:
-            for cls in CLASSES:
-                df_rc = df_sir[(df_sir['region'] == region) & (df_sir['class'] == cls)]
-                if df_rc.empty:
-                    print(f'[warn] no trials for region={region}, class={cls}, skipping.')
-                    continue
-                params_h = fit_group(df_rc, f'PER-CLASS region={region} class={cls}')
-                out_path = os.path.join(out_dir, f'params_{region}_{cls}.npy')
-                np.save(out_path, params_h)
-                print(f'  saved -> {out_path}')
 
 if __name__ == '__main__':
     main()

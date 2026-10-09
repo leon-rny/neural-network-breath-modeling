@@ -1,5 +1,3 @@
-import math
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -36,39 +34,27 @@ class CIRConvolution(nn.Module):
         mask[:baseline_samples] = 0.0
         self.register_buffer('baseline_mask', mask)
 
-    def _sensor_kernel(self, log_tau_s=None):
-        """Fixed sensor kernel (buffer) unless a learnable log_tau_s is supplied, in which case
-        rebuild s(t)=(1/tau_s) e^(-t/tau_s) so the sensor lag can be corrected during training."""
-        if log_tau_s is None:
-            return self.s
-        tau_s = torch.exp(log_tau_s)
-        return torch.where(self.t > 0, (1.0 / tau_s) * torch.exp(-self.t / tau_s), torch.zeros_like(self.t))
-
-    def compute_kernels(self, log_A, log_D, log_v, log_tau_s=None):
+    def compute_kernels(self, log_D, log_v):
         """Build per-sample advection-diffusion channel kernels, convolved with the sensor kernel.
 
-        :param log_A: (B,) log amplitude (normalised out by the unit-integral rescaling).
         :param log_D: (B,) log diffusion coefficient.
         :param log_v: (B,) log advection velocity.
-        :param log_tau_s: Optional scalar log sensor lag, if None the fixed sensor buffer is used.
-        :return: (B, T) unit-integral channel-plus-sensor kernels.
+        :return: (B, T) unit-integral channel-plus-sensor kernels (the amplitude is normalised out).
         """
-        A = torch.exp(log_A).unsqueeze(1)
         D = torch.exp(log_D).unsqueeze(1)
         v = torch.exp(log_v).unsqueeze(1)
         t = self.t.unsqueeze(0)
         # advection-diffusion
         t_pos = torch.clamp(t, min=1e-9)
-        prefactor = A / torch.sqrt(4 * np.pi * D * t_pos)
+        prefactor = 1.0 / torch.sqrt(4 * np.pi * D * t_pos)
         exponent = -(self.d0 - v * t_pos) ** 2 / (4 * D * t_pos)
         h_channel = prefactor * torch.exp(exponent)
         h_channel = torch.where(t > 1e-9, h_channel, torch.zeros_like(h_channel))
-        # convolve with sensor (fixed buffer or learnable tau_s)
-        s = self._sensor_kernel(log_tau_s)
+        # convolve with the sensor kernel
         B = h_channel.shape[0]
         h_channel_in = h_channel.unsqueeze(0)
         padded = F.pad(h_channel_in, (self.T - 1, 0))
-        s_kernel = s.flip(0).view(1, 1, -1).expand(B, 1, -1)
+        s_kernel = self.s.flip(0).view(1, 1, -1).expand(B, 1, -1)
         h_full = F.conv1d(padded, s_kernel, groups=B)
         h_full = h_full.squeeze(0) * self.dt
         h_full = h_full[:, :self.T]
@@ -76,204 +62,53 @@ class CIRConvolution(nn.Module):
         h_full = h_full / (h_full.sum(dim=1, keepdim=True) + 1e-8)
         return h_full
 
-    def forward(self, u, log_A, log_D, log_v, log_tau_s=None, apply_softplus=True):
+    def forward(self, u, log_D, log_v):
         """Convolve a per-sample source with its channel kernel to get the observed signal.
 
-        :param u: (B, T) raw source, softplus'd into a non-negative source unless apply_softplus is False.
-        :param log_A: (B,) log amplitude.
+        :param u: (B, T) raw source, softplus'd into a non-negative source and held at zero over the baseline.
         :param log_D: (B,) log diffusion coefficient.
         :param log_v: (B,) log advection velocity.
-        :param log_tau_s: Optional scalar log sensor lag (None uses the fixed sensor kernel).
-        :param apply_softplus: Whether to softplus `u` into a non-negative source (default True).
-        :return: (B, T) observed signal and the (B, T) baseline-masked source.
+        :return: (B, T) observed signal.
         """
-        # apply softplus (free source) or pass through (already-non-negative parametric source) + baseline mask
-        u_clean = (F.softplus(u) if apply_softplus else u) * self.baseline_mask
+        u_clean = F.softplus(u) * self.baseline_mask
         # per-sample kernels
-        kernels = self.compute_kernels(log_A, log_D, log_v, log_tau_s)  # (B, T)
+        kernels = self.compute_kernels(log_D, log_v)  # (B, T)
         # per-sample convolution (channels-as-batch trick for groups=B)
         B, T = u_clean.shape
         u_in = u_clean.unsqueeze(0)
         k = kernels.flip(1).unsqueeze(1)
         padded = F.pad(u_in, (T - 1, 0))
-        y = F.conv1d(padded, k, groups=B).squeeze(0)
-        return y, u_clean
-
-class PhysicsInformedCVAE(CVAE):
-    """CVAE with a physics side-head: a latent-driven source u(t) is pushed through the CIR channel to give a physics humidity estimate used as a training penalty"""
-    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, learn_cir_params: bool = True, **cvae_kwargs):
-        """
-        :param cir_params_init: (A, D, v, ...) initial channel parameters from the SIR fit.
-        :param t_grid: 1D array of sample times (seconds) for the channel kernel.
-        :param tau_s: Sensor lag time constant in seconds (default 15.0).
-        :param d0: Source-to-sensor distance in metres (default 0.03).
-        :param baseline_samples: Number of leading samples held at the pre-onset baseline (default 5).
-        :param learn_cir_params: Whether to predict per-sample (A, D, v) from z instead of fixing them (default True).
-        :param cvae_kwargs: Forwarded to the base CVAE (latent_dim, num_classes, conditioning, ...).
-        """
-        super().__init__(**cvae_kwargs)
-        # snapshot the RNG state
-        rng_state = torch.get_rng_state()
-        self.cir_conv = CIRConvolution(t_grid, tau_s=tau_s, d0=d0, baseline_samples=baseline_samples)
-        T = len(t_grid)
-        self.learn_cir_params = learn_cir_params
-        # u_head
-        self.u_head = nn.Sequential(nn.Linear(self.latent_dim, 64),
-                                    nn.ReLU(),
-                                    nn.Linear(64, T))
-        A_init, D_init, v_init, _ = cir_params_init
-        log_A_init = float(np.log(A_init))
-        log_D_init = float(np.log(D_init))
-        log_v_init = float(np.log(v_init))
-        if learn_cir_params:
-            self.cir_param_head = nn.Sequential(nn.Linear(self.latent_dim, 32),
-                                                nn.ReLU(),
-                                                nn.Linear(32, 3))
-            with torch.no_grad():
-                self.cir_param_head[-1].bias.copy_(torch.tensor([log_A_init, log_D_init, log_v_init], dtype=torch.float32))
-                self.cir_param_head[-1].weight.data *= 0.01
-        else:
-            self.register_buffer('log_A_fixed', torch.tensor(log_A_init, dtype=torch.float32))
-            self.register_buffer('log_D_fixed', torch.tensor(log_D_init, dtype=torch.float32))
-            self.register_buffer('log_v_fixed', torch.tensor(log_v_init, dtype=torch.float32))
-        # restore so the global RNG state
-        torch.set_rng_state(rng_state)
-
-    def _cir_params(self, z):
-        """Per-sample log (A, D, v): predicted from z when learnable, else the fixed buffers broadcast over the batch."""
-        if self.learn_cir_params:
-            log_A, log_D, log_v = self.cir_param_head(z).unbind(dim=1)
-        else:
-            B = z.shape[0]
-            log_A = self.log_A_fixed.expand(B)
-            log_D = self.log_D_fixed.expand(B)
-            log_v = self.log_v_fixed.expand(B)
-        return log_A, log_D, log_v
-
-    def forward(self, x, y, p=None):
-        """Encode -> sample z -> decode x_hat, plus the auxiliary physics humidity from the CIR head.
-
-        :param x: (B, 2, 36) input signals.
-        :param y: (B,) integer class labels.
-        :param p: Optional (B,) participant labels (required when conditioning on participant).
-        :return: x_hat, mu, logvar, softplus source, (log_A, log_D, log_v), physics humidity.
-        """
-        if self.training and self._cond_part and p is not None and self.part_dropout > 0.0:
-            self._total_steps += 1
-            if torch.rand(1).item() < self.part_dropout:
-                p = torch.full_like(p, self.null_part_idx)
-                self._null_steps += 1
-        if not self.training and self._cond_part and p is not None and hasattr(self, 'trained_participants'):
-            known = torch.tensor(self.trained_participants, device=p.device)
-            p = torch.where(torch.isin(p, known), p, self.null_part_idx)
-        mu, logvar = self.encoder(x, y, p)
-        z = self.reparameterize(mu, logvar)
-        x_hat = self.decoder(z, y, p)
-        u_raw = self.u_head(z)
-        log_A, log_D, log_v = self._cir_params(z)
-        humidity_phys, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
-        return x_hat, mu, logvar, u_post_softplus, (log_A, log_D, log_v), humidity_phys
-
-    def sample(self, n, y, device, return_aux: bool = False, participant: int | None = None):
-        """Sample n signals from the conv decoder.
-
-        :param n: Number of samples to generate.
-        :param y: (n,) class labels (or scalar broadcast to n).
-        :param device: Device to generate on.
-        :param return_aux: Whether to also return the source, (log_A, log_D, log_v) and physics humidity (default False).
-        :param participant: Fixed participant id (e.g. null_part_idx for LOSO), None samples uniformly.
-        :return: x_hat, or (x_hat, source, (log_A, log_D, log_v), physics humidity) when return_aux is True.
-        """
-        z = torch.randn(n, self.latent_dim, device=device)
-        if y.dim() == 0:
-            y = y.expand(n)
-        if not self._cond_part:
-            p = None
-        elif participant is not None:  # e.g. null_part_idx for LOSO generation of an unseen subject
-            p = torch.full((n,), participant, dtype=torch.long, device=device)
-        else:
-            pool = torch.tensor(getattr(self, 'trained_participants', list(range(self.num_participants))), device=device)
-            p = pool[torch.randint(len(pool), (n,), device=device)]
-        self.eval()
-        with torch.no_grad():
-            x_hat = self.decoder(z, y.to(device), p)
-            if not return_aux:
-                return x_hat
-            u_raw = self.u_head(z)
-            log_A, log_D, log_v = self._cir_params(z)
-            humidity_phys, u_post_softplus = self.cir_conv(u_raw, log_A, log_D, log_v)
-            return x_hat, u_post_softplus, (log_A, log_D, log_v), humidity_phys
+        return F.conv1d(padded, k, groups=B).squeeze(0)
 
 class SharedTransportPINN(CVAE):
-    """Physics-AS-decoder generative model with a shared advection-diffusion transport for both
-    channels (heat-mass analogy."""
+    """PI-CVAE: CVAE whose decoder emits the calibrated measurement chain. Per channel a source network maps
+    [z, class embedding, participant embedding] to a non-negative source, which is convolved with the fixed
+    transport (calibrated D, v) + first-order sensor kernel shared by both channels (heat-mass analogy); the
+    conditional conv decoder is added as a residual."""
 
-    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, learn_transport: bool = False, residual: bool = False, class_transport: bool = False, parametric_source: bool = False, ode: bool = False, temperature_tau: float | None = None, **cvae_kwargs):
+    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, residual: bool = True, **cvae_kwargs):
         """
-        :param cir_params_init: (A, D, v, ...) initial transport parameters from the SIR fit (A is unused, the kernel is unit-integral).
+        :param cir_params_init: (A, D, v, t_s) transport parameters from the calibration fit (core.fit_sir; A and
+            t_s are unused, the kernel is unit-integral and the source carries the timing).
         :param t_grid: 1D array of sample times (seconds) for the transport kernel.
         :param tau_s: Sensor lag time constant in seconds (default 15.0).
         :param d0: Source-to-sensor distance in metres (default 0.03).
         :param baseline_samples: Number of leading samples held at the pre-onset baseline (default 5).
-        :param learn_transport: Whether to learn a single global (D, v) instead of fixing them (default False).
-        :param residual: Whether to add the conv decoder output as a class-discriminative residual on the physics envelope (default False).
-        :param class_transport: Whether to learn per-class (D, v) plus a global learnable sensor lag (default False).
-        :param parametric_source: Whether to replace the learned source heads with an analytic per-class sigmoid injection (default False).
-        :param temperature_tau: Optional fixed temperature lag in seconds, separate from humidity.
+        :param residual: Whether to add the conv decoder output as a residual on the physics output (default True).
         :param cvae_kwargs: Forwarded to the base CVAE (latent_dim, num_classes, conditioning, ...).
         """
         super().__init__(**cvae_kwargs)
         rng_state = torch.get_rng_state()
         self.cir_conv = CIRConvolution(t_grid, tau_s=tau_s, d0=d0, baseline_samples=baseline_samples)
-        if temperature_tau is not None:
-            if not np.isfinite(temperature_tau) or temperature_tau <= 0:
-                raise ValueError('temperature_tau must be finite and positive')
-            if ode or class_transport or parametric_source:
-                raise ValueError('Separate fixed sensors require the fixed-sensor transport branch')
-        self.temperature_tau = temperature_tau
-        self.temperature_conv = None if temperature_tau is None else CIRConvolution(t_grid, tau_s=temperature_tau, d0=d0, baseline_samples=baseline_samples)
         T = len(t_grid)
-        self.learn_transport = learn_transport
-        self.class_transport = class_transport
-        self.parametric_source = parametric_source
-        if parametric_source:
-            self.src_base = nn.Embedding(self.num_classes, 4)  # [t0_raw, rate_raw, A_H_raw, A_T_raw] per class
-            self.src_pert = nn.Linear(self.latent_dim, 4)  # within-class variation from z
-            nn.init.zeros_(self.src_base.weight)
-            nn.init.zeros_(self.src_pert.weight)
-            nn.init.zeros_(self.src_pert.bias)
         self.residual = residual
         emb = self.decoder.label_embed.embedding_dim
         cond_dim = self.latent_dim + emb + (self.decoder.part_embed.embedding_dim if self._cond_part else 0)
         self.uH_head = nn.Sequential(nn.Linear(cond_dim, 64), nn.ReLU(), nn.Linear(64, T))
         self.uT_head = nn.Sequential(nn.Linear(cond_dim, 64), nn.ReLU(), nn.Linear(64, T))
-        # UDE: integrate a driven first-order relaxation ODE (known sensor physics)
-        self.ode = ode
-        self.T = T
-        if ode:
-            self.log_k = nn.Parameter(torch.log(torch.tensor([0.3, 0.3])))  # per-channel relaxation rate
-            self.res_net = nn.Sequential(nn.Linear(2 + cond_dim, 32), nn.Tanh(), nn.Linear(32, 2))
-            nn.init.zeros_(self.res_net[-1].weight)  # start as pure physics
-            nn.init.zeros_(self.res_net[-1].bias)
         _, D_init, v_init, _ = cir_params_init
-        log_D_init = float(np.log(D_init))
-        log_v_init = float(np.log(v_init))
-        if class_transport:
-            # per-class transport (indexed by y) + learnable global sensor lag
-            self.log_D = nn.Parameter(torch.full((self.num_classes,), log_D_init, dtype=torch.float32))
-            self.log_v = nn.Parameter(torch.full((self.num_classes,), log_v_init, dtype=torch.float32))
-            self.log_tau_s = nn.Parameter(torch.tensor(float(np.log(tau_s)), dtype=torch.float32))
-        elif parametric_source:
-            # global learnable transport (now identifiable because the source is constrained)
-            self.log_D = nn.Parameter(torch.tensor(log_D_init, dtype=torch.float32))
-            self.log_v = nn.Parameter(torch.tensor(log_v_init, dtype=torch.float32))
-            self.log_tau_s = nn.Parameter(torch.tensor(float(np.log(tau_s)), dtype=torch.float32))
-        elif learn_transport:
-            self.log_D = nn.Parameter(torch.tensor(log_D_init, dtype=torch.float32))
-            self.log_v = nn.Parameter(torch.tensor(log_v_init, dtype=torch.float32))
-        else:
-            self.register_buffer('log_D', torch.tensor(log_D_init, dtype=torch.float32))
-            self.register_buffer('log_v', torch.tensor(log_v_init, dtype=torch.float32))
+        self.register_buffer('log_D', torch.tensor(float(np.log(D_init)), dtype=torch.float32))
+        self.register_buffer('log_v', torch.tensor(float(np.log(v_init)), dtype=torch.float32))
         torch.set_rng_state(rng_state)
 
     def _cond(self, z, y, p):
@@ -283,202 +118,21 @@ class SharedTransportPINN(CVAE):
             parts.append(self.decoder.part_embed(p))
         return torch.cat(parts, dim=1)
 
-    def _physics(self, z, y, p):
-        """Run the shared-transport physics decoder: build sources u_H, u_T and push them through the shared kernel.
+    def decode(self, z, y, p=None):
+        """Physics decoder: sources u_H, u_T through the shared transport + sensor kernel, plus the residual.
 
         :param z: (B, latent_dim) latent vectors.
         :param y: (B,) integer class labels.
         :param p: Optional (B,) participant labels.
-        :return: x_hat (B, 2, 36), the humidity/temperature sources u_H and u_T, and (zero_A, log_D, log_v).
+        :return: (B, 2, 36) signals in the training space (baseline-corrected, stdscale).
         """
         B = z.shape[0]
-        zero_A = torch.zeros(B, device=z.device)  # A is normalised out of the unit-integral kernel
-        if self.ode:
-            # UDE
-            c = self._cond(z, y, p)
-            u = torch.stack([F.softplus(self.uH_head(c)), F.softplus(self.uT_head(c))], dim=1)
-            k = F.softplus(self.log_k).view(1, 2)
-            x = torch.zeros(B, 2, device=z.device)
-            traj = []
-            for t in range(self.T):
-                x = x + k * (u[:, :, t] - x) + self.res_net(torch.cat([x, c], dim=1))  # Euler step (dt=1)
-                traj.append(x)
-            x_hat = torch.stack(traj, dim=2)
-            if self.residual:
-                x_hat = x_hat + self.decoder(z, y, p)
-            return x_hat, u[:, 0, :], u[:, 1, :], (zero_A, self.log_k[0].expand(B), self.log_k[1].expand(B))
-        # transport params
-        if self.class_transport:
-            log_D = self.log_D[y]
-            log_v = self.log_v[y]
-            log_tau_s = self.log_tau_s
-        elif self.parametric_source:
-            log_D = self.log_D.expand(B)
-            log_v = self.log_v.expand(B)
-            log_tau_s = self.log_tau_s
-        else:
-            log_D = self.log_D.expand(B)
-            log_v = self.log_v.expand(B)
-            log_tau_s = None
-        # sources
-        if self.parametric_source:
-            raw = self.src_base(y) + 0.1 * self.src_pert(z)  # per-class base + small z variation
-            T = self.cir_conv.T
-            idx = torch.arange(T, device=z.device, dtype=torch.float32).unsqueeze(0)
-            t0 = torch.sigmoid(raw[:, 0:1]) * T  # onset in [0,T] samples
-            rate = F.softplus(raw[:, 1:2]) + 0.5  # ramp width
-            A_H = F.softplus(raw[:, 2:3])
-            A_T = F.softplus(raw[:, 3:4])
-            uH_src = A_H * torch.sigmoid((idx - t0) / rate)  # interpretable analytic injection
-            uT_src = A_T * torch.sigmoid((idx - t0) / rate)
-            humidity_phys, uH = self.cir_conv(uH_src, zero_A, log_D, log_v, log_tau_s, apply_softplus=False)
-            temperature_phys, uT = self.cir_conv(uT_src, zero_A, log_D, log_v, log_tau_s, apply_softplus=False)
-        else:
-            c = self._cond(z, y, p)
-            humidity_phys, uH = self.cir_conv(self.uH_head(c), zero_A, log_D, log_v, log_tau_s)
-            temperature_conv = self.cir_conv if self.temperature_conv is None else self.temperature_conv
-            temperature_phys, uT = temperature_conv(self.uT_head(c), zero_A, log_D, log_v, log_tau_s)
-        x_hat = torch.stack([humidity_phys, temperature_phys], dim=1)
+        log_D = self.log_D.expand(B)
+        log_v = self.log_v.expand(B)
+        c = self._cond(z, y, p)
+        humidity = self.cir_conv(self.uH_head(c), log_D, log_v)
+        temperature = self.cir_conv(self.uT_head(c), log_D, log_v)
+        x_hat = torch.stack([humidity, temperature], dim=1)
         if self.residual:
             x_hat = x_hat + self.decoder(z, y, p)  # class-discriminative residual on the physics envelope
-        return x_hat, uH, uT, (zero_A, log_D, log_v)
-
-    def forward(self, x, y, p=None):
-        """Encode -> sample z -> emit physics x_hat (both channels share the transport kernel).
-
-        :param x: (B, 2, 36) input signals.
-        :param y: (B,) integer class labels.
-        :param p: Optional (B,) participant labels (required when conditioning on participant).
-        :return: x_hat, mu, logvar, humidity source u_H, (zero_A, log_D, log_v), physics humidity channel.
-        """
-        # CFG-style participant dropout
-        if self.training and self._cond_part and p is not None and self.part_dropout > 0.0:
-            self._total_steps += 1
-            if torch.rand(1).item() < self.part_dropout:
-                p = torch.full_like(p, self.null_part_idx)
-                self._null_steps += 1
-        if not self.training and self._cond_part and p is not None and hasattr(self, 'trained_participants'):
-            known = torch.tensor(self.trained_participants, device=p.device)
-            p = torch.where(torch.isin(p, known), p, self.null_part_idx)
-        mu, logvar = self.encoder(x, y, p)
-        z = self.reparameterize(mu, logvar)
-        x_hat, uH, _uT, cir = self._physics(z, y, p)
-        return x_hat, mu, logvar, uH, cir, x_hat[:, 0, :]
-
-    def sample(self, n, y, device, return_aux: bool = False, participant: int | None = None):
-        """Generate n signals by emitting the physics decoder output.
-
-        :param n: Number of samples to generate.
-        :param y: (n,) class labels (or scalar broadcast to n).
-        :param device: Device to generate on.
-        :param return_aux: Whether to also return u_H, u_T and (zero_A, log_D, log_v) (default False).
-        :param participant: Fixed participant id (e.g. null_part_idx for LOSO, None samples uniformly.
-        :return: x_hat, or (x_hat, u_H, u_T, (zero_A, log_D, log_v)) when return_aux is True.
-        """
-        z = torch.randn(n, self.latent_dim, device=device)
-        if y.dim() == 0:
-            y = y.expand(n)
-        if not self._cond_part:
-            p = None
-        elif participant is not None:
-            p = torch.full((n,), participant, dtype=torch.long, device=device)
-        else:
-            pool = torch.tensor(getattr(self, 'trained_participants', list(range(self.num_participants))), device=device)
-            p = pool[torch.randint(len(pool), (n,), device=device)]
-        self.eval()
-        with torch.no_grad():
-            x_hat, uH, uT, cir = self._physics(z, y.to(device), p)
-        if return_aux:
-            return x_hat, uH, uT, cir
         return x_hat
-
-
-# rhythm tpinn: the class enters only through the breathing physics
-RHYTHM_BANDS_BPM = ((5.0, 12.0), (12.0, 20.0), (20.0, 40.0))  # bradypnea, eupnea, tachypnea (clinical definitions)
-N_RHYTHM = 6  # rhythm latents: rate, phase (cos, sin), amplitude, T:H gain, rate wander
-DT_SAMPLE, FINE, PRE_S, ONSET_S = 2.004, 8, 60.0, 10.0  # DHT22 sampling interval (s), fine-grid factor, pre-roll (s), onset (s)
-
-class RhythmTPINN(SharedTransportPINN):
-    """Shared-transport PINN whose class information enters only through a breathing rhythm.
-
-    x_hat = envelope(z_n, p) + rhythm(f, phi, A, w; tau_H, tau_T) [+ smoothed residual]: the envelope is the
-    calibrated transport physics with a constant class token (class-blind); the rhythm is a breath waveform
-    (cos + learned 2nd harmonic, slow rate wander) at a rate f inside the clinical band of the class, rendered
-    on a 0.25 s grid, passed through learned first-order humidity / temperature sensor lags and sampled every
-    2.004 s, so aliasing and attenuation follow from the physics. Latent z = [z_n | 6 rhythm latents], N(0, I).
-    """
-
-    def __init__(self, *args, n_nuis: int = 16, residual_mode: str = 'none', tau_init=(5.0, 3.0), tau_max: float = 15.0, **kwargs):
-        """
-        :param n_nuis: Number of class-blind (envelope / participant) latent dimensions.
-        :param residual_mode: 'none' (pure physics) or 'smooth' (class-blind 5-sample moving-average residual).
-        :param tau_init: Initial humidity and temperature sensor lags in seconds.
-        :param tau_max: Upper bound of the learned sensor lags in seconds (lower bound 0.5 s).
-        """
-        kwargs['latent_dim'] = n_nuis + N_RHYTHM
-        kwargs['residual'] = True
-        super().__init__(*args, **kwargs)
-        self.n_nuis, self.residual_mode = n_nuis, residual_mode
-        self.tau_bounds = (math.log(0.5), math.log(tau_max))
-        self.log_tau_c = nn.Parameter(torch.log(torch.tensor(tau_init, dtype=torch.float32)))
-        self.wave_a2 = nn.Parameter(torch.tensor(-1.0))
-        self.wave_b2 = nn.Parameter(torch.tensor(0.0))
-        self.res_gain = nn.Parameter(torch.tensor(0.1))
-        self.register_buffer('bands', torch.tensor(RHYTHM_BANDS_BPM) / 60.0)
-        self.dt = DT_SAMPLE / FINE
-        self.n_pre = int(round(PRE_S / self.dt))
-        self.n_fine = self.n_pre + self.T * FINE
-        t = (torch.arange(self.n_fine, dtype=torch.float32) - self.n_pre) * self.dt
-        self.register_buffer('t_fine', t)
-        self.register_buffer('onset', torch.sigmoid((t - ONSET_S) / 1.0))
-        self.register_buffer('kt', torch.arange(int(round(120.0 / self.dt)), dtype=torch.float32) * self.dt)
-
-    def taus(self) -> tuple[float, float]:
-        """Current humidity and temperature sensor lags in seconds."""
-        tau = self.log_tau_c.detach().clamp(*self.tau_bounds).exp()
-        return float(tau[0]), float(tau[1])
-
-    def rhythm_params(self, z, y, rate_override=None):
-        """Map the rhythm latents to rate (Hz, inside the class band), phase, amplitude, T:H gain and wander."""
-        r = z[:, self.n_nuis:]
-        lo, hi = self.bands[y, 0], self.bands[y, 1]
-        f = lo + (hi - lo) * torch.sigmoid(r[:, 0]) if rate_override is None else rate_override
-        phi = torch.atan2(r[:, 2], r[:, 1] + 1e-6)
-        amp = F.softplus(r[:, 3] + 1.0)
-        ratio = torch.exp(0.5 * r[:, 4])
-        wander = 0.15 * torch.tanh(r[:, 5])
-        return f, phi, amp, ratio, wander
-
-    def rhythm(self, z, y, rate_override=None, tau_override=None):
-        """Render the breathing rhythm on the fine grid, apply both sensor lags and sample at the DHT22 instants."""
-        f, phi, amp, ratio, wander = self.rhythm_params(z, y, rate_override)
-        span = self.t_fine[-1] - self.t_fine[0]
-        f_t = f[:, None] * (1.0 + wander[:, None] * torch.sin(2 * math.pi * (self.t_fine - self.t_fine[0]) / span)[None])
-        theta = phi[:, None] + 2 * math.pi * torch.cumsum(f_t, dim=1) * self.dt
-        a2 = torch.sigmoid(self.wave_a2)
-        src = (torch.cos(theta) + a2 * torch.cos(2 * theta + self.wave_b2)) * self.onset[None]
-        log_tau = self.log_tau_c.clamp(*self.tau_bounds) if tau_override is None else tau_override
-        out = []
-        for c in range(2):
-            k = torch.exp(-self.kt / log_tau[c].exp())
-            k = (k / k.sum()).flip(0).view(1, 1, -1)
-            y_c = F.conv1d(F.pad(src.unsqueeze(1), (k.shape[-1] - 1, 0)), k).squeeze(1)  # causal first-order sensor
-            out.append(y_c[:, self.n_pre::FINE][:, :self.T])
-        gains = torch.stack([amp, amp * ratio], dim=1)
-        return torch.stack(out, dim=1) * gains[:, :, None]
-
-    def _physics(self, z, y, p, rate_override=None, tau_override=None):
-        """Class-blind envelope (constant class token, rhythm latents zeroed) + class-carrying rhythm."""
-        B = z.shape[0]
-        y0 = torch.zeros_like(y)
-        z_n = torch.cat([z[:, :self.n_nuis], torch.zeros(B, N_RHYTHM, device=z.device)], dim=1)
-        c = self._cond(z_n, y0, p)
-        zero_A = torch.zeros(B, device=z.device)
-        log_D, log_v = self.log_D.expand(B), self.log_v.expand(B)
-        hum, uH = self.cir_conv(self.uH_head(c), zero_A, log_D, log_v, None)
-        tmp, uT = self.cir_conv(self.uT_head(c), zero_A, log_D, log_v, None)
-        x_hat = torch.stack([hum, tmp], dim=1) + self.rhythm(z, y, rate_override, tau_override)
-        if self.residual_mode == 'smooth':
-            res = F.avg_pool1d(F.pad(self.decoder(z_n, y0, p), (2, 2), mode='replicate'), 5, stride=1)
-            x_hat = x_hat + self.res_gain * res
-        return x_hat, uH, uT, (zero_A, log_D, log_v)

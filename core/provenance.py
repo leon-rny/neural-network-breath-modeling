@@ -27,7 +27,7 @@ def fingerprint(dataset_dir: str = 'dataset') -> dict:
         raise ValueError(f'No classification recordings in {root}')
     source = Path(__file__).resolve().parents[1]
     code = {str(p.relative_to(source)): file_digest(p)
-            for folder in ('core', 'models', 'ablations') for p in sorted((source / folder).glob('*.py'))}
+            for folder in ('core', 'models') for p in sorted((source / folder).glob('*.py'))}
     return {'dataset_sha256': digest(files), 'code_sha256': digest(code)}
 
 @contextmanager
