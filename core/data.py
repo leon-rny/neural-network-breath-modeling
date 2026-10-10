@@ -76,7 +76,7 @@ def nested_split(subjects: list[str], outer: int, inner: int = -1) -> tuple[list
 
 def split_frames(df: pd.DataFrame, train: list[str], val: str, test: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """(train, val, test) trial frames of the given participants, each in the order of df."""
-    pick = lambda m: df[m].reset_index(drop=True)  # noqa: E731
+    pick = lambda m: df[m].reset_index(drop=True)
     return pick(df['participant'].isin(train)), pick(df['participant'] == val), pick(df['participant'] == test)
 
 def kfold_split(df: pd.DataFrame, fold: int, n_folds: int = 5, split_seed: int = 42, val_size: float = 0.15) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
