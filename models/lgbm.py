@@ -1,24 +1,12 @@
-"""LightGBM on per-trial combo features, tuned inside the training split.
-
-Combo features: hand-crafted breathing features + spectral / wavelet features + catch22, computed on the
-baseline-corrected trial (first 5 samples subtracted per channel).
-  breath    (86) amplitude statistics, rise / fall slopes and their timing, rise times, duty cycle, area, peaks and
-                 inter-peak intervals, high-pass oscillation, dominant frequency, spectral centroid / entropy,
-                 autocorrelation per channel + humidity–temperature coupling (correlation, lag, range ratio, peak delay)
-  spectral  (88) log power and relative FFT power spectrum of the detrended trial, relative Welch band powers
-                 (nperseg 16), db2 wavelet level energies / statistics per channel
-  catch22   (48) catch22 + mean / SD (catch24) per channel (pycatch22)
-Per-trial extraction has no fitted state; imputation, scaling and selection happen inside the training folds.
-
-Classifier: median imputation -> standard scaling -> [top-k features by ANOVA F, k in {20, 50, 100, all}] -> LightGBM.
-Hyperparameters (k, n_estimators, num_leaves, learning_rate, min_child_samples, colsample_bytree, reg_lambda) by
-Optuna TPE (n_trials, 5 random start-up trials) maximizing the leave-one-participant-out accuracy over the training
-participants; then refit on all training trials.
-"""
+"""LightGBM on per-trial combo features (breath + spectral / wavelet + catch22, 222 per trial), tuned by Optuna on
+leave-one-participant-out over the training participants."""
 
 import numpy as np
 import optuna
 import pandas as pd
+import pycatch22
+import pywt
+from lightgbm import LGBMClassifier
 from scipy import signal as sps
 from scipy import stats
 from sklearn.feature_selection import SelectKBest, f_classif
@@ -30,8 +18,10 @@ from sklearn.preprocessing import StandardScaler
 DT = 2.004  # s per sample
 CH = ('H', 'T')
 
-
+# features
 def _breath_channel(x: np.ndarray) -> dict:
+    # amplitude statistics, slopes and their timing, rise times, duty cycle, area, peaks, high-pass oscillation,
+    # spectrum and autocorrelation of one baseline-corrected channel
     t = np.arange(len(x)) * DT
     rng = x.max() - x.min() + 1e-9
     d = np.diff(x)
@@ -70,8 +60,8 @@ def _breath_channel(x: np.ndarray) -> dict:
     f['ac_first_zero'] = zc[0] if len(zc) else len(x)
     return f
 
-
 def breath_features(S: np.ndarray) -> pd.DataFrame:
+    # 86: _breath_channel per channel + humidity-temperature coupling
     rows = []
     for s in S:
         f = {}
@@ -86,9 +76,8 @@ def breath_features(S: np.ndarray) -> pd.DataFrame:
         rows.append(f)
     return pd.DataFrame(rows)
 
-
 def spectral_features(S: np.ndarray) -> pd.DataFrame:
-    import pywt
+    # 88: log power and relative FFT spectrum of the detrended trial, relative Welch band powers, db2 wavelet levels
     rows = []
     level = pywt.dwt_max_level(S.shape[2], 'db2')
     for s in S:
@@ -110,9 +99,8 @@ def spectral_features(S: np.ndarray) -> pd.DataFrame:
         rows.append(f)
     return pd.DataFrame(rows)
 
-
 def catch22_features(S: np.ndarray) -> pd.DataFrame:
-    import pycatch22
+    # 48: catch24 per channel
     rows = []
     for s in S:
         f = {}
@@ -122,17 +110,16 @@ def catch22_features(S: np.ndarray) -> pd.DataFrame:
         rows.append(f)
     return pd.DataFrame(rows)
 
-
 def combo_features(signals: np.ndarray) -> pd.DataFrame:
-    """(n, 222) combo features of (n, 2, T) absolute trials (baseline-corrected here); +/-inf -> NaN (imputed in fold)."""
+    """(n, 222) combo features of absolute (n, 2, T) trials, baseline-corrected here; +/-inf -> NaN (imputed in fold)."""
     S = np.asarray(signals, dtype=float)
     S = S - S[:, :, :5].mean(2, keepdims=True)
     X = pd.concat([breath_features(S).add_prefix('br_'), spectral_features(S).add_prefix('sp_'), catch22_features(S).add_prefix('ca_')], axis=1)
     return X.replace([np.inf, -np.inf], np.nan)
 
-
+# classifier
 def make(params: dict, seed: int) -> Pipeline:
-    from lightgbm import LGBMClassifier
+    """Median imputation -> standard scaling -> [top-k features by ANOVA F] -> LightGBM."""
     p = dict(params)
     k = p.pop('k', 'all')
     steps = [('imp', SimpleImputer(strategy='median')), ('scale', StandardScaler())]
@@ -141,8 +128,7 @@ def make(params: dict, seed: int) -> Pipeline:
     steps.append(('clf', LGBMClassifier(n_jobs=1, random_state=seed, verbose=-1, subsample=0.8, subsample_freq=1, **p)))
     return Pipeline(steps)
 
-
-def suggest(trial) -> dict:
+def suggest(trial: optuna.Trial) -> dict:
     return {'k': trial.suggest_categorical('k', [20, 50, 100, 'all']),
             'n_estimators': trial.suggest_int('n_estimators', 100, 600, step=100),
             'num_leaves': trial.suggest_int('num_leaves', 7, 63),
@@ -151,12 +137,15 @@ def suggest(trial) -> dict:
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
             'reg_lambda': trial.suggest_float('reg_lambda', 1e-2, 10.0, log=True)}
 
-
 def tune(X: np.ndarray, y: np.ndarray, groups: np.ndarray, seed: int, n_trials: int) -> tuple[dict, float]:
-    """Best hyperparameters and their mean leave-one-participant-out accuracy (training split only)."""
+    """Optuna TPE (n_trials, 5 random start-up trials) on the leave-one-participant-out accuracy of the training split.
+
+    :param groups: participant of each training trial
+    :return: (best hyperparameters, their mean leave-one-participant-out accuracy)
+    """
     inner = list(LeaveOneGroupOut().split(X, y, groups))
 
-    def objective(trial):
+    def objective(trial: optuna.Trial) -> float:
         params = suggest(trial)
         return float(np.mean([(make(params, seed).fit(X[a], y[a]).predict(X[b]) == y[b]).mean() for a, b in inner]))
 
