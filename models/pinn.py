@@ -1,3 +1,6 @@
+"""PI-CVAE: a CVAE whose decoder emits the calibrated measurement chain (transport + sensor), with the conv decoder as
+residual."""
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,16 +11,10 @@ from models.vae import CVAE
 
 # physics cvae
 class CIRConvolution(nn.Module):
-    """Differentiable advection-diffusion channel plus sensor-lag convolution. Maps a per-sample
-    source u(t) to the observed signal y = u conv (h_channel * s), where h(D, v) is the channel
-    kernel and s(tau_s) the first-order sensor kernel, kernels are unit-integral normalised."""
-    def __init__(self, t_grid: np.ndarray, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5):
-        """
-        :param t_grid: 1D array of sample times (seconds) defining the kernel grid.
-        :param tau_s: Sensor lag time constant in seconds (default 15.0).
-        :param d0: Source-to-sensor distance in metres (default 0.03).
-        :param baseline_samples: Number of leading samples held at zero for the pre-onset baseline (default 5).
-        """
+    """Differentiable advection-diffusion channel + first-order sensor lag: a per-sample source u(t) is convolved with
+    the unit-integral kernel h_channel(D, v) * s(tau_s)."""
+
+    def __init__(self, t_grid: np.ndarray, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5) -> None:
         super().__init__()
         self.d0 = d0
         self.tau_s = tau_s
@@ -29,18 +26,13 @@ class CIRConvolution(nn.Module):
         # fixed sensor kernel
         s = torch.where(t > 0, (1.0 / tau_s) * torch.exp(-t / tau_s), torch.zeros_like(t))
         self.register_buffer('s', s)
-        # baseline mask
+        # baseline mask: the source is zero over the pre-onset baseline
         mask = torch.ones(self.T)
         mask[:baseline_samples] = 0.0
         self.register_buffer('baseline_mask', mask)
 
-    def compute_kernels(self, log_D, log_v):
-        """Build per-sample advection-diffusion channel kernels, convolved with the sensor kernel.
-
-        :param log_D: (B,) log diffusion coefficient.
-        :param log_v: (B,) log advection velocity.
-        :return: (B, T) unit-integral channel-plus-sensor kernels (the amplitude is normalised out).
-        """
+    def compute_kernels(self, log_D: torch.Tensor, log_v: torch.Tensor) -> torch.Tensor:
+        """(B, T) unit-integral channel kernels convolved with the sensor kernel, for (B,) log D and log v."""
         D = torch.exp(log_D).unsqueeze(1)
         v = torch.exp(log_v).unsqueeze(1)
         t = self.t.unsqueeze(0)
@@ -62,16 +54,9 @@ class CIRConvolution(nn.Module):
         h_full = h_full / (h_full.sum(dim=1, keepdim=True) + 1e-8)
         return h_full
 
-    def forward(self, u, log_D, log_v):
-        """Convolve a per-sample source with its channel kernel to get the observed signal.
-
-        :param u: (B, T) raw source, softplus'd into a non-negative source and held at zero over the baseline.
-        :param log_D: (B,) log diffusion coefficient.
-        :param log_v: (B,) log advection velocity.
-        :return: (B, T) observed signal.
-        """
+    def forward(self, u: torch.Tensor, log_D: torch.Tensor, log_v: torch.Tensor) -> torch.Tensor:
+        """(B, T) raw source (softplus, zero over the baseline) -> (B, T) observed signal."""
         u_clean = F.softplus(u) * self.baseline_mask
-        # per-sample kernels
         kernels = self.compute_kernels(log_D, log_v)  # (B, T)
         # per-sample convolution (channels-as-batch trick for groups=B)
         B, T = u_clean.shape
@@ -81,22 +66,16 @@ class CIRConvolution(nn.Module):
         return F.conv1d(padded, k, groups=B).squeeze(0)
 
 class SharedTransportPINN(CVAE):
-    """PI-CVAE: CVAE whose decoder emits the calibrated measurement chain. Per channel a source network maps
-    [z, class embedding, participant embedding] to a non-negative source, which is convolved with the fixed
-    transport (calibrated D, v) + first-order sensor kernel shared by both channels (heat-mass analogy); the
-    conditional conv decoder is added as a residual."""
+    """PI-CVAE: per channel a source network maps [z, class embedding, participant embedding] to a non-negative source,
+    convolved with the fixed calibrated transport (D, v) + sensor kernel shared by both channels (heat-mass analogy);
+    the conditional conv decoder is added as a residual.
 
-    def __init__(self, cir_params_init, t_grid, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, residual: bool = True, **cvae_kwargs):
-        """
-        :param cir_params_init: (A, D, v, t_s) transport parameters from the calibration fit (core.fit_sir; A and
-            t_s are unused, the kernel is unit-integral and the source carries the timing).
-        :param t_grid: 1D array of sample times (seconds) for the transport kernel.
-        :param tau_s: Sensor lag time constant in seconds (default 15.0).
-        :param d0: Source-to-sensor distance in metres (default 0.03).
-        :param baseline_samples: Number of leading samples held at the pre-onset baseline (default 5).
-        :param residual: Whether to add the conv decoder output as a residual on the physics output (default True).
-        :param cvae_kwargs: Forwarded to the base CVAE (latent_dim, num_classes, conditioning, ...).
-        """
+    :param cir_params_init: (A, D, v, t_shift) of the calibration (core.calibrate); only D and v are used
+    :param residual: add the conv decoder output to the physics output
+    :param cvae_kwargs: forwarded to CVAE
+    """
+
+    def __init__(self, cir_params_init: np.ndarray, t_grid: np.ndarray, tau_s: float = 15.0, d0: float = 0.03, baseline_samples: int = 5, residual: bool = True, **cvae_kwargs) -> None:
         super().__init__(**cvae_kwargs)
         rng_state = torch.get_rng_state()
         self.cir_conv = CIRConvolution(t_grid, tau_s=tau_s, d0=d0, baseline_samples=baseline_samples)
@@ -111,20 +90,16 @@ class SharedTransportPINN(CVAE):
         self.register_buffer('log_v', torch.tensor(float(np.log(v_init)), dtype=torch.float32))
         torch.set_rng_state(rng_state)
 
-    def _cond(self, z, y, p):
-        """Concatenate z with the class (and optional participant) embedding into the source-head conditioning vector."""
+    def _cond(self, z: torch.Tensor, y: torch.Tensor, p: torch.Tensor | None) -> torch.Tensor:
         parts = [z, self.decoder.label_embed(y)]
         if self._cond_part and p is not None:
             parts.append(self.decoder.part_embed(p))
         return torch.cat(parts, dim=1)
 
-    def decode(self, z, y, p=None):
-        """Physics decoder: sources u_H, u_T through the shared transport + sensor kernel, plus the residual.
+    def decode(self, z: torch.Tensor, y: torch.Tensor, p: torch.Tensor | None = None) -> torch.Tensor:
+        """Sources u_H, u_T through the shared transport + sensor kernel, plus the residual.
 
-        :param z: (B, latent_dim) latent vectors.
-        :param y: (B,) integer class labels.
-        :param p: Optional (B,) participant labels.
-        :return: (B, 2, 36) signals in the training space (baseline-corrected, stdscale).
+        :return: (B, 2, 36) signals in the training space (baseline-corrected, stdscale)
         """
         B = z.shape[0]
         log_D = self.log_D.expand(B)
