@@ -1,39 +1,8 @@
-"""Nested leave-one-participant-out evaluation, one task = (region, outer test participant, inner test participant or
-outer task, seed).
+"""One task of the evaluation: nested LOSO (classifiers, augmentation, controls, TSTR, fidelity) or k-fold (fidelity).
 
-Outer loop (evaluation): every participant is the test participant once; validation = the next participant, training =
-the other 6. Inner loop (selection only, core.report): the 7 non-test participants rotate as inner test participant,
-inner validation = the next of the 7, inner training = the remaining 5 (core.data.nested_split). The outer test
-participant is not part of any inner task.
-
-Every task fits the candidates of the selection menus on its own split (training participants; the validation
-participant only for the CNN epoch and the generator checkpoint) and stores accuracy, macro F1 and class probabilities
-on its test participant:
-  stacker        thesis stacker, real trials only (core.stacker)
-  lgbm           LightGBM on combo features, Optuna TPE 20 trials on leave-one-participant-out over the training
-                 participants, refit on all of them (core.lgbm)
-  cnn            1D-CNN, real trials only (core.cnn)
-  cnn_physgain   + 2 physics re-renderings per real training trial: gain x/÷1.8 per channel + DHT22 observation
-  cnn_postgain   + 2 x n_train PI-CVAE posterior samples of class-balanced real training parents (core.augment), then the
-                 physics gain step; PI-CVAE trained on the task's training participants (core.train)
-  ens, ens_*     mean class probabilities of the LightGBM and the respective CNN
-Outer tasks also compute fixed comparisons and fidelity (never selected):
-  cnn_/ens_jitter    + 2 jittered copies per real training trial (SD 0.05 x training SD per channel)
-  cnn_/ens_mixup     + 2 mixups per real training trial with a random trial of the same class, lambda ~ Beta(0.4, 0.4)
-  cnn_/ens_cvaegain  as postgain with the CVAE (same parents, latent noise and gains)
-  cnn_/ens_post      the PI-CVAE posterior samples of postgain without the gain step
-  cnn_/ens_cvaepost  the CVAE posterior samples of cvaegain without the gain step
-  tstr_<gen>_<clf>   LightGBM (the task's tuned hyperparameters), CNN and their ensemble trained only on n_train
-                     class-balanced prior samples of the CVAE / PI-CVAE decoded with the null participant token
-  fidelity           core.fidelity MMD and morphology of the prior samples and of every augmentation set against the
-                     held-out participant (k-fold counterpart: core.kfold)
-Random streams (core.augment.stream_rng) are keyed by seed and task (outer: '<o+1>', inner: '<o+1>.<i+1>'); the stream
-names of the menu candidates are those of the development runs (development/nested), whose results this module
-reproduces.
-
-Usage (repository root, after experiments/00_calibration.sh):
-  python -m core.nested --region mouth --outer 0 --inner -1 --seed 0      (--inner -1: outer task)
-Writes results/nested/<task>.json; generator checkpoints in results/nested/work/<task>/.
+Usage: python -m core.nested --region mouth --seed 0 --outer 0 --inner -1   (nested LOSO; --inner -1 = outer task)
+       python -m core.nested --region mouth --seed 0 --fold 0               (k-fold)
+Writes results/nested/<task>.json or results/kfold/<task>.json, generator checkpoints in <out_dir>/work/<task>/.
 """
 
 import argparse
@@ -43,46 +12,69 @@ import time
 import warnings
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.metrics import f1_score
 
-from core import cnn, stacker
-from core.augment import GAIN_MAX, jitter, mixup, posterior_samples, prior_samples, rerender, sample_parents, stream_rng
-from core.data import CLASS_TO_IDX, BreathDataset, load_dataset, nested_split, split_frames
+from core.augment import (
+    GAIN_MAX,
+    jitter,
+    mixup,
+    posterior_samples,
+    prior_samples,
+    rerender,
+    sample_parents,
+    stream_rng,
+)
+from core.data import (
+    CLASS_TO_IDX,
+    BreathDataset,
+    kfold_split,
+    load_dataset,
+    nested_split,
+    split_frames,
+)
 from core.fidelity import mmd_report, morphology_report
-from core.lgbm import combo_features, make, tune
-from core.provenance import file_digest, fingerprint
 from core.train import train
-from core.utils import seed_everything
+from core.utils import file_digest, fingerprint, seed_everything
+from models import cnn, stacker
+from models.lgbm import combo_features, make, tune
 
+# selection menu (core.report): real-only, + physics gain, + PI-CVAE posterior samples + gain; ens = LightGBM + CNN
 MENU = ('stacker', 'lgbm', 'cnn', 'cnn_physgain', 'cnn_postgain', 'ens', 'ens_physgain', 'ens_postgain')
-CONTROLS = ('jitter', 'mixup', 'cvaegain', 'post', 'cvaepost')
-GENERATORS = ('cvae', 'picvae')
 N_TRIALS = 20  # Optuna trials of the LightGBM tuning
 COPIES = 2  # synthetic trials per real training trial
-
+N_FOLDS = 5
+SPLIT_SEED = 42  # k-fold split (thesis protocol)
 
 def task_name(region: str, outer: int, inner: int, seed: int) -> str:
     return f'{region}_o{outer}_' + ('outer' if inner < 0 else f'i{inner}') + f'_s{seed}'
 
+def kfold_task_name(region: str, fold: int, seed: int) -> str:
+    return f'{region}_k{fold}_s{seed}'
 
 def scores(P: np.ndarray, y: np.ndarray) -> dict:
     pred = P.argmax(1)
     return {'accuracy': float((pred == y).mean()), 'macro_f1': float(f1_score(y, pred, average='macro')), 'proba': np.round(P, 6).tolist()}
 
-
-def labels(df) -> np.ndarray:
+def labels(df: pd.DataFrame) -> np.ndarray:
     return np.array([CLASS_TO_IDX[c] for c in df['class']])
 
-
-def signals(df) -> np.ndarray:
-    """(n, 2, T) absolute humidity / temperature trials."""
+def signals(df: pd.DataFrame) -> np.ndarray:
     return np.stack([np.stack([h, t]) for h, t in zip(df['humidity'], df['temperature'])]).astype(float)
 
+def synthetic_sets(tr: pd.DataFrame, R_tr: np.ndarray, y_tr: np.ndarray, gens: dict, seed: int, key: int | str, controls: bool) -> dict:
+    """Synthetic training sets of one split, COPIES x n_train trials each.
 
-def synthetic_sets(tr, R_tr: np.ndarray, y_tr: np.ndarray, gens: dict, seed: int, key, controls: bool) -> dict:
-    """Synthetic training sets {name: (absolute signals, labels)} of one split, COPIES x n_train trials each: physgain
-    and postgain (gens['picvae']); with controls also cvaegain (gens['cvae']), post, cvaepost, jitter and mixup."""
+    :param tr: training trials
+    :param R_tr: their absolute signals (n, 2, T)
+    :param y_tr: their labels
+    :param gens: trained generators {'picvae': ..., 'cvae': ... (controls only)}
+    :param key: task key of the random streams
+    :param controls: also build cvaegain, post, cvaepost, jitter and mixup
+    :return: {name: (absolute signals, labels)}, physgain and postgain always
+    """
+    # stream names as in the development runs, whose results this reproduces
     n_add = COPIES * len(y_tr)
     sets = {'physgain': (rerender(R_tr, COPIES, GAIN_MAX, 0.0, stream_rng(seed, key, '1.0/physgain')), np.tile(y_tr, COPIES))}
     parents, y_post = sample_parents(tr, n_add, stream_rng(seed, key, 'postgain_parents'))
@@ -95,9 +87,26 @@ def synthetic_sets(tr, R_tr: np.ndarray, y_tr: np.ndarray, gens: dict, seed: int
         sets['mixup'] = (mixup(R_tr, y_tr, COPIES, stream_rng(seed, key, 'mixup')), np.tile(y_tr, COPIES))
     return sets
 
+def fidelity_of(synth: dict, R_tr: np.ndarray, y_tr: np.ndarray, R_te: np.ndarray, y_te: np.ndarray) -> dict:
+    return {name: {'n': len(y_s), **mmd_report(S, y_s, R_tr, R_te, y_te), **morphology_report(S, y_s, R_tr, y_tr, R_te, y_te)}
+            for name, (S, y_s) in synth.items()}
 
-def run(region: str, outer: int, inner: int, seed: int, out_dir: str = 'results/nested', dataset_dir: str = 'dataset',
-        calibration_dir: str = 'results/pinn', gen_epochs: int = 500, cnn_epochs: int = cnn.EPOCHS, n_trials: int = N_TRIALS) -> dict:
+def save(out: dict, out_dir: str, task: str) -> None:
+    # write to a temporary file first: an interrupted task never leaves a partial result
+    with open(os.path.join(out_dir, f'{task}.json.tmp'), 'w') as f:
+        json.dump(out, f, default=str)
+    os.replace(os.path.join(out_dir, f'{task}.json.tmp'), os.path.join(out_dir, f'{task}.json'))
+
+def run(region: str, outer: int, inner: int, seed: int, out_dir: str = 'results/nested', dataset_dir: str = 'dataset', calibration_dir: str = 'results/pinn', gen_epochs: int = 500, cnn_epochs: int = cnn.EPOCHS, n_trials: int = N_TRIALS) -> dict:
+    """Nested LOSO task: every menu candidate on the task's test participant; outer tasks also the controls, TSTR
+    (training on prior samples only) and fidelity. Inner tasks only feed the selection (core.report).
+
+    :param outer: 0-indexed outer test participant
+    :param inner: 0-indexed inner test participant among the other 7, -1 = outer task
+    :param gen_epochs: generator epochs (lower only for smoke tests)
+    :return: the result written to <out_dir>/<task>.json
+    """
+    # split: validation participant only for the CNN epoch and the generator checkpoint
     t0 = time.time()
     task = task_name(region, outer, inner, seed)
     work = os.path.join(out_dir, 'work', task)
@@ -111,10 +120,7 @@ def run(region: str, outer: int, inner: int, seed: int, out_dir: str = 'results/
     y_tr, y_va, y_te = labels(tr), labels(va), labels(te)
     R_tr, R_va, R_te = signals(tr), signals(va), signals(te)
     print(f'[NESTED] {task}: train {train_p} | val {val_p} | test {test_p} ({len(y_te)} trials)', flush=True)
-    res, fidelity = {}, {}
-    gen = lambda name: train(name, region, tr, va, seed, os.path.join(work, f'{name}.pt'), {'task': task, 'train': train_p, 'val': val_p, 'test': test_p},  # noqa: E731
-                             dataset_dir, calibration_dir, gen_epochs)
-
+    res = {}
     # real-only classifiers
     res['stacker'] = scores(stacker.fit_predict(tr, te, seed), y_te)
     X_tr, X_te = combo_features(R_tr).values, combo_features(R_te).values
@@ -122,22 +128,20 @@ def run(region: str, outer: int, inner: int, seed: int, out_dir: str = 'results/
     lgbm = make(params, seed).fit(X_tr, y_tr)
     P_lgbm = lgbm.predict_proba(X_te)
     res['lgbm'] = scores(P_lgbm, y_te)
-
-    # CNN real-only / + physics gain / + PI-CVAE posterior samples + gain (outer tasks: + controls), and the ensembles
-    # with the LightGBM; the CNN reseeds per fit and every synthetic set has its own random streams, so the order of
-    # the fits does not matter
+    # CNN on real-only and every synthetic set, ensembles with the LightGBM (the CNN reseeds per fit, every set has its
+    # own random streams, so the order of the fits does not matter)
     scale = (R_tr - R_tr[:, :, :5].mean(2, keepdims=True)).std(axis=(0, 2)) + 1e-6
-    gens = {'picvae': gen('picvae')}
-    if inner < 0:
-        gens['cvae'] = gen('cvae')
+    split = {'task': task, 'train': train_p, 'val': val_p, 'test': test_p}
+    gens = {name: train(name, region, tr, va, seed, os.path.join(work, f'{name}.pt'), split, dataset_dir, calibration_dir, gen_epochs)
+            for name in (('picvae', 'cvae') if inner < 0 else ('picvae',))}
     synth = synthetic_sets(tr, R_tr, y_tr, gens, seed, key, controls=inner < 0)
     P_cnn = cnn.fit(R_tr, y_tr, R_va, y_va, seed, scale, cnn_epochs).predict_proba(R_te)
     res['cnn'], res['ens'] = scores(P_cnn, y_te), scores((P_lgbm + P_cnn) / 2, y_te)
     for name, (S, y_s) in synth.items():
         P = cnn.fit(np.concatenate([R_tr, S]), np.r_[y_tr, y_s], R_va, y_va, seed, scale, cnn_epochs).predict_proba(R_te)
         res[f'cnn_{name}'], res[f'ens_{name}'] = scores(P, y_te), scores((P_lgbm + P) / 2, y_te)
-
-    # outer task: synthetic-only training and fidelity of the generators' prior samples (null participant token)
+    # outer task: TSTR on prior samples (null participant token) and fidelity
+    fidelity = {}
     if inner < 0:
         for name, g in gens.items():
             S, y_s = prior_samples(g, len(y_tr), stream_rng(seed, key, 'prior_z'))
@@ -145,38 +149,85 @@ def run(region: str, outer: int, inner: int, seed: int, out_dir: str = 'results/
             P_l = make(params, seed).fit(combo_features(S).values, y_s).predict_proba(X_te)
             P_c = cnn.fit(S, y_s, R_va, y_va, seed, scale, cnn_epochs).predict_proba(R_te)
             res[f'tstr_{name}_lgbm'], res[f'tstr_{name}_cnn'], res[f'tstr_{name}_ens'] = scores(P_l, y_te), scores(P_c, y_te), scores((P_l + P_c) / 2, y_te)
-        for name, (S, y_s) in synth.items():
-            fidelity[name] = {'n': len(y_s), **mmd_report(S, y_s, R_tr, R_te, y_te), **morphology_report(S, y_s, R_tr, y_tr, R_te, y_te)}
-
+        fidelity = fidelity_of(synth, R_tr, y_tr, R_te, y_te)
+    # save
     print(f'[NESTED] {task}: ' + ' '.join(f'{c} {r["accuracy"]:.3f}' for c, r in res.items()) + f' | {time.time() - t0:.0f}s', flush=True)
     provenance = fingerprint(dataset_dir) | {'calibration_sha256': file_digest(f'{calibration_dir}/params_{region}.npy')}
     out = {'config': {'region': region, 'outer': outer, 'inner': inner, 'seed': seed, 'gen_epochs': gen_epochs, 'cnn_epochs': cnn_epochs, 'n_trials': n_trials},
            'task': task, 'train': train_p, 'val': val_p, 'test': test_p, 'y_test': y_te.tolist(), 'n_train': len(y_tr),
            'lgbm_params': params, 'lgbm_inner': inner_acc, 'provenance': provenance, 'results': res, 'fidelity': fidelity,
            'seconds': time.time() - t0}
-    with open(os.path.join(out_dir, f'{task}.json.tmp'), 'w') as f:
-        json.dump(out, f, default=str)
-    os.replace(os.path.join(out_dir, f'{task}.json.tmp'), os.path.join(out_dir, f'{task}.json'))
+    save(out, out_dir, task)
     return out
 
+def run_kfold(region: str, fold: int, seed: int, out_dir: str = 'results/kfold', dataset_dir: str = 'dataset', calibration_dir: str = 'results/pinn', gen_epochs: int = 500) -> dict:
+    """k-fold task (thesis protocol, training and test trials from the same participants): fidelity of the outer-task
+    synthetic sets and of the prior samples against the test fold, no classifiers.
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--region', required=True, choices=['mouth', 'nose'])
-    ap.add_argument('--outer', type=int, required=True, help='0-indexed outer test participant (sorted participants)')
-    ap.add_argument('--inner', type=int, required=True, help='0-indexed inner test participant among the others; -1 = outer task')
-    ap.add_argument('--seed', type=int, required=True)
-    ap.add_argument('--out_dir', default='results/nested')
-    ap.add_argument('--dataset_dir', default='dataset')
-    ap.add_argument('--calibration_dir', default='results/pinn')
-    ap.add_argument('--gen_epochs', type=int, default=500, help='generator epochs (smoke tests only)')
-    ap.add_argument('--cnn_epochs', type=int, default=cnn.EPOCHS, help='CNN epochs (smoke tests only)')
-    ap.add_argument('--n_trials', type=int, default=N_TRIALS, help='LightGBM tuning trials (smoke tests only)')
-    a = ap.parse_args()
+    :param fold: 0-indexed test fold of the class-stratified N_FOLDS split
+    :param gen_epochs: generator epochs (lower only for smoke tests)
+    :return: the result written to <out_dir>/<task>.json
+    """
+    # split: validation = 15 % of the training folds, for the generator checkpoint
+    t0 = time.time()
+    task = kfold_task_name(region, fold, seed)
+    work = os.path.join(out_dir, 'work', task)
+    os.makedirs(work, exist_ok=True)
+    seed_everything(seed)
+    df = load_dataset(dataset_dir)
+    tr, va, te = kfold_split(df[df['region'] == region], fold, N_FOLDS, SPLIT_SEED)
+    key = f'k{fold + 1}'
+    y_tr, y_te = labels(tr), labels(te)
+    R_tr, R_te = signals(tr), signals(te)
+    print(f'[KFOLD] {task}: train {len(tr)} | val {len(va)} | test {len(te)} trials', flush=True)
+    # generators, synthetic sets and fidelity
+    split = {'task': task, 'fold': fold, 'n_folds': N_FOLDS, 'split_seed': SPLIT_SEED}
+    gens = {name: train(name, region, tr, va, seed, os.path.join(work, f'{name}.pt'), split, dataset_dir, calibration_dir, gen_epochs)
+            for name in ('picvae', 'cvae')}
+    synth = synthetic_sets(tr, R_tr, y_tr, gens, seed, key, controls=True)
+    for name, g in gens.items():
+        synth[f'{name}_prior'] = prior_samples(g, len(y_tr), stream_rng(seed, key, 'prior_z'))
+    fidelity = fidelity_of(synth, R_tr, y_tr, R_te, y_te)
+    # save
+    print(f'[KFOLD] {task}: MMD ' + ' '.join(f'{n} {f["mmd"]:.4f}' for n, f in fidelity.items())
+          + f' | real {fidelity["physgain"]["mmd_real_ref"]:.4f} | {time.time() - t0:.0f}s', flush=True)
+    provenance = fingerprint(dataset_dir) | {'calibration_sha256': file_digest(f'{calibration_dir}/params_{region}.npy')}
+    out = {'config': {'region': region, 'fold': fold, 'seed': seed, 'n_folds': N_FOLDS, 'split_seed': SPLIT_SEED, 'gen_epochs': gen_epochs},
+           'task': task, 'n_train': len(tr), 'n_val': len(va), 'n_test': len(te),
+           'test_participants': te['participant'].value_counts().sort_index().to_dict(), 'provenance': provenance,
+           'fidelity': fidelity, 'seconds': time.time() - t0}
+    save(out, out_dir, task)
+    return out
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    # task: --outer and --inner (nested LOSO) or --fold (k-fold)
+    p.add_argument('--region', required=True, choices=['mouth', 'nose'])
+    p.add_argument('--seed', type=int, required=True)
+    p.add_argument('--outer', type=int)
+    p.add_argument('--inner', type=int)
+    p.add_argument('--fold', type=int)
+    # paths (out_dir default: results/nested or results/kfold)
+    p.add_argument('--out_dir')
+    p.add_argument('--dataset_dir', default='dataset')
+    p.add_argument('--calibration_dir', default='results/pinn')
+    # smoke tests only
+    p.add_argument('--gen_epochs', type=int, default=500)
+    p.add_argument('--cnn_epochs', type=int, default=cnn.EPOCHS)
+    p.add_argument('--n_trials', type=int, default=N_TRIALS)
+    a = p.parse_args()
+    if (a.outer is not None and a.inner is not None) == (a.fold is not None):
+        p.error('give either --outer and --inner (nested LOSO) or --fold (k-fold)')
+    return a
+
+def main() -> None:
+    a = parse_args()
     warnings.filterwarnings('ignore')
     torch.set_num_threads(1)
-    run(a.region, a.outer, a.inner, a.seed, a.out_dir, a.dataset_dir, a.calibration_dir, a.gen_epochs, a.cnn_epochs, a.n_trials)
-
+    if a.fold is not None:
+        run_kfold(a.region, a.fold, a.seed, a.out_dir or 'results/kfold', a.dataset_dir, a.calibration_dir, a.gen_epochs)
+    else:
+        run(a.region, a.outer, a.inner, a.seed, a.out_dir or 'results/nested', a.dataset_dir, a.calibration_dir, a.gen_epochs, a.cnn_epochs, a.n_trials)
 
 if __name__ == '__main__':
     main()

@@ -1,15 +1,5 @@
-"""Generator training on one split: the CVAE baseline and the PI-CVAE (models/pinn.py), both conditioned on class and
-participant with participant dropout 0.1 (null token for unseen participants).
-
-Both: latent 16, class / participant embeddings 8, Adam 1e-3 with cosine schedule, batch 32, 500 epochs, KL weight
-warmed up linearly to beta_max = 0.01 over the first half, no free bits; the checkpoint is the epoch with the lowest
-validation ELBO (reconstruction + beta KL) once beta has reached beta_max (validation = the split's validation
-participant, decoded with the null token).
-  cvae    z-scored signals (BreathDataset), training data expanded tenfold with Gaussian jitter (SD 0.05)
-  picvae  baseline-corrected signals scaled per channel by the training SD (PhysicsInformedDataset), training data
-          repeated tenfold without jitter, + 3 x MSE of the first differences (shape term); fixed calibrated transport
-          (results/pinn/params_<region>.npy from core.fit_sir) and the conv decoder as residual
-"""
+"""Generator training on one split: CVAE and PI-CVAE (models/), conditioned on class and participant with participant
+dropout (null token for unseen participants); checkpoint = lowest validation ELBO once beta has reached BETA_MAX."""
 
 import copy
 
@@ -19,31 +9,40 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from core.data import CLASS_TO_IDX, PARTICIPANT_TO_IDX, PARTICIPANTS, BreathDataset, PhysicsInformedDataset
-from core.provenance import file_digest, fingerprint, reserve_training
-from core.utils import make_generator, seed_everything, seed_worker
+from core.data import (
+    CLASS_TO_IDX,
+    PARTICIPANT_TO_IDX,
+    PARTICIPANTS,
+    BreathDataset,
+    PhysicsInformedDataset,
+)
+from core.utils import (
+    file_digest,
+    fingerprint,
+    make_generator,
+    reserve_training,
+    seed_everything,
+    seed_worker,
+)
 from models.pinn import SharedTransportPINN
 from models.vae import CVAE, elbo_loss
 
+# cvae: z-scored signals, tenfold with jitter; picvae: baseline-corrected stdscale signals, tenfold without jitter, +
+# shape term (shape_lambda x MSE of the first differences), calibrated transport + conv decoder as residual
 GENERATORS = {'cvae': {'alpha': 0.05, 'n_copies': 10, 'shape_lambda': 0.0},
               'picvae': {'alpha': 0.0, 'n_copies': 10, 'shape_lambda': 3.0}}
 DIMS = {'latent_dim': 16, 'embed_dim': 8, 'part_embed_dim': 8}
 BETA_MAX, PART_DROPOUT, LR, BATCH_SIZE, EPOCHS = 0.01, 0.1, 1e-3, 32, 500
 T_GRID = np.arange(36) * 2.0
 
-
 def beta_capped(epoch: int, warmup_epochs: int, beta_max: float = BETA_MAX) -> float:
-    """Linear warmup from 0 -> beta_max over warmup_epochs, then hold."""
+    # linear KL warmup from 0 to beta_max, then hold
     if warmup_epochs < 0:
         raise ValueError('warmup_epochs must be nonnegative')
     return beta_max if warmup_epochs == 0 else min(beta_max, (epoch / warmup_epochs) * beta_max)
 
-
-def run_epoch(model, loader, beta: float, shape_lambda: float = 0.0, optimizer=None) -> tuple[float, float]:
-    """One pass over loader (training when an optimizer is given, else evaluation without gradients).
-
-    :return: epoch-mean (reconstruction, KL).
-    """
+def run_epoch(model: torch.nn.Module, loader: DataLoader, beta: float, shape_lambda: float = 0.0, optimizer: torch.optim.Optimizer | None = None) -> tuple[float, float]:
+    # training pass with an optimizer, else evaluation without gradients; returns the epoch-mean (reconstruction, KL)
     model.train(optimizer is not None)
     recon_sum = kl_sum = 0.0
     with torch.set_grad_enabled(optimizer is not None):
@@ -61,11 +60,10 @@ def run_epoch(model, loader, beta: float, shape_lambda: float = 0.0, optimizer=N
     n = len(loader.dataset)
     return recon_sum / n, kl_sum / n
 
-
 class Generator:
     """A trained CVAE / PI-CVAE with the transform between its training space and signals."""
 
-    def __init__(self, name: str, model: torch.nn.Module, stats: dict):
+    def __init__(self, name: str, model: torch.nn.Module, stats: dict) -> None:
         self.name, self.model, self.stats = name, model.eval(), stats
         self.space = PhysicsInformedDataset if name == 'picvae' else BreathDataset
 
@@ -78,30 +76,31 @@ class Generator:
         return x, y, p
 
     def signals(self, x_hat: torch.Tensor) -> np.ndarray:
-        """Decoder output (n, 2, T) -> baseline-corrected signals in physical units (PI-CVAE: rescaled; CVAE:
-        de-standardized, then the mean of the first 5 samples subtracted)."""
+        """Decoder output (n, 2, T) -> baseline-corrected signals in physical units."""
         x = np.asarray(x_hat.numpy(), dtype=float)
         if self.name == 'picvae':
             return x * np.array([self.stats['h_bcstd'], self.stats['t_bcstd']]).reshape(1, 2, 1)
+        # cvae: de-standardize, then subtract the mean of the first 5 samples
         s = x * self.stats['std'].reshape(1, 2, 1) + self.stats['mean'].reshape(1, 2, 1)
         return s - s[:, :, :5].mean(2, keepdims=True)
 
-
-def build(name: str, calibration: np.ndarray) -> torch.nn.Module:
-    """Untrained generator (consumes the global torch RNG for the initial weights)."""
+def build(name: str, calibration: np.ndarray | None) -> torch.nn.Module:
+    # untrained generator, consumes the global torch RNG for the initial weights
     kwargs = dict(**DIMS, num_classes=3, condition_on_participant=True, num_participants=len(PARTICIPANTS), part_dropout=PART_DROPOUT)
     if name == 'picvae':
         return SharedTransportPINN(cir_params_init=calibration, t_grid=T_GRID, residual=True, **kwargs)
     return CVAE(**kwargs)
 
+def train(name: str, region: str, df_train: pd.DataFrame, df_val: pd.DataFrame, seed: int, path: str, split: dict, dataset_dir: str = 'dataset', calibration_dir: str = 'results/pinn', epochs: int = EPOCHS) -> Generator:
+    """Train generator `name` on df_train (checkpoint selection on df_val) and save it to path; a checkpoint with the
+    same data, code and settings is loaded instead (core.utils.reserve_training).
 
-def train(name: str, region: str, df_train: pd.DataFrame, df_val: pd.DataFrame, seed: int, path: str, split: dict,
-          dataset_dir: str = 'dataset', calibration_dir: str = 'results/pinn', epochs: int = EPOCHS) -> Generator:
-    """Train generator `name` on df_train (checkpoint selection on df_val) and save it to path; an existing checkpoint
-    with the same data, code and settings is loaded instead (core.provenance.reserve_training).
-
-    :param split: identification of the split recorded with the checkpoint (participants, task).
+    :param name: 'cvae' or 'picvae'
+    :param split: identification of the split recorded with the checkpoint (task, participants or fold)
+    :param epochs: training epochs (lower only for smoke tests)
+    :return: the trained generator
     """
+    # provenance
     calibration_path = f'{calibration_dir}/params_{region}.npy'
     config = {'generator': name, 'region': region, 'seed': seed, 'epochs': epochs, **split, **DIMS, **GENERATORS[name],
               'beta_max': BETA_MAX, 'part_dropout': PART_DROPOUT, 'lr': LR, 'batch_size': BATCH_SIZE}
@@ -115,6 +114,7 @@ def train(name: str, region: str, df_train: pd.DataFrame, df_val: pd.DataFrame, 
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
     except FileNotFoundError:
         ckpt = None
+    # train
     if ckpt is None:
         hp = GENERATORS[name]
         seed_everything(seed)
@@ -142,6 +142,7 @@ def train(name: str, region: str, df_train: pd.DataFrame, df_val: pd.DataFrame, 
         ckpt = {**state, 'stats': train_ds.stats, 'trained_participants': trained_participants, 'calibration': calibration,
                 'history': history, 'provenance': provenance}
         torch.save(ckpt, path)
+    # load
     if ckpt['provenance'] != provenance:
         raise ValueError(f'Checkpoint {path} was trained on other data, code or settings')
     model = build(name, calibration)
