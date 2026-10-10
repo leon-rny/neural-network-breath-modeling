@@ -4,6 +4,7 @@ import re
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import Dataset
 
 CLASSES = ['bradypnea', 'eupnea', 'tachypnea']
@@ -77,6 +78,22 @@ def split_frames(df: pd.DataFrame, train: list[str], val: str, test: str) -> tup
     """(train, val, test) trial frames of the given participants, each in the order of df."""
     pick = lambda m: df[m].reset_index(drop=True)  # noqa: E731
     return pick(df['participant'].isin(train)), pick(df['participant'] == val), pick(df['participant'] == test)
+
+def kfold_split(df: pd.DataFrame, fold: int, n_folds: int = 5, split_seed: int = 42, val_size: float = 0.15) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """(train, val, test) trial frames of the thesis k-fold protocol: class-stratified n_folds split of the trials
+    (test = fold `fold`), validation = val_size of the remaining trials (class-stratified). Training, validation and
+    test trials come from the same participants; split_seed fixes both splits.
+
+    :param df: trials of one region.
+    :param fold: 0-indexed test fold.
+    """
+    if not 0 <= fold < n_folds:
+        raise ValueError(f'fold must be in [0, {n_folds}), got {fold}')
+    df = df.reset_index(drop=True)
+    train_idx, test_idx = list(StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=split_seed).split(df, df['class']))[fold]
+    pool = df.iloc[train_idx].reset_index(drop=True)
+    tr, va = train_test_split(pool, test_size=val_size, stratify=pool['class'], random_state=split_seed)
+    return tr.reset_index(drop=True), va.reset_index(drop=True), df.iloc[test_idx].reset_index(drop=True)
 
 class BreathDataset(Dataset):
     """PyTorch Dataset of z-score normalised breath signals (humidity, temperature), the CVAE's training space."""

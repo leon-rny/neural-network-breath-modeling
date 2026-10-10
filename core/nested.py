@@ -21,10 +21,12 @@ Outer tasks also compute fixed comparisons and fidelity (never selected):
   cnn_/ens_jitter    + 2 jittered copies per real training trial (SD 0.05 x training SD per channel)
   cnn_/ens_mixup     + 2 mixups per real training trial with a random trial of the same class, lambda ~ Beta(0.4, 0.4)
   cnn_/ens_cvaegain  as postgain with the CVAE (same parents, latent noise and gains)
+  cnn_/ens_post      the PI-CVAE posterior samples of postgain without the gain step
+  cnn_/ens_cvaepost  the CVAE posterior samples of cvaegain without the gain step
   tstr_<gen>_<clf>   LightGBM (the task's tuned hyperparameters), CNN and their ensemble trained only on n_train
                      class-balanced prior samples of the CVAE / PI-CVAE decoded with the null participant token
   fidelity           core.fidelity MMD and morphology of the prior samples and of every augmentation set against the
-                     held-out participant
+                     held-out participant (k-fold counterpart: core.kfold)
 Random streams (core.augment.stream_rng) are keyed by seed and task (outer: '<o+1>', inner: '<o+1>.<i+1>'); the stream
 names of the menu candidates are those of the development runs (development/nested), whose results this module
 reproduces.
@@ -54,7 +56,7 @@ from core.train import train
 from core.utils import seed_everything
 
 MENU = ('stacker', 'lgbm', 'cnn', 'cnn_physgain', 'cnn_postgain', 'ens', 'ens_physgain', 'ens_postgain')
-CONTROLS = ('jitter', 'mixup', 'cvaegain')
+CONTROLS = ('jitter', 'mixup', 'cvaegain', 'post', 'cvaepost')
 GENERATORS = ('cvae', 'picvae')
 N_TRIALS = 20  # Optuna trials of the LightGBM tuning
 COPIES = 2  # synthetic trials per real training trial
@@ -69,6 +71,31 @@ def scores(P: np.ndarray, y: np.ndarray) -> dict:
     return {'accuracy': float((pred == y).mean()), 'macro_f1': float(f1_score(y, pred, average='macro')), 'proba': np.round(P, 6).tolist()}
 
 
+def labels(df) -> np.ndarray:
+    return np.array([CLASS_TO_IDX[c] for c in df['class']])
+
+
+def signals(df) -> np.ndarray:
+    """(n, 2, T) absolute humidity / temperature trials."""
+    return np.stack([np.stack([h, t]) for h, t in zip(df['humidity'], df['temperature'])]).astype(float)
+
+
+def synthetic_sets(tr, R_tr: np.ndarray, y_tr: np.ndarray, gens: dict, seed: int, key, controls: bool) -> dict:
+    """Synthetic training sets {name: (absolute signals, labels)} of one split, COPIES x n_train trials each: physgain
+    and postgain (gens['picvae']); with controls also cvaegain (gens['cvae']), post, cvaepost, jitter and mixup."""
+    n_add = COPIES * len(y_tr)
+    sets = {'physgain': (rerender(R_tr, COPIES, GAIN_MAX, 0.0, stream_rng(seed, key, '1.0/physgain')), np.tile(y_tr, COPIES))}
+    parents, y_post = sample_parents(tr, n_add, stream_rng(seed, key, 'postgain_parents'))
+    post = {name: posterior_samples(g, parents, stream_rng(seed, key, 'postgain_z')) for name, g in gens.items()}
+    sets['postgain'] = (rerender(post['picvae'], 1, GAIN_MAX, 0.0, stream_rng(seed, key, 'postgain_gain')), y_post)
+    if controls:
+        sets['cvaegain'] = (rerender(post['cvae'], 1, GAIN_MAX, 0.0, stream_rng(seed, key, 'postgain_gain')), y_post)
+        sets['post'], sets['cvaepost'] = (post['picvae'], y_post), (post['cvae'], y_post)
+        sets['jitter'] = (jitter(R_tr, COPIES, BreathDataset(tr).stats['std'], stream_rng(seed, key, 'jitter')), np.tile(y_tr, COPIES))
+        sets['mixup'] = (mixup(R_tr, y_tr, COPIES, stream_rng(seed, key, 'mixup')), np.tile(y_tr, COPIES))
+    return sets
+
+
 def run(region: str, outer: int, inner: int, seed: int, out_dir: str = 'results/nested', dataset_dir: str = 'dataset',
         calibration_dir: str = 'results/pinn', gen_epochs: int = 500, cnn_epochs: int = cnn.EPOCHS, n_trials: int = N_TRIALS) -> dict:
     t0 = time.time()
@@ -81,9 +108,7 @@ def run(region: str, outer: int, inner: int, seed: int, out_dir: str = 'results/
     train_p, val_p, test_p = nested_split(sorted(df['participant'].unique()), outer, inner)
     tr, va, te = split_frames(df, train_p, val_p, test_p)
     key = outer + 1 if inner < 0 else f'{outer + 1}.{inner + 1}'
-    y = lambda d: np.array([CLASS_TO_IDX[c] for c in d['class']])  # noqa: E731
-    signals = lambda d: np.stack([np.stack([h, t]) for h, t in zip(d['humidity'], d['temperature'])]).astype(float)  # noqa: E731
-    y_tr, y_va, y_te = y(tr), y(va), y(te)
+    y_tr, y_va, y_te = labels(tr), labels(va), labels(te)
     R_tr, R_va, R_te = signals(tr), signals(va), signals(te)
     print(f'[NESTED] {task}: train {train_p} | val {val_p} | test {test_p} ({len(y_te)} trials)', flush=True)
     res, fidelity = {}, {}
@@ -98,20 +123,14 @@ def run(region: str, outer: int, inner: int, seed: int, out_dir: str = 'results/
     P_lgbm = lgbm.predict_proba(X_te)
     res['lgbm'] = scores(P_lgbm, y_te)
 
-    # CNN real-only / + physics gain / + PI-CVAE posterior samples + gain, and the ensembles with the LightGBM
+    # CNN real-only / + physics gain / + PI-CVAE posterior samples + gain (outer tasks: + controls), and the ensembles
+    # with the LightGBM; the CNN reseeds per fit and every synthetic set has its own random streams, so the order of
+    # the fits does not matter
     scale = (R_tr - R_tr[:, :, :5].mean(2, keepdims=True)).std(axis=(0, 2)) + 1e-6
-    n_add = COPIES * len(y_tr)
-    synth = {'physgain': (rerender(R_tr, COPIES, GAIN_MAX, 0.0, stream_rng(seed, key, '1.0/physgain')), np.tile(y_tr, COPIES))}
-    parents, y_post = sample_parents(tr, n_add, stream_rng(seed, key, 'postgain_parents'))
     gens = {'picvae': gen('picvae')}
-    post = posterior_samples(gens['picvae'], parents, stream_rng(seed, key, 'postgain_z'))
-    synth['postgain'] = (rerender(post, 1, GAIN_MAX, 0.0, stream_rng(seed, key, 'postgain_gain')), y_post)
     if inner < 0:
         gens['cvae'] = gen('cvae')
-        post = posterior_samples(gens['cvae'], parents, stream_rng(seed, key, 'postgain_z'))
-        synth['cvaegain'] = (rerender(post, 1, GAIN_MAX, 0.0, stream_rng(seed, key, 'postgain_gain')), y_post)
-        synth['jitter'] = (jitter(R_tr, COPIES, BreathDataset(tr).stats['std'], stream_rng(seed, key, 'jitter')), np.tile(y_tr, COPIES))
-        synth['mixup'] = (mixup(R_tr, y_tr, COPIES, stream_rng(seed, key, 'mixup')), np.tile(y_tr, COPIES))
+    synth = synthetic_sets(tr, R_tr, y_tr, gens, seed, key, controls=inner < 0)
     P_cnn = cnn.fit(R_tr, y_tr, R_va, y_va, seed, scale, cnn_epochs).predict_proba(R_te)
     res['cnn'], res['ens'] = scores(P_cnn, y_te), scores((P_lgbm + P_cnn) / 2, y_te)
     for name, (S, y_s) in synth.items():

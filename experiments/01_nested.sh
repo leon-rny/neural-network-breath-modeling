@@ -12,13 +12,13 @@
 set -euo pipefail
 
 # Nested LOSO (core/nested.py): one array index = one task. 2 regions x 8 outer participants x (1 outer + 7 inner tasks)
-# x 5 seeds = 640 tasks; indices 0-79 are the outer tasks (evaluation, controls, TSTR, fidelity; ~2.5 h each),
-# 80-639 the inner tasks (selection only; ~1.5 h each). Writes results/nested/<task>.json; finished tasks are skipped.
+# x 5 seeds = 640 tasks; indices 0-79 are the outer tasks (evaluation, controls, TSTR, fidelity; ~0.5-1.5 h each),
+# 80-639 the inner tasks (selection only; ~0.3-1 h each). Writes results/nested/<task>.json; finished tasks are skipped.
 # Run from the repository root of a fresh run directory (a clean checkout of the commit to report) after
 # experiments/00_calibration.sh; the log directory must exist before submission:
 #   mkdir -p logs && sbatch experiments/01_nested.sh
 #   sbatch --array=0-79 experiments/01_nested.sh      # outer tasks only
-# Report: experiments/02_report.sh. The node constraint keeps all tasks on one CPU family, so reruns reproduce the
+# Report: experiments/03_report.sh. The node constraint keeps all tasks on one CPU family, so reruns reproduce the
 # results bit for bit; CONDA_SH / CONDA_ENV select the Python environment (requirements.txt), without conda the python
 # on PATH is used.
 CONDA_SH="${CONDA_SH:-/opt/miniforge/etc/profile.d/conda.sh}"

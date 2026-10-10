@@ -21,8 +21,9 @@ Nested LOSO over the eight participants (`core/nested.py`, `core/report.py`). In
 
 - **Classifiers:** the thesis stacker (tsfresh + SHAP top-20 + SMOTE + XGBoost / CatBoost, random-forest meta-learner; `core/stacker.py`), LightGBM on combo features tuned by Optuna inside the training split (`core/lgbm.py`), a raw-signal 1D-CNN (`core/cnn.py`) and the LightGBM + CNN ensemble.
 - **Augmentation of the CNN (selected in the inner loop):** physics gain (random sensor gain ×/÷1.8 per channel + DHT22 observation) and PI-CVAE posterior samples + physics gain (`core/augment.py`).
-- **Controls (outer folds):** Gaussian jitter, same-class mixup, CVAE posterior samples + physics gain.
-- **Fidelity (outer folds):** MMD and morphology (onset, rise slope, plateau) of CVAE / PI-CVAE prior samples against the held-out participant (`core/fidelity.py`), and train-on-synthetic-test-on-real accuracy.
+- **Controls (outer folds):** Gaussian jitter, same-class mixup, CVAE posterior samples + physics gain, and the CVAE / PI-CVAE posterior samples without the gain step.
+- **Fidelity (outer folds):** MMD and morphology (onset, rise slope, plateau) of CVAE / PI-CVAE prior samples and of every augmentation set against the held-out participant (`core/fidelity.py`), and train-on-synthetic-test-on-real accuracy.
+- **k-fold fidelity:** the same MMD and morphology under the thesis protocol (class-stratified 5-fold split of the trials, so training and test trials come from the same participants; `core/kfold.py`), to contrast within-participant with cross-participant fidelity.
 - **Generators:** CVAE and PI-CVAE (`models/`, trained by `core/train.py`), calibration by `core/fit_sir.py`.
 
 ## Installation
@@ -36,15 +37,16 @@ pip install -r requirements.txt
 
 ## Usage
 
-From the repository root of a run directory (on a Slurm cluster for step 2):
+From the repository root of a run directory (on a Slurm cluster for steps 2 and 3, which can run at the same time):
 
 ```bash
 experiments/00_calibration.sh                      # results/pinn/params_<region>.npy
 mkdir -p logs && sbatch experiments/01_nested.sh   # 640 tasks -> results/nested/<task>.json
-experiments/02_report.sh                           # results/summary.csv, fidelity.csv, selection.csv, nested.csv, report.txt
+sbatch experiments/02_kfold.sh                     # 50 tasks -> results/kfold/<task>.json
+experiments/03_report.sh                           # results/summary.csv, fidelity.csv, fidelity_kfold.csv, selection.csv, nested.csv, report.txt
 ```
 
-A single task: `python -m core.nested --region mouth --outer 0 --inner -1 --seed 0` (`--inner -1` = outer task).
+Single tasks: `python -m core.nested --region mouth --outer 0 --inner -1 --seed 0` (`--inner -1` = outer task), `python -m core.kfold --region mouth --fold 0 --seed 0`.
 
 ## Citation
 
