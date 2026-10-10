@@ -1,15 +1,3 @@
-# python
-__pycache__/
-*.pyc
-*.pyo
-
-# environment
-.DS_Store
-.python-version
-.vscode/
-.ruff_cache/
-
-# development
 results/
 development/
 *.ipynb
